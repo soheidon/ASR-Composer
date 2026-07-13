@@ -403,6 +403,7 @@ function renderHeader(activePage: PageName): string {
   return `
   <header class="app-header">
     <div class="header-left">
+      <img class="brand-icon" src="/icon.png" alt="" width="24" height="24" />
       <span class="brand-name">ASR Composer</span>
       <div class="header-divider"></div>
       <nav class="header-nav">

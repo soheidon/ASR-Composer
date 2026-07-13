@@ -99,6 +99,16 @@ html, body {
 
   display: flex;
   align-items: center;
+  padding-left: 12px;
+}
+
+.brand-icon {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  margin-right: 8px;
+  border-radius: 6px;
+  object-fit: contain;
 }
 
 .brand-name {
@@ -107,17 +117,17 @@ html, body {
   display: flex;
   align-items: center;
 
-  padding-left: 16px;
   font-weight: 700;
   white-space: nowrap;
+  margin-right: 16px;
 }
 
 .header-divider {
   width: 1px;
-  height: 20px;
+  height: 24px;
   flex: 0 0 1px;
 
-  margin: 0 16px;
+  margin-right: 16px;
   background: var(--outline-variant);
 }
 
@@ -679,8 +689,6 @@ html, body {
 
 .ollama-save-status.visible {
   opacity: 1;
-}
-  font-weight: 500;
 }
 
 .settings-nav-divider {
@@ -1295,4 +1303,3 @@ html, body {
 
 .app-dialog-ok:hover { opacity: 0.85; }
 .app-dialog-ok:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-}
