@@ -11,6 +11,9 @@ import {
   shouldAutoSaveProject,
   setGoogleSttAdvancedOpen,
   ensureSelectValue,
+  setGoogleSttStatus,
+  invalidateGoogleSttVerification,
+  getGoogleSttConfiguredState,
 } from "./provider-config-save";
 
 const app = document.getElementById("app")!;
@@ -173,19 +176,21 @@ function buildGoogleSttDetail(_p: ProviderDefinition): string {
               <input type="text" class="google-stt-recognizer-id" data-field="recognizer-id"
                      value="_" />
             </div>
+            <div class="api-field-group">
+              <label class="api-field-label">詳細な確認</label>
+              <button class="btn-google-stt-select-file" type="button">
+                <span class="material-symbols-outlined">folder_open</span>
+                別の音声ファイルで試す
+              </button>
+              <span class="google-stt-selected-file" data-field="selected-file" style="display:none;"></span>
+            </div>
           </div>
 
           <div class="google-stt-recognize-section">
-            <div class="google-stt-file-row">
-              <button class="btn-google-stt-select-file" type="button">
-                <span class="material-symbols-outlined">folder_open</span>
-                音声ファイルを選択
-              </button>
-              <span class="google-stt-selected-file" data-field="selected-file">未選択</span>
-            </div>
-            <button class="btn-google-stt-recognize" type="button">
+            <p class="google-stt-test-description">同梱された短い日本語音声（ja-JP）で確認します</p>
+            <button class="btn-google-stt-builtin-test" type="button">
               <span class="material-symbols-outlined">mic</span>
-              認識テスト実行
+              接続・認識テスト
             </button>
             <div class="google-stt-result" data-field="recognize-result" style="display:none;"></div>
           </div>`;
@@ -827,9 +832,15 @@ async function loadSavedSettings() {
         }
       }
 
-      // ステータスバッジの初期設定: env_nameが保存済み → 設定済み（APIキーの実値はフロントに返さない）
-      if (statusBadgeEl && saved?.env_name) {
-        setStatusBadge(statusBadgeEl, "設定済み");
+      // ステータスバッジの初期設定
+      if (statusBadgeEl) {
+        if (providerId === "google_stt") {
+          // Google STT: options (project_id + location) で判定、verifiedは永続化しない
+          const configuredState = getGoogleSttConfiguredState(item);
+          setGoogleSttStatus(item, configuredState, (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
+        } else if (saved?.env_name) {
+          setStatusBadge(statusBadgeEl, "設定済み");
+        }
       }
 
       // Google STT options の復元
@@ -848,6 +859,11 @@ async function loadSavedSettings() {
       if (providerId === "google_stt") {
         loadGoogleSttProjects(item).finally(() => {
           delete item.dataset.googleSttSavedProjectId;
+          // プロジェクト一覧読込完了後、設定状態を再評価
+          if (item.dataset.providerId === "google_stt" && item.querySelector("[data-status-badge]")) {
+            const configuredState = getGoogleSttConfiguredState(item);
+            setGoogleSttStatus(item, configuredState, (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
+          }
         });
       }
     });
@@ -1031,6 +1047,8 @@ function bindProviderConfigAutoSave() {
           if (input) input.focus();
           return;
         }
+        // 接続確認状態を無効化
+        invalidateGoogleSttVerification(item, (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
         providerConfigState.markDirty(providerId);
         saveDirtyProviderConfig({
           providerId: providerId!,
@@ -1045,6 +1063,8 @@ function bindProviderConfigAutoSave() {
     item.querySelectorAll<HTMLInputElement>('[data-field="project-id-input"]').forEach((optInput) => {
       optInput.addEventListener("input", () => providerConfigState.markDirty(providerId));
       optInput.addEventListener("blur", () => {
+        // 接続確認状態を無効化
+        invalidateGoogleSttVerification(item, (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
         saveDirtyProviderConfig({
           providerId: providerId!,
           section: item,
@@ -1067,8 +1087,22 @@ function bindProviderConfigAutoSave() {
       });
     });
 
-    // language-code, location: change→dirty+save
-    item.querySelectorAll<HTMLSelectElement>('[data-field="language-code"], [data-field="location"]').forEach((optSelect) => {
+    // location: change→dirty+save+invalidate verification
+    item.querySelectorAll<HTMLSelectElement>('[data-field="location"]').forEach((optSelect) => {
+      optSelect.addEventListener("change", () => {
+        invalidateGoogleSttVerification(item, (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
+        providerConfigState.markDirty(providerId);
+        saveDirtyProviderConfig({
+          providerId: providerId!,
+          section: item,
+          state: providerConfigState,
+          saveConfig: saveProviderConfigFromSection,
+        });
+      });
+    });
+
+    // language-code: change→dirty+save（verified は維持）
+    item.querySelectorAll<HTMLSelectElement>('[data-field="language-code"]').forEach((optSelect) => {
       optSelect.addEventListener("change", () => {
         providerConfigState.markDirty(providerId);
         saveDirtyProviderConfig({
@@ -1358,21 +1392,53 @@ function bindGoogleSttHandlers() {
     });
   });
 
-  // 音声ファイル選択
+  // 別の音声ファイルで試す（詳細設定内: 選択→即認識）
   document.querySelectorAll<HTMLElement>(".btn-google-stt-select-file").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const item = btn.closest<HTMLElement>(".accordion-item");
       if (!item) return;
+      const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
       try {
         const { open } = await import("@tauri-apps/plugin-dialog");
         const selected = await open({
           multiple: false,
           filters: [{ name: "音声ファイル", extensions: ["wav", "mp3", "ogg", "flac", "m4a", "webm", "opus", "aac", "wma"] }],
         });
-        if (selected && typeof selected === "string") {
-          const fileLabel = item.querySelector<HTMLElement>('[data-field="selected-file"]');
-          if (fileLabel) fileLabel.textContent = selected.split(/[/\\]/).pop() || selected;
-          item.dataset.googleSttAudioPath = selected;
+        if (!selected || typeof selected !== "string") return; // キャンセル時は何もしない
+
+        const fileName = selected.split(/[/\\]/).pop() || selected;
+        const fileLabel = item.querySelector<HTMLElement>('[data-field="selected-file"]');
+        if (fileLabel) {
+          fileLabel.textContent = fileName;
+          fileLabel.style.display = "";
+        }
+
+        if (resultEl) { resultEl.style.display = "none"; resultEl.textContent = ""; }
+
+        const origHtml = btn.innerHTML;
+        btn.innerHTML = '<span class="material-symbols-outlined spin">mic</span> 認識中...';
+        (btn as HTMLButtonElement).disabled = true;
+
+        try {
+          const projectId = getGoogleSttProjectId(item);
+          const location = item.querySelector<HTMLSelectElement>('[data-field="location"]')?.value || "us-central1";
+          const recognizerId = item.querySelector<HTMLInputElement>('[data-field="recognizer-id"]')?.value?.trim() || "_";
+          const langSel = item.querySelector<HTMLSelectElement>('[data-field="language-code"]');
+          const languageCode = langSel?.value?.trim() || "ja-JP";
+
+          const result = await invokeTauri<GoogleSttRecognizeResult>("google_stt_recognize", {
+            input: { projectId, location, recognizerId, languageCode, model: "chirp_2", audioPath: selected },
+          });
+          renderGoogleSttRecognitionSuccess(resultEl!, result, {
+            sourceLabel: `使用ファイル: ${fileName}`,
+            languageCode,
+            model: "chirp_2",
+          });
+        } catch (e) {
+          renderGoogleSttRecognitionError(resultEl!, e, `使用ファイル: ${fileName}`);
+        } finally {
+          btn.innerHTML = origHtml;
+          (btn as HTMLButtonElement).disabled = false;
         }
       } catch (e) {
         console.error("open_audio_file_dialog error:", e);
@@ -1380,12 +1446,12 @@ function bindGoogleSttHandlers() {
     });
   });
 
-  // 認識テスト
-  document.querySelectorAll<HTMLElement>(".btn-google-stt-recognize").forEach((btn) => {
+  // 接続・認識テスト（同梱音声）
+  document.querySelectorAll<HTMLElement>(".btn-google-stt-builtin-test").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const item = btn.closest<HTMLElement>(".accordion-item");
       if (!item) return;
-      await runRecognizeTest(item, btn);
+      await runBuiltinTest(item, btn);
     });
   });
 }
@@ -1399,11 +1465,14 @@ async function runAdcCheck(item: HTMLElement, btn: HTMLElement): Promise<void> {
     const statusEl = item.querySelector<HTMLElement>('[data-field="adc-status"]');
     const quotaEl = item.querySelector<HTMLElement>('[data-field="adc-quota"]');
     if (status.available) {
-      if (statusEl) statusEl.textContent = "ADC利用可能";
+      if (statusEl) { statusEl.textContent = "ADC利用可能"; statusEl.dataset.adcState = "available"; }
       const parts: string[] = [];
       if (status.quota_project) parts.push(`クォータ: ${status.quota_project}`);
       if (status.current_project) parts.push(`プロジェクト: ${status.current_project}`);
       if (quotaEl) quotaEl.textContent = parts.join(" / ") || "プロジェクト情報なし";
+
+      // ADC成功 → ステータスバッジ更新
+      setGoogleSttStatus(item, "verified", (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
 
       // Project IDが空欄の場合のみcurrent_projectを自動入力
       const currentProjectId = getGoogleSttProjectId(item);
@@ -1430,12 +1499,17 @@ async function runAdcCheck(item: HTMLElement, btn: HTMLElement): Promise<void> {
         });
       }
     } else {
-      if (statusEl) statusEl.textContent = "ADC利用不可";
+      if (statusEl) { statusEl.textContent = "ADC利用不可"; statusEl.dataset.adcState = "unavailable"; }
       if (quotaEl) quotaEl.textContent = status.error || "";
+      // ADC失敗: 必須設定あればエラー
+      const configuredState = getGoogleSttConfiguredState(item);
+      setGoogleSttStatus(item, configuredState === "configured" ? "error" : "unconfigured", (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
     }
   } catch (e) {
     const statusEl = item.querySelector<HTMLElement>('[data-field="adc-status"]');
-    if (statusEl) statusEl.textContent = "エラー";
+    if (statusEl) { statusEl.textContent = "エラー"; statusEl.dataset.adcState = "error"; }
+    const configuredState = getGoogleSttConfiguredState(item);
+    setGoogleSttStatus(item, configuredState === "configured" ? "error" : "unconfigured", (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
     console.error("google_stt_check_adc error:", e);
   } finally {
     btn.innerHTML = originalHtml;
@@ -1443,13 +1517,66 @@ async function runAdcCheck(item: HTMLElement, btn: HTMLElement): Promise<void> {
   }
 }
 
-async function runRecognizeTest(item: HTMLElement, btn: HTMLElement): Promise<void> {
-  const audioPath = item.dataset.googleSttAudioPath;
-  if (!audioPath) {
-    await showAppDialog({ title: "ファイル未選択", message: "音声ファイルを選択してください。", type: "error" });
-    return;
-  }
+// ---- Google STT: common display functions ----
 
+type GoogleSttRecognizeResult = {
+  transcript: string;
+  segments: Array<{
+    transcript: string;
+    confidence?: number;
+    languageCode?: string;
+  }>;
+};
+
+function renderGoogleSttRecognitionSuccess(
+  resultEl: HTMLElement,
+  result: GoogleSttRecognizeResult,
+  context: { sourceLabel: string; languageCode?: string; model: string },
+): void {
+  const lines: string[] = ["✓ API接続と音声認識に成功しました", "", `認識結果:`];
+  lines.push(result.transcript || "(空の文字起こし)");
+  lines.push("");
+  lines.push(`音声: ${context.sourceLabel}`);
+  if (context.languageCode) lines.push(`認識言語: ${context.languageCode}`);
+  if (result.segments.length > 0) {
+    for (const seg of result.segments) {
+      if (seg.confidence != null) {
+        lines.push(`信頼度: ${(seg.confidence * 100).toFixed(1)}%`);
+        break;
+      }
+    }
+  }
+  lines.push(`モデル: ${context.model}`);
+  resultEl.textContent = lines.join("\n");
+  resultEl.style.display = "block";
+}
+
+function renderGoogleSttRecognitionError(
+  resultEl: HTMLElement,
+  error: unknown,
+  sourceLabel: string,
+): void {
+  const msg = error instanceof Error ? error.message : String(error);
+  const safeMsg = msg.length > 500 ? msg.substring(0, 500) + "..." : msg;
+  resultEl.textContent = `✗ 認識に失敗しました\n\n音声: ${sourceLabel}\nエラー: ${safeMsg}`;
+  resultEl.style.display = "block";
+}
+
+// ---- Google STT: builtin test ----
+
+function markGoogleSttAdcVerifiedByRecognition(item: HTMLElement): void {
+  const statusEl = item.querySelector<HTMLElement>('[data-field="adc-status"]');
+  const detailEl = item.querySelector<HTMLElement>('[data-field="adc-quota"]');
+  if (statusEl) {
+    statusEl.textContent = "ADC利用可能";
+    statusEl.dataset.adcState = "available";
+  }
+  if (detailEl) {
+    detailEl.textContent = "認識テストで認証を確認しました";
+  }
+}
+
+async function runBuiltinTest(item: HTMLElement, btn: HTMLElement): Promise<void> {
   const projectId = getGoogleSttProjectId(item);
   if (!projectId) {
     await showAppDialog({ title: "プロジェクト未選択", message: "Google Cloud プロジェクトを選択または入力してください。", type: "error" });
@@ -1457,64 +1584,35 @@ async function runRecognizeTest(item: HTMLElement, btn: HTMLElement): Promise<vo
   }
 
   const location = item.querySelector<HTMLSelectElement>('[data-field="location"]')?.value || "us-central1";
-  const recognizerId = item.querySelector<HTMLInputElement>('[data-field="recognizer-id"]')?.value?.trim() || "_";
-  const languageCode = item.querySelector<HTMLSelectElement>('[data-field="language-code"]')?.value?.trim() || "ja-JP";
 
   const originalHtml = btn.innerHTML;
-  btn.innerHTML = '<span class="material-symbols-outlined spin">mic</span> 認識中...';
+  btn.innerHTML = '<span class="material-symbols-outlined spin">mic</span> 認識しています…';
   (btn as HTMLButtonElement).disabled = true;
 
   const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
   if (resultEl) { resultEl.style.display = "none"; resultEl.textContent = ""; }
 
   try {
-    type GoogleSttRecognizeResult = {
-      transcript: string;
-      segments: Array<{
-        transcript: string;
-        confidence?: number;
-        languageCode?: string;
-      }>;
-    };
-
     const result = await invokeTauri<GoogleSttRecognizeResult>(
-      "google_stt_recognize",
-      {
-        input: {
-          projectId,
-          location,
-          recognizerId,
-          languageCode,
-          audioPath,
-          model: "chirp_2",
-        },
-      },
+      "google_stt_run_builtin_test",
+      { input: { projectId, location } },
     );
-
     if (resultEl) {
-      const parts: string[] = [`【認識結果】\n${result.transcript}`];
-
-      if (result.segments.length > 0) {
-        parts.push("\n\n【セグメント】");
-        for (const segment of result.segments) {
-          const confidence = segment.confidence != null
-            ? ` (${(segment.confidence * 100).toFixed(1)}%)`
-            : "";
-          const language = segment.languageCode
-            ? ` [${segment.languageCode}]`
-            : "";
-          parts.push(`  ${segment.transcript}${language}${confidence}`);
-        }
-      }
-      resultEl.textContent = parts.join("");
-      resultEl.style.display = "block";
+      renderGoogleSttRecognitionSuccess(resultEl, result, {
+        sourceLabel: "同梱テスト音声",
+        languageCode: "ja-JP",
+        model: "chirp_2",
+      });
     }
+    // 成功時ステータス更新
+    setGoogleSttStatus(item, "verified", (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
+    markGoogleSttAdcVerifiedByRecognition(item);
   } catch (e) {
-    console.error("google_stt_recognize error:", e);
-    if (resultEl) {
-      resultEl.textContent = `エラー: ${e instanceof Error ? e.message : String(e)}`;
-      resultEl.style.display = "block";
-    }
+    console.error("google_stt_run_builtin_test error:", e);
+    if (resultEl) renderGoogleSttRecognitionError(resultEl, e, "同梱テスト音声");
+    // 失敗時: 必須設定があればエラー
+    const configuredState = getGoogleSttConfiguredState(item);
+    setGoogleSttStatus(item, configuredState === "configured" ? "error" : "unconfigured", (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
   } finally {
     btn.innerHTML = originalHtml;
     (btn as HTMLButtonElement).disabled = false;

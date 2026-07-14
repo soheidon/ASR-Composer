@@ -9,6 +9,11 @@
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
+  "bundle": {
+    "resources": [
+      "resources/google-stt-test-ja.wav"
+    ]
+  },
   "app": {
     "windows": [
       {

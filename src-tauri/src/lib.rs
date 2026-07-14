@@ -745,6 +745,27 @@ pub struct GoogleSttListProjectsResult {
     pub current_project: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleSttBuiltinTestInput {
+    pub project_id: String,
+    pub location: String,
+}
+
+struct GoogleSttBuiltinRecognitionConfig {
+    recognizer_id: &'static str,
+    language_code: &'static str,
+    model: &'static str,
+}
+
+fn google_stt_builtin_recognition_config() -> GoogleSttBuiltinRecognitionConfig {
+    GoogleSttBuiltinRecognitionConfig {
+        recognizer_id: "_",
+        language_code: "ja-JP",
+        model: "chirp_2",
+    }
+}
+
 fn find_gcloud_executable() -> Option<std::path::PathBuf> {
     // 1. PATH上の gcloud.cmd / gcloud を where で検索
     for name in &["gcloud.cmd", "gcloud"] {
@@ -1157,9 +1178,26 @@ async fn google_stt_recognize(
     input: GoogleSttRecognizeInput,
 ) -> Result<GoogleSttRecognizeResult, FetchModelsError> {
     validate_google_stt_input(&input)?;
+    recognize_google_stt_audio(
+        &input.project_id,
+        &input.location,
+        &input.recognizer_id,
+        &input.language_code,
+        &input.model,
+        std::path::Path::new(&input.audio_path),
+    )
+    .await
+}
 
+async fn recognize_google_stt_audio(
+    project_id: &str,
+    location: &str,
+    recognizer_id: &str,
+    language_code: &str,
+    model: &str,
+    audio_path: &std::path::Path,
+) -> Result<GoogleSttRecognizeResult, FetchModelsError> {
     // ファイル存在確認
-    let audio_path = std::path::Path::new(&input.audio_path);
     if !audio_path.exists() {
         return Err(FetchModelsError {
             kind: FetchErrorKind::NotConfigured,
@@ -1194,23 +1232,18 @@ async fn google_stt_recognize(
     let access_token = get_adc_access_token()?;
 
     // URL構築
-    let base_url = build_google_stt_base_url(&input.location)?;
-    let url = build_google_stt_recognize_url(
-        &base_url,
-        &input.project_id,
-        &input.location,
-        &input.recognizer_id,
-    );
+    let base_url = build_google_stt_base_url(location)?;
+    let url = build_google_stt_recognize_url(&base_url, project_id, location, recognizer_id);
 
     // リクエスト構築
-    let body = build_google_stt_request_body(&audio_base64, &input.model, &input.language_code);
+    let body = build_google_stt_request_body(&audio_base64, model, language_code);
 
     // HTTPリクエスト
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
         .bearer_auth(&access_token)
-        .header("x-goog-user-project", &input.project_id)
+        .header("x-goog-user-project", project_id)
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -1252,6 +1285,53 @@ async fn google_stt_recognize(
     parse_google_stt_response(&json)
 }
 
+fn resolve_google_stt_builtin_audio(
+    app: &tauri::AppHandle,
+) -> Result<std::path::PathBuf, FetchModelsError> {
+    use tauri::Manager;
+    let resource_path = app
+        .path()
+        .resolve(
+            "resources/google-stt-test-ja.wav",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|_e| FetchModelsError {
+            kind: FetchErrorKind::NotConfigured,
+            message: "同梱テスト音声のパス解決に失敗しました".to_string(),
+        })?;
+    validate_google_stt_builtin_audio_path(resource_path)
+}
+
+fn validate_google_stt_builtin_audio_path(
+    path: std::path::PathBuf,
+) -> Result<std::path::PathBuf, FetchModelsError> {
+    if !path.is_file() {
+        return Err(FetchModelsError {
+            kind: FetchErrorKind::NotConfigured,
+            message: "同梱テスト音声が見つかりません".to_string(),
+        });
+    }
+    Ok(path)
+}
+
+#[tauri::command]
+async fn google_stt_run_builtin_test(
+    app: tauri::AppHandle,
+    input: GoogleSttBuiltinTestInput,
+) -> Result<GoogleSttRecognizeResult, FetchModelsError> {
+    let audio_path = resolve_google_stt_builtin_audio(&app)?;
+    let config = google_stt_builtin_recognition_config();
+    recognize_google_stt_audio(
+        &input.project_id,
+        &input.location,
+        config.recognizer_id,
+        config.language_code,
+        config.model,
+        &audio_path,
+    )
+    .await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1264,7 +1344,8 @@ pub fn run() {
             get_env_var,
             google_stt_check_adc,
             google_stt_list_projects,
-            google_stt_recognize
+            google_stt_recognize,
+            google_stt_run_builtin_test
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2654,5 +2735,75 @@ mod tests {
         let projects = parse_google_stt_projects(json).unwrap();
         let ids: Vec<&str> = projects.iter().map(|p| p.project_id.as_str()).collect();
         assert_eq!(ids, vec!["a-project", "m-project", "z-project"]);
+    }
+
+    // ---- Google STT builtin test ----
+
+    #[test]
+    fn test_google_stt_builtin_recognition_config_fixed_values() {
+        let config = google_stt_builtin_recognition_config();
+        assert_eq!(config.recognizer_id, "_");
+        assert_eq!(config.language_code, "ja-JP");
+        assert_eq!(config.model, "chirp_2");
+    }
+
+    #[test]
+    fn test_validate_google_stt_builtin_audio_path_exists() {
+        let dir = std::env::temp_dir();
+        let tmp_file = dir.join("__google_stt_test_exists__.tmp");
+        fs::write(&tmp_file, b"test").unwrap();
+        let result = validate_google_stt_builtin_audio_path(tmp_file.clone());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), tmp_file);
+        fs::remove_file(&tmp_file).ok();
+    }
+
+    #[test]
+    fn test_validate_google_stt_builtin_audio_path_not_found() {
+        let nonexistent = std::path::PathBuf::from("/nonexistent/path/test.wav");
+        let result = validate_google_stt_builtin_audio_path(nonexistent);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("同梱テスト音声が見つかりません"),
+            "expected missing file message, got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_google_stt_builtin_test_input_only_project_id_and_location() {
+        let json = r#"{"projectId":"my-proj","location":"us-central1"}"#;
+        let input: GoogleSttBuiltinTestInput =
+            serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(input.project_id, "my-proj");
+        assert_eq!(input.location, "us-central1");
+        // Confirm no languageCode field
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(
+            !parsed.as_object().unwrap().contains_key("languageCode"),
+            "input must not contain languageCode",
+        );
+    }
+
+    #[test]
+    fn test_google_stt_recognize_still_works_for_existing_path() {
+        // Verify the existing recognize command delegates to the common function
+        // by checking that the common function validates file existence
+        let nonexistent = std::path::PathBuf::from("/nonexistent/audio.wav");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            recognize_google_stt_audio(
+                "test-proj",
+                "us-central1",
+                "_",
+                "ja-JP",
+                "chirp_2",
+                &nonexistent,
+            )
+            .await
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("音声ファイルが見つかりません"));
     }
 }

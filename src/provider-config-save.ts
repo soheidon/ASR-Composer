@@ -178,6 +178,54 @@ export function ensureSelectValue(
   select.value = value;
 }
 
+// ---- Google STT: status management ----
+
+export type GoogleSttConnectionState =
+  | "unconfigured"
+  | "configured"
+  | "verified"
+  | "error";
+
+export function getGoogleSttConfiguredState(
+  section: Element,
+): "unconfigured" | "configured" {
+  const projectId = getGoogleSttProjectId(section);
+  const location =
+    section
+      .querySelector<HTMLSelectElement>('[data-field="location"]')
+      ?.value
+      .trim() ?? "";
+
+  return projectId && location ? "configured" : "unconfigured";
+}
+
+const GOOGLE_STT_STATUS_LABELS: Record<GoogleSttConnectionState, string> = {
+  unconfigured: "未設定",
+  configured: "設定済み",
+  verified: "接続確認済み",
+  error: "接続エラー",
+};
+
+export function setGoogleSttStatus(
+  item: HTMLElement,
+  state: GoogleSttConnectionState,
+  setBadge: (el: HTMLElement, label: string) => void,
+): void {
+  const badge = item.querySelector<HTMLElement>("[data-status-badge]");
+  if (!badge) return;
+
+  badge.dataset.connectionState = state;
+  setBadge(badge, GOOGLE_STT_STATUS_LABELS[state]);
+}
+
+export function invalidateGoogleSttVerification(
+  item: HTMLElement,
+  setBadge: (el: HTMLElement, label: string) => void,
+): void {
+  const configuredState = getGoogleSttConfiguredState(item);
+  setGoogleSttStatus(item, configuredState, setBadge);
+}
+
 export function getGoogleSttProjectId(section: Element): string {
   const select = section.querySelector<HTMLSelectElement>(
     '[data-field="project-id-select"]',
@@ -316,4 +364,28 @@ export async function prepareProviderForModelFetch(options: {
   return options.state.isDirty(options.providerId)
     ? { ok: false, reason: "save-failed" }
     : { ok: true };
+}
+
+// ---- Google STT: button loading state helpers ----
+
+export interface ButtonLoadingState {
+  originalHtml: string;
+}
+
+export function setButtonLoading(
+  btn: HTMLButtonElement,
+  loadingHtml: string,
+): ButtonLoadingState {
+  const state: ButtonLoadingState = { originalHtml: btn.innerHTML };
+  btn.innerHTML = loadingHtml;
+  btn.disabled = true;
+  return state;
+}
+
+export function restoreButtonLoading(
+  btn: HTMLButtonElement,
+  state: ButtonLoadingState,
+): void {
+  btn.innerHTML = state.originalHtml;
+  btn.disabled = false;
 }

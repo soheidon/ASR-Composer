@@ -1510,7 +1510,7 @@ html, body {
   white-space: nowrap;
 }
 
-.btn-google-stt-recognize {
+.btn-google-stt-builtin-test {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1526,9 +1526,16 @@ html, body {
   align-self: flex-start;
 }
 
-.btn-google-stt-recognize:hover { opacity: 0.85; }
-.btn-google-stt-recognize:disabled { opacity: 0.6; cursor: default; }
-.btn-google-stt-recognize .material-symbols-outlined { font-size: 18px; }
+.btn-google-stt-builtin-test:hover { opacity: 0.85; }
+.btn-google-stt-builtin-test:disabled { opacity: 0.6; cursor: default; }
+.btn-google-stt-builtin-test .material-symbols-outlined { font-size: 18px; }
+
+.google-stt-test-description {
+  margin: 0;
+  font-size: 13px;
+  color: var(--on-surface-variant);
+  line-height: 1.5;
+}
 
 .google-stt-result {
   padding: 12px 14px;

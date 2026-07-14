@@ -10,6 +10,11 @@ import {
   shouldAutoSaveProject,
   setGoogleSttAdvancedOpen,
   ensureSelectValue,
+  getGoogleSttConfiguredState,
+  setGoogleSttStatus,
+  invalidateGoogleSttVerification,
+  setButtonLoading,
+  restoreButtonLoading,
   type ProviderConfigValues,
 } from "./provider-config-save";
 
@@ -978,5 +983,175 @@ describe("ensureSelectValue", () => {
     expect(select.value).toBe("custom-lang");
     const addedOpt = Array.from(select.options).find(o => o.value === "custom-lang");
     expect(addedOpt!.textContent).toBe("custom-lang");
+  });
+});
+
+// ---- getGoogleSttConfiguredState ----
+
+describe("getGoogleSttConfiguredState", () => {
+  it("returns unconfigured when no project_id or location", () => {
+    document.body.innerHTML = '<div></div>';
+    expect(getGoogleSttConfiguredState(document.body)).toBe("unconfigured");
+  });
+
+  it("returns unconfigured when only project_id present", () => {
+    document.body.innerHTML = `
+      <div>
+        <select data-field="project-id-select"><option value="proj" selected>proj</option></select>
+      </div>`;
+    expect(getGoogleSttConfiguredState(document.body)).toBe("unconfigured");
+  });
+
+  it("returns unconfigured when only location present", () => {
+    document.body.innerHTML = `
+      <div>
+        <select data-field="location"><option value="us-central1" selected>us-central1</option></select>
+      </div>`;
+    expect(getGoogleSttConfiguredState(document.body)).toBe("unconfigured");
+  });
+
+  it("returns configured when both project_id and location present", () => {
+    document.body.innerHTML = `
+      <div>
+        <select data-field="project-id-select"><option value="proj" selected>proj</option></select>
+        <select data-field="location"><option value="us-central1" selected>us-central1</option></select>
+      </div>`;
+    expect(getGoogleSttConfiguredState(document.body)).toBe("configured");
+  });
+
+  it("returns configured with project-id-input (manual fallback)", () => {
+    document.body.innerHTML = `
+      <div>
+        <input data-field="project-id-input" value="manual-proj" />
+        <select data-field="location"><option value="us-central1" selected>us-central1</option></select>
+      </div>`;
+    expect(getGoogleSttConfiguredState(document.body)).toBe("configured");
+  });
+
+  it("returns configured without env_name (Google STT specific)", () => {
+    document.body.innerHTML = `
+      <div>
+        <select data-field="project-id-select"><option value="proj" selected>proj</option></select>
+        <select data-field="location"><option value="us-central1" selected>us-central1</option></select>
+      </div>`;
+    // No .api-env-input → still configured
+    expect(getGoogleSttConfiguredState(document.body)).toBe("configured");
+  });
+});
+
+// ---- setGoogleSttStatus ----
+
+describe("setGoogleSttStatus", () => {
+  it("sets connectionState and label on badge element", () => {
+    document.body.innerHTML = '<div><span data-status-badge>未設定</span></div>';
+    const mockSetBadge = vi.fn();
+
+    setGoogleSttStatus(document.body.firstElementChild as HTMLElement, "verified", mockSetBadge);
+
+    const badge = document.querySelector("[data-status-badge]") as HTMLElement;
+    expect(badge.dataset.connectionState).toBe("verified");
+    expect(mockSetBadge).toHaveBeenCalledWith(badge, "接続確認済み");
+  });
+
+  it("all four states set correct labels", () => {
+    const states: Array<{ state: import("./provider-config-save").GoogleSttConnectionState; label: string }> = [
+      { state: "unconfigured", label: "未設定" },
+      { state: "configured", label: "設定済み" },
+      { state: "verified", label: "接続確認済み" },
+      { state: "error", label: "接続エラー" },
+    ];
+
+    for (const { state, label } of states) {
+      document.body.innerHTML = '<div><span data-status-badge>old</span></div>';
+      const mockSetBadge = vi.fn();
+      setGoogleSttStatus(document.body.firstElementChild as HTMLElement, state, mockSetBadge);
+      expect(mockSetBadge).toHaveBeenCalledWith(
+        document.querySelector("[data-status-badge]"),
+        label,
+      );
+    }
+  });
+
+  it("does nothing when badge is missing", () => {
+    document.body.innerHTML = '<div></div>';
+    const mockSetBadge = vi.fn();
+    setGoogleSttStatus(document.body.firstElementChild as HTMLElement, "verified", mockSetBadge);
+    expect(mockSetBadge).not.toHaveBeenCalled();
+  });
+});
+
+// ---- invalidateGoogleSttVerification ----
+
+describe("invalidateGoogleSttVerification", () => {
+  it("demotes verified to configured when settings are complete", () => {
+    document.body.innerHTML = `
+      <div>
+        <select data-field="project-id-select"><option value="proj" selected>proj</option></select>
+        <select data-field="location"><option value="us-central1" selected>us-central1</option></select>
+        <span data-status-badge data-connection-state="verified">接続確認済み</span>
+      </div>`;
+    const mockSetBadge = vi.fn();
+
+    invalidateGoogleSttVerification(document.body.firstElementChild as HTMLElement, mockSetBadge);
+
+    expect(mockSetBadge).toHaveBeenCalledWith(
+      document.querySelector("[data-status-badge]"),
+      "設定済み",
+    );
+  });
+
+  it("demotes verified to unconfigured when settings are missing", () => {
+    document.body.innerHTML = `
+      <div>
+        <span data-status-badge data-connection-state="verified">接続確認済み</span>
+      </div>`;
+    const mockSetBadge = vi.fn();
+
+    invalidateGoogleSttVerification(document.body.firstElementChild as HTMLElement, mockSetBadge);
+
+    expect(mockSetBadge).toHaveBeenCalledWith(
+      document.querySelector("[data-status-badge]"),
+      "未設定",
+    );
+  });
+
+  it("does not change error state if still configured", () => {
+    document.body.innerHTML = `
+      <div>
+        <select data-field="project-id-select"><option value="proj" selected>proj</option></select>
+        <select data-field="location"><option value="us-central1" selected>us-central1</option></select>
+        <span data-status-badge data-connection-state="error">接続エラー</span>
+      </div>`;
+    const mockSetBadge = vi.fn();
+
+    invalidateGoogleSttVerification(document.body.firstElementChild as HTMLElement, mockSetBadge);
+
+    expect(mockSetBadge).toHaveBeenCalledWith(
+      document.querySelector("[data-status-badge]"),
+      "設定済み",
+    );
+  });
+});
+
+// ---- setButtonLoading / restoreButtonLoading ----
+
+describe("setButtonLoading and restoreButtonLoading", () => {
+  it("setButtonLoading disables and changes innerHTML", () => {
+    document.body.innerHTML = '<button id="btn">元の文言</button>';
+    const btn = document.getElementById("btn") as HTMLButtonElement;
+    const state = setButtonLoading(btn, "ローディング...");
+    expect(btn.disabled).toBe(true);
+    expect(btn.innerHTML).toBe("ローディング...");
+    expect(state.originalHtml).toBe("元の文言");
+  });
+
+  it("restoreButtonLoading re-enables and restores", () => {
+    document.body.innerHTML = '<button id="btn2">元の文言</button>';
+    const btn = document.getElementById("btn2") as HTMLButtonElement;
+    btn.disabled = true;
+    btn.innerHTML = "ローディング...";
+    restoreButtonLoading(btn, { originalHtml: "元の文言" });
+    expect(btn.disabled).toBe(false);
+    expect(btn.innerHTML).toBe("元の文言");
   });
 });
