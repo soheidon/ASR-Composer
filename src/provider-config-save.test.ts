@@ -1,9 +1,15 @@
+// @vitest-environment jsdom
 import { describe, it, expect, vi } from "vitest";
 import {
   createProviderConfigState,
   readProviderConfigFromSection,
   saveDirtyProviderConfig,
   prepareProviderForModelFetch,
+  getGoogleSttProjectId,
+  buildGoogleSttProjectOptions,
+  shouldAutoSaveProject,
+  setGoogleSttAdvancedOpen,
+  ensureSelectValue,
   type ProviderConfigValues,
 } from "./provider-config-save";
 
@@ -282,12 +288,12 @@ describe("readProviderConfigFromSection", () => {
       env: "GOOGLE_APPLICATION_CREDENTIALS",
       model: "chirp_2",
       extraInputs: [
-        { selector: '[data-field="project-id"]', value: "my-project-123" },
         { selector: '[data-field="recognizer-id"]', value: "_" },
-        { selector: '[data-field="language-code"]', value: "ja-JP" },
       ],
       extraSelects: [
+        { selector: '[data-field="project-id-select"]', value: "my-project-123" },
         { selector: '[data-field="location"]', value: "us-central1" },
+        { selector: '[data-field="language-code"]', value: "ja-JP" },
       ],
     });
     const result = readProviderConfigFromSection(section);
@@ -304,11 +310,10 @@ describe("readProviderConfigFromSection", () => {
       env: "GOOGLE_APPLICATION_CREDENTIALS",
       model: "chirp_2",
       extraInputs: [
-        { selector: '[data-field="project-id"]', value: "test-proj" },
         { selector: '[data-field="recognizer-id"]', value: "" },
-        { selector: '[data-field="language-code"]', value: "" },
       ],
       extraSelects: [
+        { selector: '[data-field="project-id-select"]', value: "test-proj" },
         { selector: '[data-field="location"]', value: "europe-west4" },
       ],
     });
@@ -621,5 +626,357 @@ describe("prepareProviderForModelFetch", () => {
     expect(result).toEqual({ ok: false, reason: "save-failed" });
     expect(callCount).toBe(5);
     expect(state.isDirty("openai")).toBe(true);
+  });
+});
+
+// ---- getGoogleSttProjectId ----
+
+describe("getGoogleSttProjectId", () => {
+  it("returns value from visible select", () => {
+    const section = document.createElement("div");
+    const select = document.createElement("select");
+    select.setAttribute("data-field", "project-id-select");
+    const opt = document.createElement("option");
+    opt.value = "my-project";
+    opt.selected = true;
+    select.appendChild(opt);
+    section.appendChild(select);
+    expect(getGoogleSttProjectId(section)).toBe("my-project");
+  });
+
+  it("returns input value when select is __manual__", () => {
+    const section = document.createElement("div");
+    const select = document.createElement("select");
+    select.setAttribute("data-field", "project-id-select");
+    const opt = document.createElement("option");
+    opt.value = "__manual__";
+    opt.selected = true;
+    select.appendChild(opt);
+    section.appendChild(select);
+    const input = document.createElement("input");
+    input.setAttribute("data-field", "project-id-input");
+    input.value = "manual-project";
+    section.appendChild(input);
+    expect(getGoogleSttProjectId(section)).toBe("manual-project");
+  });
+
+  it("returns input value when select is hidden even if it has a value", () => {
+    const section = document.createElement("div");
+    const select = document.createElement("select");
+    select.setAttribute("data-field", "project-id-select");
+    select.hidden = true;
+    const opt = document.createElement("option");
+    opt.value = "old-project";
+    opt.selected = true;
+    select.appendChild(opt);
+    section.appendChild(select);
+    const input = document.createElement("input");
+    input.setAttribute("data-field", "project-id-input");
+    input.value = "fallback-project";
+    section.appendChild(input);
+    expect(getGoogleSttProjectId(section)).toBe("fallback-project");
+  });
+
+  it("returns empty string when neither select nor input exists", () => {
+    const section = document.createElement("div");
+    expect(getGoogleSttProjectId(section)).toBe("");
+  });
+});
+
+// ---- readProviderConfigFromSection: Google STT options ----
+
+describe("readProviderConfigFromSection: Google STT options", () => {
+  function makeSection(html: string): HTMLElement {
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = html.trim();
+    const el = wrapper.firstElementChild;
+    if (!(el instanceof HTMLElement)) {
+      throw new Error("Test section element is not an HTMLElement");
+    }
+    return el;
+  }
+
+  function googleSttSectionHtml(opts: {
+    projectId?: string;
+    projectIdHidden?: boolean;
+    projectInput?: string;
+    location?: string;
+    recognizerId?: string;
+    languageCode?: string;
+    model?: string;
+  }): string {
+    const projectSelectHidden = opts.projectIdHidden ?? false;
+    const projectInputHidden = !projectSelectHidden;
+    const projectSelectValue = opts.projectId ?? "";
+    const projectInputValue = opts.projectInput ?? "";
+    return `
+      <div>
+        <input class="api-env-input" value="_" />
+        <select data-field="project-id-select"${projectSelectHidden ? " hidden" : ""}>
+          <option value="${projectSelectValue}" selected>${projectSelectValue}</option>
+        </select>
+        <input data-field="project-id-input" value="${projectInputValue}"${projectInputHidden ? " hidden" : ""} />
+        <select data-field="location">
+          <option value="${opts.location ?? "us-central1"}" selected>${opts.location ?? "us-central1"}</option>
+        </select>
+        <input data-field="recognizer-id" value="${opts.recognizerId ?? "_"}" />
+        <select data-field="language-code">
+          <option value="${opts.languageCode ?? "ja-JP"}" selected>${opts.languageCode ?? "ja-JP"}</option>
+        </select>
+        <select data-field="model" disabled>
+          <option value="${opts.model ?? "chirp_2"}" selected>${opts.model ?? "chirp_2"}</option>
+        </select>
+      </div>`;
+  }
+
+  it("reads project_id from visible select", () => {
+    const section = makeSection(googleSttSectionHtml({ projectId: "my-project" }));
+    const result = readProviderConfigFromSection(section);
+    expect(result?.options?.project_id).toBe("my-project");
+  });
+
+  it("reads project_id from input when select is hidden", () => {
+    const section = makeSection(googleSttSectionHtml({
+      projectId: "old-project",
+      projectIdHidden: true,
+      projectInput: "manual-project",
+    }));
+    const result = readProviderConfigFromSection(section);
+    expect(result?.options?.project_id).toBe("manual-project");
+  });
+
+  it("reads location from select", () => {
+    const section = makeSection(googleSttSectionHtml({ location: "asia-southeast1" }));
+    const result = readProviderConfigFromSection(section);
+    expect(result?.options?.location).toBe("asia-southeast1");
+  });
+
+  it("reads recognizer_id from input", () => {
+    const section = makeSection(googleSttSectionHtml({ recognizerId: "custom-recognizer" }));
+    const result = readProviderConfigFromSection(section);
+    expect(result?.options?.recognizer_id).toBe("custom-recognizer");
+  });
+
+  it("reads language_code from select", () => {
+    const section = makeSection(googleSttSectionHtml({ languageCode: "en-US" }));
+    const result = readProviderConfigFromSection(section);
+    expect(result?.options?.language_code).toBe("en-US");
+  });
+
+  it("reads defaultModel from disabled chirp_2 select", () => {
+    const section = makeSection(googleSttSectionHtml({ model: "chirp_2" }));
+    const result = readProviderConfigFromSection(section);
+    expect(result?.defaultModel).toBe("chirp_2");
+  });
+
+  it("skips empty project_id", () => {
+    const section = makeSection(googleSttSectionHtml({ projectId: "" }));
+    const result = readProviderConfigFromSection(section);
+    expect(result?.options?.project_id).toBeUndefined();
+  });
+
+  it("skips __manual__ project_id from select", () => {
+    const section = makeSection(googleSttSectionHtml({
+      projectId: "__manual__",
+      projectInput: "manual-project",
+    }));
+    const result = readProviderConfigFromSection(section);
+    expect(result?.options?.project_id).toBe("manual-project");
+  });
+});
+
+// ---- buildGoogleSttProjectOptions ----
+
+describe("buildGoogleSttProjectOptions", () => {
+  const PROJ_A = { projectId: "proj-a", name: "Project A" };
+  const PROJ_B = { projectId: "proj-b", name: "Project B" };
+
+  it("saved project_id takes priority over current_project", () => {
+    const result = buildGoogleSttProjectOptions({
+      projects: [PROJ_A, PROJ_B],
+      currentProject: "proj-a",
+      savedProjectId: "proj-b",
+    });
+    expect(result.selectedValue).toBe("proj-b");
+    expect(result.selectedBy).toBe("saved");
+  });
+
+  it("saved project_id not in list is added as 'saved' option", () => {
+    const result = buildGoogleSttProjectOptions({
+      projects: [PROJ_A],
+      currentProject: "proj-a",
+      savedProjectId: "ext-project",
+    });
+    expect(result.selectedValue).toBe("ext-project");
+    expect(result.selectedBy).toBe("saved");
+    const savedOpt = result.options.find(o => o.value === "ext-project");
+    expect(savedOpt).toBeDefined();
+    expect(savedOpt!.kind).toBe("saved");
+    // saved option should come before project options
+    expect(result.options[0].value).toBe("ext-project");
+  });
+
+  it("current_project auto-selected when no saved value", () => {
+    const result = buildGoogleSttProjectOptions({
+      projects: [PROJ_A, PROJ_B],
+      currentProject: "proj-b",
+      savedProjectId: null,
+    });
+    expect(result.selectedValue).toBe("proj-b");
+    expect(result.selectedBy).toBe("current");
+  });
+
+  it("no selection when neither saved nor current match", () => {
+    const result = buildGoogleSttProjectOptions({
+      projects: [PROJ_A, PROJ_B],
+      currentProject: null,
+      savedProjectId: null,
+    });
+    expect(result.selectedValue).toBe("");
+    expect(result.selectedBy).toBe("none");
+  });
+
+  it("current_project not in list does not get selected", () => {
+    const result = buildGoogleSttProjectOptions({
+      projects: [PROJ_A],
+      currentProject: "other-project",
+      savedProjectId: null,
+    });
+    expect(result.selectedValue).toBe("");
+    expect(result.selectedBy).toBe("none");
+  });
+
+  it("__manual__ option is always last", () => {
+    const result = buildGoogleSttProjectOptions({
+      projects: [PROJ_A],
+      currentProject: null,
+      savedProjectId: null,
+    });
+    const last = result.options[result.options.length - 1];
+    expect(last.value).toBe("__manual__");
+    expect(last.kind).toBe("manual");
+  });
+
+  it("saved project_id in list is not duplicated", () => {
+    const result = buildGoogleSttProjectOptions({
+      projects: [PROJ_A, PROJ_B],
+      currentProject: null,
+      savedProjectId: "proj-a",
+    });
+    const savedOptions = result.options.filter(o => o.value === "proj-a");
+    expect(savedOptions).toHaveLength(1);
+  });
+
+  it("empty projects with saved value still works", () => {
+    const result = buildGoogleSttProjectOptions({
+      projects: [],
+      currentProject: "proj-a",
+      savedProjectId: "saved-proj",
+    });
+    expect(result.selectedValue).toBe("saved-proj");
+    expect(result.selectedBy).toBe("saved");
+    expect(result.options).toHaveLength(2); // saved + manual
+  });
+});
+
+// ---- shouldAutoSaveProject ----
+
+describe("shouldAutoSaveProject", () => {
+  it("returns true when current auto-selected and no saved value", () => {
+    expect(shouldAutoSaveProject({ selectedBy: "current", savedProjectId: null })).toBe(true);
+  });
+
+  it("returns false when saved value was used", () => {
+    expect(shouldAutoSaveProject({ selectedBy: "saved", savedProjectId: "proj-a" })).toBe(false);
+  });
+
+  it("returns false when none selected", () => {
+    expect(shouldAutoSaveProject({ selectedBy: "none", savedProjectId: null })).toBe(false);
+  });
+
+  it("returns false when current selected but saved value exists", () => {
+    // This shouldn't happen in practice, but verify it's false
+    expect(shouldAutoSaveProject({ selectedBy: "current", savedProjectId: "proj-a" })).toBe(false);
+  });
+});
+
+// ---- setGoogleSttAdvancedOpen ----
+
+describe("setGoogleSttAdvancedOpen", () => {
+  it("sets hidden=false and aria-expanded=true when open", () => {
+    const btn = document.createElement("button") as HTMLButtonElement;
+    const content = document.createElement("div") as HTMLElement;
+    content.hidden = true;
+    setGoogleSttAdvancedOpen(btn, content, true);
+    expect(content.hidden).toBe(false);
+    expect(btn.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("sets hidden=true and aria-expanded=false when closed", () => {
+    const btn = document.createElement("button") as HTMLButtonElement;
+    const content = document.createElement("div") as HTMLElement;
+    content.hidden = false;
+    setGoogleSttAdvancedOpen(btn, content, false);
+    expect(content.hidden).toBe(true);
+    expect(btn.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("hidden and aria-expanded always match", () => {
+    const btn = document.createElement("button") as HTMLButtonElement;
+    const content = document.createElement("div") as HTMLElement;
+    // Toggle twice
+    setGoogleSttAdvancedOpen(btn, content, true);
+    expect(content.hidden).toBe(false);
+    expect(btn.getAttribute("aria-expanded")).toBe("true");
+
+    setGoogleSttAdvancedOpen(btn, content, false);
+    expect(content.hidden).toBe(true);
+    expect(btn.getAttribute("aria-expanded")).toBe("false");
+
+    setGoogleSttAdvancedOpen(btn, content, true);
+    expect(content.hidden).toBe(false);
+    expect(btn.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("initial state is false when content is hidden", () => {
+    const btn = document.createElement("button") as HTMLButtonElement;
+    const content = document.createElement("div") as HTMLElement;
+    content.hidden = true;
+    setGoogleSttAdvancedOpen(btn, content, false);
+    expect(content.hidden).toBe(true);
+    expect(btn.getAttribute("aria-expanded")).toBe("false");
+  });
+});
+
+// ---- ensureSelectValue ----
+
+describe("ensureSelectValue", () => {
+  it("sets value on existing option", () => {
+    const select = document.createElement("select") as HTMLSelectElement;
+    select.add(new Option("日本語（ja-JP）", "ja-JP"));
+    select.add(new Option("英語（en-US）", "en-US"));
+    ensureSelectValue(select, "en-US");
+    expect(select.value).toBe("en-US");
+    expect(select.options).toHaveLength(2); // no duplicate
+  });
+
+  it("adds new option when value not found", () => {
+    const select = document.createElement("select") as HTMLSelectElement;
+    select.add(new Option("日本語（ja-JP）", "ja-JP"));
+    ensureSelectValue(select, "en-GB", "英語（en-GB）");
+    expect(select.value).toBe("en-GB");
+    expect(select.options).toHaveLength(2);
+    const addedOpt = Array.from(select.options).find(o => o.value === "en-GB");
+    expect(addedOpt).toBeDefined();
+    expect(addedOpt!.textContent).toBe("英語（en-GB）");
+  });
+
+  it("uses value as label when label not provided", () => {
+    const select = document.createElement("select") as HTMLSelectElement;
+    select.add(new Option("日本語（ja-JP）", "ja-JP"));
+    ensureSelectValue(select, "custom-lang");
+    expect(select.value).toBe("custom-lang");
+    const addedOpt = Array.from(select.options).find(o => o.value === "custom-lang");
+    expect(addedOpt!.textContent).toBe("custom-lang");
   });
 });

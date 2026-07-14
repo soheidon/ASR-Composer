@@ -673,11 +673,6 @@ fn get_env_var(name: String) -> Option<String> {
 
 // ---- Google Cloud Speech-to-Text v2 ----
 
-const GOOGLE_STT_OPT_PROJECT_ID: &str = "project_id";
-const GOOGLE_STT_OPT_LOCATION: &str = "location";
-const GOOGLE_STT_OPT_RECOGNIZER_ID: &str = "recognizer_id";
-const GOOGLE_STT_OPT_LANGUAGE_CODE: &str = "language_code";
-
 const GOOGLE_STT_ALLOWED_LOCATIONS: &[&str] = &[
     "us-central1",
     "asia-southeast1",
@@ -734,6 +729,20 @@ pub struct GoogleSttRecognizeSegment {
 pub struct GoogleSttRecognizeResult {
     pub transcript: String,
     pub segments: Vec<GoogleSttRecognizeSegment>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleSttProject {
+    pub project_id: String,
+    pub name: String,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleSttListProjectsResult {
+    pub projects: Vec<GoogleSttProject>,
+    pub current_project: Option<String>,
 }
 
 fn find_gcloud_executable() -> Option<std::path::PathBuf> {
@@ -808,6 +817,40 @@ fn get_adc_current_project(gcloud: &std::path::Path) -> Option<String> {
     }
 }
 
+fn parse_google_stt_projects(json_str: &str) -> Result<Vec<GoogleSttProject>, FetchModelsError> {
+    let json: serde_json::Value = serde_json::from_str(json_str).map_err(|e| FetchModelsError {
+        kind: FetchErrorKind::ConnectionError,
+        message: format!("プロジェクト一覧のJSON解析に失敗しました: {}", e),
+    })?;
+
+    let arr = match json.as_array() {
+        Some(a) => a,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut projects: Vec<GoogleSttProject> = Vec::new();
+
+    for item in arr {
+        let project_id = match item.get("projectId").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        if !seen.insert(project_id.clone()) {
+            continue;
+        }
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&project_id)
+            .to_string();
+        projects.push(GoogleSttProject { project_id, name });
+    }
+
+    projects.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+    Ok(projects)
+}
+
 #[tauri::command]
 async fn google_stt_check_adc() -> GoogleSttAdcStatus {
     let gcloud = match find_gcloud_executable() {
@@ -866,6 +909,49 @@ async fn google_stt_check_adc() -> GoogleSttAdcStatus {
             error_kind: Some(GoogleSttErrorKind::GcloudNotFound),
         },
     }
+}
+
+#[tauri::command]
+async fn google_stt_list_projects() -> Result<GoogleSttListProjectsResult, FetchModelsError> {
+    let gcloud = find_gcloud_executable().ok_or_else(|| FetchModelsError {
+        kind: FetchErrorKind::NotConfigured,
+        message: "Google Cloud CLIが見つかりません。gcloud CLIをインストールしてください。".to_string(),
+    })?;
+
+    let current_project = get_adc_current_project(&gcloud);
+
+    let output = std::process::Command::new("cmd.exe")
+        .args([
+            "/C",
+            &gcloud.to_string_lossy(),
+            "projects",
+            "list",
+            "--filter=lifecycleState:ACTIVE",
+            "--format=json(projectId,name)",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| FetchModelsError {
+            kind: FetchErrorKind::ConnectionError,
+            message: format!("gcloud projects list の実行に失敗しました: {}", e),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(FetchModelsError {
+            kind: FetchErrorKind::ConnectionError,
+            message: format!("プロジェクト一覧の取得に失敗しました: {}", stderr.trim()),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let projects = parse_google_stt_projects(&stdout)?;
+
+    Ok(GoogleSttListProjectsResult {
+        projects,
+        current_project,
+    })
 }
 
 fn validate_google_stt_input(input: &GoogleSttRecognizeInput) -> Result<(), FetchModelsError> {
@@ -1177,6 +1263,7 @@ pub fn run() {
             test_connection_ollama,
             get_env_var,
             google_stt_check_adc,
+            google_stt_list_projects,
             google_stt_recognize
         ])
         .run(tauri::generate_context!())
@@ -2498,5 +2585,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- parse_google_stt_projects ----
+
+    #[test]
+    fn test_parse_google_stt_projects_normal() {
+        let json = r#"[
+            {"projectId": "beta-project", "name": "Beta"},
+            {"projectId": "alpha-project", "name": "Alpha"}
+        ]"#;
+        let projects = parse_google_stt_projects(json).unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].project_id, "alpha-project");
+        assert_eq!(projects[0].name, "Alpha");
+        assert_eq!(projects[1].project_id, "beta-project");
+        assert_eq!(projects[1].name, "Beta");
+    }
+
+    #[test]
+    fn test_parse_google_stt_projects_empty_array() {
+        let projects = parse_google_stt_projects("[]").unwrap();
+        assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn test_parse_google_stt_projects_invalid_json() {
+        let result = parse_google_stt_projects("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_google_stt_projects_skips_missing_project_id() {
+        let json = r#"[
+            {"projectId": "valid-project", "name": "Valid"},
+            {"name": "No ID"}
+        ]"#;
+        let projects = parse_google_stt_projects(json).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project_id, "valid-project");
+    }
+
+    #[test]
+    fn test_parse_google_stt_projects_name_fallback_to_project_id() {
+        let json = r#"[{"projectId": "my-proj"}]"#;
+        let projects = parse_google_stt_projects(json).unwrap();
+        assert_eq!(projects[0].name, "my-proj");
+    }
+
+    #[test]
+    fn test_parse_google_stt_projects_dedup_by_project_id() {
+        let json = r#"[
+            {"projectId": "dup-proj", "name": "First"},
+            {"projectId": "dup-proj", "name": "Second"}
+        ]"#;
+        let projects = parse_google_stt_projects(json).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "First");
+    }
+
+    #[test]
+    fn test_parse_google_stt_projects_sorted_by_project_id() {
+        let json = r#"[
+            {"projectId": "z-project", "name": "Z"},
+            {"projectId": "a-project", "name": "A"},
+            {"projectId": "m-project", "name": "M"}
+        ]"#;
+        let projects = parse_google_stt_projects(json).unwrap();
+        let ids: Vec<&str> = projects.iter().map(|p| p.project_id.as_str()).collect();
+        assert_eq!(ids, vec!["a-project", "m-project", "z-project"]);
     }
 }

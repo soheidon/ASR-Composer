@@ -1371,9 +1371,11 @@ html, body {
   font-weight: 600;
 }
 
-.google-stt-project-id,
+.google-stt-project-select,
+.google-stt-project-input,
 .google-stt-recognizer-id,
-.google-stt-language-code {
+.google-stt-language-code,
+.google-stt-location {
   width: 100%;
   padding: 10px 14px;
   border: 1px solid var(--outline-variant);
@@ -1384,22 +1386,85 @@ html, body {
   transition: border-color 0.15s;
 }
 
-.google-stt-project-id:focus,
+.google-stt-project-select:focus,
+.google-stt-project-input:focus,
 .google-stt-recognizer-id:focus,
-.google-stt-language-code:focus {
+.google-stt-language-code:focus,
+.google-stt-location:focus {
   outline: none;
   border-color: var(--primary);
   box-shadow: 0 0 0 2px rgba(0, 74, 198, 0.12);
 }
 
-.google-stt-location {
-  width: 100%;
-  padding: 10px 14px;
+.google-stt-project-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.google-stt-project-select {
+  flex: 1;
+}
+
+.google-stt-project-input {
+  flex: 1;
+}
+
+.btn-google-stt-refresh-projects {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px;
   border: 1px solid var(--outline-variant);
   border-radius: 8px;
-  background: var(--surface-container-lowest);
+  background: var(--surface-container-low);
   color: var(--on-surface);
-  font-size: 14px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-google-stt-refresh-projects:hover {
+  background: var(--surface-container);
+}
+
+.google-stt-project-error {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--error, #b3261e);
+}
+
+.google-stt-advanced-toggle {
+  margin-top: 8px;
+}
+
+.btn-google-stt-advanced {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--on-surface-variant);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn-google-stt-advanced:hover {
+  background: var(--surface-container-low);
+}
+
+.btn-google-stt-advanced .accordion-chevron {
+  transition: transform 0.2s;
+}
+
+.btn-google-stt-advanced.is-open .accordion-chevron {
+  transform: rotate(90deg);
+}
+
+.google-stt-advanced-content {
+  padding: 8px 0;
 }
 
 .google-stt-recognize-section {

@@ -80,6 +80,124 @@ export function createProviderConfigState(): ProviderConfigState {
   };
 }
 
+// ---- Google STT: Project list helpers ----
+
+export interface GoogleSttProject {
+  projectId: string;
+  name: string;
+}
+
+export interface GoogleSttProjectOption {
+  value: string;
+  label: string;
+  kind: "project" | "saved" | "manual";
+}
+
+export function buildGoogleSttProjectOptions(params: {
+  projects: GoogleSttProject[];
+  currentProject: string | null;
+  savedProjectId: string | null;
+}): {
+  options: GoogleSttProjectOption[];
+  selectedValue: string;
+  selectedBy: "saved" | "current" | "none";
+} {
+  const options: GoogleSttProjectOption[] = [];
+  let selectedValue = "";
+  let selectedBy: "saved" | "current" | "none" = "none";
+
+  // 保存済みproject_idがある場合
+  if (params.savedProjectId) {
+    const savedInList = params.projects.some(
+      (p) => p.projectId === params.savedProjectId,
+    );
+    if (!savedInList) {
+      // 一覧にない保存値は先頭に追加
+      options.push({
+        value: params.savedProjectId,
+        label: params.savedProjectId,
+        kind: "saved",
+      });
+    }
+    selectedValue = params.savedProjectId;
+    selectedBy = "saved";
+  }
+
+  // プロジェクト一覧
+  for (const project of params.projects) {
+    const isSelected =
+      selectedBy === "none" &&
+      params.currentProject != null &&
+      project.projectId === params.currentProject;
+    if (isSelected) {
+      selectedValue = project.projectId;
+      selectedBy = "current";
+    }
+    options.push({
+      value: project.projectId,
+      label: project.name,
+      kind: "project",
+    });
+  }
+
+  // 末尾に__manual__を追加
+  options.push({ value: "__manual__", label: "手動入力...", kind: "manual" });
+
+  return { options, selectedValue, selectedBy };
+}
+
+export function shouldAutoSaveProject(params: {
+  selectedBy: "saved" | "current" | "none";
+  savedProjectId: string | null;
+}): boolean {
+  return params.selectedBy === "current" && params.savedProjectId === null;
+}
+
+// ---- Google STT: DOM helpers ----
+
+export function setGoogleSttAdvancedOpen(
+  button: HTMLButtonElement,
+  content: HTMLElement,
+  open: boolean,
+): void {
+  content.hidden = !open;
+  button.setAttribute("aria-expanded", String(open));
+}
+
+export function ensureSelectValue(
+  select: HTMLSelectElement,
+  value: string,
+  label: string = value,
+): void {
+  const exists = Array.from(select.options).some(
+    (option) => option.value === value,
+  );
+  if (!exists) {
+    select.add(new Option(label, value));
+  }
+  select.value = value;
+}
+
+export function getGoogleSttProjectId(section: Element): string {
+  const select = section.querySelector<HTMLSelectElement>(
+    '[data-field="project-id-select"]',
+  );
+  const input = section.querySelector<HTMLInputElement>(
+    '[data-field="project-id-input"]',
+  );
+
+  const selectIsUsable =
+    select != null &&
+    !select.hidden &&
+    select.value !== "__manual__";
+
+  if (selectIsUsable) {
+    return select.value.trim();
+  }
+
+  return input?.value.trim() ?? "";
+}
+
 export function readProviderConfigFromSection(
   section: HTMLElement,
 ): ProviderConfigValues | null {
@@ -106,15 +224,12 @@ export function readProviderConfigFromSection(
 
   // Google STT options
   const options: Record<string, string> = {};
-  const projectIdInput = section.querySelector<HTMLInputElement>('[data-field="project-id"]');
+  const projectId = getGoogleSttProjectId(section);
   const locationInput = section.querySelector<HTMLSelectElement>('[data-field="location"]');
   const recognizerIdInput = section.querySelector<HTMLInputElement>('[data-field="recognizer-id"]');
-  const languageCodeInput = section.querySelector<HTMLInputElement>('[data-field="language-code"]');
+  const languageCodeSelect = section.querySelector<HTMLSelectElement>('[data-field="language-code"]');
 
-  if (projectIdInput) {
-    const v = projectIdInput.value.trim();
-    if (v) options.project_id = v;
-  }
+  if (projectId) options.project_id = projectId;
   if (locationInput) {
     const v = locationInput.value.trim();
     if (v) options.location = v;
@@ -123,8 +238,8 @@ export function readProviderConfigFromSection(
     const v = recognizerIdInput.value.trim();
     if (v) options.recognizer_id = v;
   }
-  if (languageCodeInput) {
-    const v = languageCodeInput.value.trim();
+  if (languageCodeSelect) {
+    const v = languageCodeSelect.value.trim();
     if (v) options.language_code = v;
   }
 

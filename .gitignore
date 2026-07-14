@@ -2,3 +2,8 @@ node_modules/
 dist/
 src-tauri/target/
 *.log
+/test-audio.wav
+/test-speech-jp.wav
+/dev-screenshot.png
+/screenshot.png
+/screenshot.jpg

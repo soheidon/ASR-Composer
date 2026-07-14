@@ -6,6 +6,11 @@ import {
   createProviderConfigState,
   saveDirtyProviderConfig,
   prepareProviderForModelFetch,
+  getGoogleSttProjectId,
+  buildGoogleSttProjectOptions,
+  shouldAutoSaveProject,
+  setGoogleSttAdvancedOpen,
+  ensureSelectValue,
 } from "./provider-config-save";
 
 const app = document.getElementById("app")!;
@@ -117,15 +122,23 @@ function buildGoogleSttDetail(_p: ProviderDefinition): string {
           </div>
 
           <div class="api-field-group">
-            <label class="api-field-label">Project ID <span class="api-field-required">*</span></label>
-            <input type="text" class="google-stt-project-id" data-field="project-id"
-                   placeholder="例: my-project-123"
-                   pattern="^[a-z][a-z0-9\\-]{4,28}[a-z0-9]$" />
-            <p class="model-hint">小文字英数字とハイフン、6〜30文字、小文字英字で始まりハイフンで終わらない</p>
+            <label class="api-field-label">Google Cloud プロジェクト <span class="api-field-required">*</span></label>
+            <div class="google-stt-project-row">
+              <select class="google-stt-project-select" data-field="project-id-select">
+                <option value="">読み込み中...</option>
+              </select>
+              <input type="text" class="google-stt-project-input" data-field="project-id-input"
+                     placeholder="Project IDを入力" hidden />
+              <button class="btn-google-stt-refresh-projects" type="button">
+                <span class="material-symbols-outlined">refresh</span>
+                再取得
+              </button>
+            </div>
+            <p class="google-stt-project-error" data-field="project-error" style="display:none;"></p>
           </div>
 
           <div class="api-field-group">
-            <label class="api-field-label">Location <span class="api-field-required">*</span></label>
+            <label class="api-field-label">リージョン <span class="api-field-required">*</span></label>
             <select class="google-stt-location" data-field="location">
               <option value="us-central1">us-central1</option>
               <option value="asia-southeast1">asia-southeast1</option>
@@ -134,25 +147,32 @@ function buildGoogleSttDetail(_p: ProviderDefinition): string {
           </div>
 
           <div class="api-field-group">
-            <label class="api-field-label">Recognizer ID</label>
-            <input type="text" class="google-stt-recognizer-id" data-field="recognizer-id"
-                   placeholder="_（既定の暗黙Recognizer）" value="_" />
-            <p class="model-hint">デフォルトの <code>_</code> のままにしておくと、明示的なRecognizer作成なしで利用できます</p>
+            <label class="api-field-label">認識言語</label>
+            <select class="google-stt-language-code" data-field="language-code">
+              <option value="ja-JP" selected>日本語（ja-JP）</option>
+              <option value="en-US">英語（en-US）</option>
+            </select>
           </div>
 
           <div class="api-field-group">
-            <label class="api-field-label">Model</label>
-            <div class="model-select-row">
-              <select class="model-select" data-field="model">
-                <option value="chirp_2" selected>chirp_2</option>
-              </select>
+            <label class="api-field-label">認識モデル</label>
+            <select class="model-select" data-field="model" disabled>
+              <option value="chirp_2" selected>chirp_2</option>
+            </select>
+          </div>
+
+          <div class="google-stt-advanced-toggle">
+            <button type="button" class="btn-google-stt-advanced" data-field="advanced-toggle" aria-expanded="false">
+              <span class="material-symbols-outlined accordion-chevron">chevron_right</span>
+              詳細設定
+            </button>
+          </div>
+          <div class="google-stt-advanced-content" data-field="advanced-content" style="display:none;">
+            <div class="api-field-group">
+              <label class="api-field-label">Recognizer ID</label>
+              <input type="text" class="google-stt-recognizer-id" data-field="recognizer-id"
+                     value="_" />
             </div>
-          </div>
-
-          <div class="api-field-group">
-            <label class="api-field-label">Language Code</label>
-            <input type="text" class="google-stt-language-code" data-field="language-code"
-                   value="ja-JP" />
           </div>
 
           <div class="google-stt-recognize-section">
@@ -540,25 +560,22 @@ async function saveProviderConfigFromSection(
 
   // Google STT: options を読み取る
   const options: Record<string, string> = {};
-  const projectIdInput = section.querySelector<HTMLInputElement>('[data-field="project-id"]');
-  const locationInput = section.querySelector<HTMLSelectElement>('[data-field="location"]');
+  const projectId = getGoogleSttProjectId(section);
+  const locationSelect = section.querySelector<HTMLSelectElement>('[data-field="location"]');
   const recognizerIdInput = section.querySelector<HTMLInputElement>('[data-field="recognizer-id"]');
-  const languageCodeInput = section.querySelector<HTMLInputElement>('[data-field="language-code"]');
+  const languageCodeSelect = section.querySelector<HTMLSelectElement>('[data-field="language-code"]');
 
-  if (projectIdInput) {
-    const v = projectIdInput.value.trim();
-    if (v) options.project_id = v;
-  }
-  if (locationInput) {
-    const v = locationInput.value.trim();
+  if (projectId) options.project_id = projectId;
+  if (locationSelect) {
+    const v = locationSelect.value.trim();
     if (v) options.location = v;
   }
   if (recognizerIdInput) {
     const v = recognizerIdInput.value.trim();
     if (v) options.recognizer_id = v;
   }
-  if (languageCodeInput) {
-    const v = languageCodeInput.value.trim();
+  if (languageCodeSelect) {
+    const v = languageCodeSelect.value.trim();
     if (v) options.language_code = v;
   }
 
@@ -817,14 +834,21 @@ async function loadSavedSettings() {
 
       // Google STT options の復元
       if (saved?.options) {
-        const projectInput = item.querySelector<HTMLInputElement>('[data-field="project-id"]');
-        const locationInput = item.querySelector<HTMLSelectElement>('[data-field="location"]');
+        const locationSelect = item.querySelector<HTMLSelectElement>('[data-field="location"]');
         const recognizerInput = item.querySelector<HTMLInputElement>('[data-field="recognizer-id"]');
-        const langInput = item.querySelector<HTMLInputElement>('[data-field="language-code"]');
-        if (projectInput && saved.options.project_id) projectInput.value = saved.options.project_id;
-        if (locationInput && saved.options.location) locationInput.value = saved.options.location;
+        const langSelect = item.querySelector<HTMLSelectElement>('[data-field="language-code"]');
+        // project-id は data属性経由で loadGoogleSttProjects に渡す
+        if (saved.options.project_id) item.dataset.googleSttSavedProjectId = saved.options.project_id;
+        if (locationSelect && saved.options.location) locationSelect.value = saved.options.location;
         if (recognizerInput && saved.options.recognizer_id) recognizerInput.value = saved.options.recognizer_id;
-        if (langInput && saved.options.language_code) langInput.value = saved.options.language_code;
+        if (langSelect && saved.options.language_code) ensureSelectValue(langSelect, saved.options.language_code);
+      }
+
+      // Google STT プロジェクト読み込み起動
+      if (providerId === "google_stt") {
+        loadGoogleSttProjects(item).finally(() => {
+          delete item.dataset.googleSttSavedProjectId;
+        });
       }
     });
   } catch (e) {
@@ -997,8 +1021,28 @@ function bindProviderConfigAutoSave() {
       });
     }
 
-    // Google STT options: input→dirty, blur→save
-    item.querySelectorAll<HTMLInputElement>('[data-field="project-id"], [data-field="recognizer-id"], [data-field="language-code"]').forEach((optInput) => {
+    // Google STT options: select/input→dirty, blur/change→save
+    // project-id-select: change→dirty+save
+    item.querySelectorAll<HTMLSelectElement>('[data-field="project-id-select"]').forEach((optSelect) => {
+      optSelect.addEventListener("change", () => {
+        if (optSelect.value === "__manual__") {
+          switchToManualProjectInput(item, "", null);
+          const input = item.querySelector<HTMLInputElement>('[data-field="project-id-input"]');
+          if (input) input.focus();
+          return;
+        }
+        providerConfigState.markDirty(providerId);
+        saveDirtyProviderConfig({
+          providerId: providerId!,
+          section: item,
+          state: providerConfigState,
+          saveConfig: saveProviderConfigFromSection,
+        });
+      });
+    });
+
+    // project-id-input: input→dirty, blur→save
+    item.querySelectorAll<HTMLInputElement>('[data-field="project-id-input"]').forEach((optInput) => {
       optInput.addEventListener("input", () => providerConfigState.markDirty(providerId));
       optInput.addEventListener("blur", () => {
         saveDirtyProviderConfig({
@@ -1010,7 +1054,21 @@ function bindProviderConfigAutoSave() {
       });
     });
 
-    item.querySelectorAll<HTMLSelectElement>('[data-field="location"]').forEach((optSelect) => {
+    // recognizer-id: input→dirty, blur→save
+    item.querySelectorAll<HTMLInputElement>('[data-field="recognizer-id"]').forEach((optInput) => {
+      optInput.addEventListener("input", () => providerConfigState.markDirty(providerId));
+      optInput.addEventListener("blur", () => {
+        saveDirtyProviderConfig({
+          providerId: providerId!,
+          section: item,
+          state: providerConfigState,
+          saveConfig: saveProviderConfigFromSection,
+        });
+      });
+    });
+
+    // language-code, location: change→dirty+save
+    item.querySelectorAll<HTMLSelectElement>('[data-field="language-code"], [data-field="location"]').forEach((optSelect) => {
       optSelect.addEventListener("change", () => {
         providerConfigState.markDirty(providerId);
         saveDirtyProviderConfig({
@@ -1019,6 +1077,24 @@ function bindProviderConfigAutoSave() {
           state: providerConfigState,
           saveConfig: saveProviderConfigFromSection,
         });
+      });
+    });
+
+    // 再取得ボタン
+    item.querySelectorAll<HTMLButtonElement>('.btn-google-stt-refresh-projects').forEach((refreshBtn) => {
+      refreshBtn.addEventListener("click", () => {
+        loadGoogleSttProjects(item);
+      });
+    });
+
+    // 詳細設定トグル
+    item.querySelectorAll<HTMLButtonElement>('[data-field="advanced-toggle"]').forEach((toggleBtn) => {
+      toggleBtn.addEventListener("click", () => {
+        const content = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+        if (!content) return;
+        const open = content.hidden;
+        setGoogleSttAdvancedOpen(toggleBtn, content, open);
+        toggleBtn.classList.toggle("is-open", open);
       });
     });
 
@@ -1135,6 +1211,101 @@ function bindFetchModelsButtons() {
   });
 }
 
+// ---- Google STT: loadGoogleSttProjects ----
+
+async function loadGoogleSttProjects(section: Element): Promise<void> {
+  const select = section.querySelector<HTMLSelectElement>(
+    '[data-field="project-id-select"]',
+  );
+  const errorEl = section.querySelector<HTMLElement>(
+    '[data-field="project-error"]',
+  );
+  if (!select) return;
+
+  if (errorEl) errorEl.style.display = "none";
+  select.innerHTML = '<option value="">読み込み中...</option>';
+
+  // 保存済みproject_idをdata属性から取得（loadSavedSettingsで設定済み）
+  // selectの現在値は使わない（再取得時は「読み込み中...」で上書き済みのため）
+  const savedProjectId =
+    (section as HTMLElement).dataset.googleSttSavedProjectId || null;
+
+  try {
+    const result = await invokeTauri<{
+      projects: Array<{ projectId: string; name: string }>;
+      currentProject: string | null;
+    }>("google_stt_list_projects");
+
+    if (result.projects.length === 0) {
+      if (result.currentProject) {
+        switchToManualProjectInput(section, result.currentProject, errorEl);
+        return;
+      }
+      switchToManualProjectInput(section, "", errorEl);
+      return;
+    }
+
+    const optionsResult = buildGoogleSttProjectOptions({
+      projects: result.projects,
+      currentProject: result.currentProject,
+      savedProjectId,
+    });
+
+    // DOM構築: innerHTMLを使わずnew Option()で安全に
+    select.replaceChildren();
+    for (const opt of optionsResult.options) {
+      select.add(new Option(opt.label, opt.value));
+    }
+    if (optionsResult.selectedValue) {
+      select.value = optionsResult.selectedValue;
+    }
+
+    // 自動保存: 保存値なし + current_project自動選択時のみ
+    if (shouldAutoSaveProject({
+      selectedBy: optionsResult.selectedBy,
+      savedProjectId,
+    })) {
+      providerConfigState.markDirty("google_stt");
+      await saveDirtyProviderConfig({
+        providerId: "google_stt",
+        section: section as HTMLElement,
+        state: providerConfigState,
+        saveConfig: saveProviderConfigFromSection,
+      });
+    }
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    switchToManualProjectInput(section, "", errorEl, msg);
+  }
+}
+
+function switchToManualProjectInput(
+  section: Element,
+  fallbackValue: string,
+  errorEl: HTMLElement | null,
+  errorMsg?: string,
+): void {
+  const select = section.querySelector<HTMLSelectElement>(
+    '[data-field="project-id-select"]',
+  );
+  const input = section.querySelector<HTMLInputElement>(
+    '[data-field="project-id-input"]',
+  );
+  if (select) select.hidden = true;
+  if (input) {
+    input.hidden = false;
+    if (fallbackValue) input.value = fallbackValue;
+  }
+  if (errorEl) {
+    if (errorMsg) {
+      errorEl.textContent = errorMsg;
+      errorEl.style.display = "";
+    } else {
+      errorEl.style.display = "none";
+    }
+  }
+}
+
 // ---- Common: fetchProviderModels ----
 
 async function fetchProviderModels(providerId: string, item: Element, btn: HTMLElement): Promise<boolean> {
@@ -1235,9 +1406,21 @@ async function runAdcCheck(item: HTMLElement, btn: HTMLElement): Promise<void> {
       if (quotaEl) quotaEl.textContent = parts.join(" / ") || "プロジェクト情報なし";
 
       // Project IDが空欄の場合のみcurrent_projectを自動入力
-      const projectIdInput = item.querySelector<HTMLInputElement>('[data-field="project-id"]');
-      if (projectIdInput && !projectIdInput.value.trim() && status.current_project) {
-        projectIdInput.value = status.current_project;
+      const currentProjectId = getGoogleSttProjectId(item);
+      if (!currentProjectId && status.current_project) {
+        const select = item.querySelector<HTMLSelectElement>('[data-field="project-id-select"]');
+        const input = item.querySelector<HTMLInputElement>('[data-field="project-id-input"]');
+        if (select && !select.hidden) {
+          const match = Array.from(select.options).find(o => o.value === status.current_project);
+          if (match) {
+            select.value = status.current_project;
+          } else {
+            select.hidden = true;
+            if (input) { input.hidden = false; input.value = status.current_project; }
+          }
+        } else if (input) {
+          input.value = status.current_project;
+        }
         providerConfigState.markDirty("google_stt");
         saveDirtyProviderConfig({
           providerId: "google_stt",
@@ -1267,25 +1450,15 @@ async function runRecognizeTest(item: HTMLElement, btn: HTMLElement): Promise<vo
     return;
   }
 
-  const projectId = item.querySelector<HTMLInputElement>('[data-field="project-id"]')?.value?.trim();
+  const projectId = getGoogleSttProjectId(item);
   if (!projectId) {
-    await showAppDialog({ title: "Project ID未入力", message: "Project IDを入力してください。", type: "error" });
-    return;
-  }
-
-  const projectIdPattern = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
-  if (!projectIdPattern.test(projectId)) {
-    await showAppDialog({
-      title: "Project ID形式エラー",
-      message: "Project IDは6〜30文字、小文字英数字とハイフン、小文字英字で始まりハイフンで終わらない必要があります。",
-      type: "error",
-    });
+    await showAppDialog({ title: "プロジェクト未選択", message: "Google Cloud プロジェクトを選択または入力してください。", type: "error" });
     return;
   }
 
   const location = item.querySelector<HTMLSelectElement>('[data-field="location"]')?.value || "us-central1";
   const recognizerId = item.querySelector<HTMLInputElement>('[data-field="recognizer-id"]')?.value?.trim() || "_";
-  const languageCode = item.querySelector<HTMLInputElement>('[data-field="language-code"]')?.value?.trim() || "ja-JP";
+  const languageCode = item.querySelector<HTMLSelectElement>('[data-field="language-code"]')?.value?.trim() || "ja-JP";
 
   const originalHtml = btn.innerHTML;
   btn.innerHTML = '<span class="material-symbols-outlined spin">mic</span> 認識中...';
