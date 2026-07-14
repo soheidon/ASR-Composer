@@ -1234,7 +1234,15 @@ function bindFetchModelsButtons() {
 
         const classified = classifyFetchError(e);
         setStatusBadge(item.querySelector<HTMLElement>("[data-status-badge]"), classified.status);
-        await showAppDialog({ title: "モデル取得エラー", message: "モデル一覧の取得に失敗しました。\n" + classified.message, type: "error" });
+
+        let message = "モデル一覧を取得できませんでした。\n\n推奨モデルまたはモデルIDの直接入力は引き続き利用できます。";
+        if (classified.status === "認証エラー") {
+          const providerName = providerId === "moonshot" ? "Moonshot" : "";
+          if (providerName) {
+            message = `${providerName} APIキーが認証されませんでした。\n\n推奨モデルまたはモデルIDの直接入力は引き続き利用できます。`;
+          }
+        }
+        await showAppDialog({ title: "モデル取得エラー", message, type: "error" });
         btn.innerHTML = originalHtml;
       } finally {
         (btn as HTMLButtonElement).disabled = false;
