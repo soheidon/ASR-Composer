@@ -3,7 +3,9 @@ import { describe, it, expect } from "vitest";
 import {
   setButtonLoading,
   restoreButtonLoading,
+  setGoogleSttAdvancedOpen,
 } from "./provider-config-save";
+import { asrProviders } from "./providers";
 
 /**
  * Google STT 組み込みテスト・表示に関するDOM整合性テスト。
@@ -221,5 +223,257 @@ describe("Google STT file selection cancel", () => {
     }
     // verify result unchanged
     expect(resultEl.textContent).toBe(prevText);
+  });
+});
+
+// ---- Advanced toggle DOM integration ----
+
+describe("Google STT advanced toggle click-to-open", () => {
+  function buildAccordionItem(): HTMLElement {
+    document.body.innerHTML = `
+      <div class="accordion-item" data-provider-id="google_stt">
+        <div class="accordion-detail" style="">
+          <div class="accordion-detail-inner">
+            <div class="google-stt-advanced-toggle">
+              <button type="button" class="btn-google-stt-advanced"
+                      data-field="advanced-toggle" aria-expanded="false">
+                詳細設定
+              </button>
+            </div>
+            <div class="google-stt-advanced-content"
+                 data-field="advanced-content" hidden>
+              <input data-field="recognizer-id" value="_" />
+            </div>
+          </div>
+        </div>
+      </div>`;
+    return document.querySelector(".accordion-item") as HTMLElement;
+  }
+
+  it("advanced content starts hidden", () => {
+    const item = buildAccordionItem();
+    const content = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+    expect(content).toBeTruthy();
+    expect(content!.hidden).toBe(true);
+  });
+
+  it("clicking toggle opens content via setGoogleSttAdvancedOpen", () => {
+    const item = buildAccordionItem();
+    const toggleBtn = item.querySelector<HTMLButtonElement>('[data-field="advanced-toggle"]')!;
+    const content = item.querySelector<HTMLElement>('[data-field="advanced-content"]')!;
+
+    // Wire the same logic as bindProviderConfigAutoSave
+    toggleBtn.addEventListener("click", () => {
+      const c = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+      if (!c) return;
+      const open = c.hidden;
+      setGoogleSttAdvancedOpen(toggleBtn, c, open);
+      toggleBtn.classList.toggle("is-open", open);
+    });
+
+    expect(content.hidden).toBe(true);
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("false");
+
+    // First click: opens
+    toggleBtn.click();
+    expect(content.hidden).toBe(false);
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("true");
+    expect(toggleBtn.classList.contains("is-open")).toBe(true);
+
+    // Second click: closes
+    toggleBtn.click();
+    expect(content.hidden).toBe(true);
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("false");
+    expect(toggleBtn.classList.contains("is-open")).toBe(false);
+  });
+
+  it("multiple open-close cycles stay consistent", () => {
+    const item = buildAccordionItem();
+    const toggleBtn = item.querySelector<HTMLButtonElement>('[data-field="advanced-toggle"]')!;
+    const content = item.querySelector<HTMLElement>('[data-field="advanced-content"]')!;
+
+    toggleBtn.addEventListener("click", () => {
+      const c = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+      if (!c) return;
+      const open = c.hidden;
+      setGoogleSttAdvancedOpen(toggleBtn, c, open);
+      toggleBtn.classList.toggle("is-open", open);
+    });
+
+    for (let i = 0; i < 3; i++) {
+      toggleBtn.click();
+      expect(content.hidden).toBe(false);
+      toggleBtn.click();
+      expect(content.hidden).toBe(true);
+    }
+  });
+});
+
+// ---- Provider accordion: initial state and toggle ----
+
+describe("Provider accordion initial state and toggle", () => {
+  function buildProviderAccordion(): HTMLElement {
+    // Build the same structure as buildProviderSection → providerAccordionItem
+    const cards = asrProviders.map((p, i) => `
+      <div class="accordion-item" data-index="${i}" data-provider-id="${p.id}">
+        <button class="accordion-header accordion-header-collapsed" type="button" aria-expanded="false">
+          <div class="accordion-header-left">
+            <span class="material-symbols-outlined accordion-chevron">chevron_right</span>
+            <div class="accordion-icon-circle">
+              <span class="material-symbols-outlined">${p.icon}</span>
+            </div>
+            <span class="accordion-title">${p.company}</span>
+            <span class="accordion-title-sub">${p.name}</span>
+          </div>
+          <div class="accordion-header-right">
+            <span data-status-badge class="status-badge status-unconfigured">
+              <span class="status-dot status-dot-unconfigured"></span>未設定
+            </span>
+          </div>
+        </button>
+        <div class="accordion-detail" style="display:none">
+          <div class="accordion-detail-inner">content</div>
+        </div>
+      </div>
+    `).join("");
+
+    document.body.innerHTML = `<div class="accordion-container">${cards}</div>`;
+
+    // Wire the same toggle logic as bindAccordions
+    document.querySelectorAll<HTMLElement>(".accordion-header").forEach((header) => {
+      header.addEventListener("click", () => {
+        const item = header.closest(".accordion-item");
+        if (!item) return;
+        const detail = item.querySelector<HTMLElement>(".accordion-detail");
+        const chevron = header.querySelector<HTMLElement>(".accordion-chevron");
+        if (!detail || !chevron) return;
+
+        const isOpen = detail.style.display !== "none";
+        if (isOpen) {
+          detail.style.display = "none";
+          chevron.classList.remove("rotate-90");
+          header.classList.remove("accordion-header-expanded");
+          header.classList.add("accordion-header-collapsed");
+          header.setAttribute("aria-expanded", "false");
+        } else {
+          detail.style.display = "";
+          chevron.classList.add("rotate-90");
+          header.classList.remove("accordion-header-collapsed");
+          header.classList.add("accordion-header-expanded");
+          header.setAttribute("aria-expanded", "true");
+        }
+      });
+    });
+
+    return document.querySelector(".accordion-container") as HTMLElement;
+  }
+
+  const expectedOrder = asrProviders.map(p => p.id);
+
+  it("ASR providers are in the expected order", () => {
+    expect(expectedOrder).toEqual([
+      "google_stt",
+      "openai_audio",
+      "azure_speech",
+      "xiaomi_mimo_asr",
+      "groq_speech",
+      "deepgram",
+      "assemblyai",
+    ]);
+  });
+
+  it("all provider detail sections are initially hidden (style.display = 'none')", () => {
+    buildProviderAccordion();
+    const details = document.querySelectorAll<HTMLElement>(".accordion-detail");
+    expect(details.length).toBe(asrProviders.length);
+    for (const detail of details) {
+      expect(detail.style.display).toBe("none");
+    }
+  });
+
+  it("all provider headers initially have aria-expanded='false'", () => {
+    buildProviderAccordion();
+    const headers = document.querySelectorAll<HTMLElement>(".accordion-header");
+    for (const header of headers) {
+      expect(header.getAttribute("aria-expanded")).toBe("false");
+    }
+  });
+
+  it("all headers initially have accordion-header-collapsed (none expanded)", () => {
+    buildProviderAccordion();
+    const headers = document.querySelectorAll<HTMLElement>(".accordion-header");
+    for (const header of headers) {
+      expect(header.classList.contains("accordion-header-collapsed")).toBe(true);
+      expect(header.classList.contains("accordion-header-expanded")).toBe(false);
+    }
+  });
+
+  it("google_stt (first item) is NOT initially expanded", () => {
+    buildProviderAccordion();
+    const googleStt = document.querySelector<HTMLElement>('[data-provider-id="google_stt"]')!;
+    const detail = googleStt.querySelector<HTMLElement>(".accordion-detail")!;
+    const header = googleStt.querySelector<HTMLElement>(".accordion-header")!;
+    expect(detail.style.display).toBe("none");
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("openai_audio is NOT initially expanded", () => {
+    buildProviderAccordion();
+    const openai = document.querySelector<HTMLElement>('[data-provider-id="openai_audio"]')!;
+    const detail = openai.querySelector<HTMLElement>(".accordion-detail")!;
+    expect(detail.style.display).toBe("none");
+  });
+
+  it("clicking google_stt header opens its detail", () => {
+    buildProviderAccordion();
+    const googleStt = document.querySelector<HTMLElement>('[data-provider-id="google_stt"]')!;
+    const header = googleStt.querySelector<HTMLElement>(".accordion-header")!;
+    const detail = googleStt.querySelector<HTMLElement>(".accordion-detail")!;
+
+    header.click();
+
+    expect(detail.style.display).toBe("");
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+    expect(header.classList.contains("accordion-header-expanded")).toBe(true);
+  });
+
+  it("clicking google_stt header again closes its detail", () => {
+    buildProviderAccordion();
+    const googleStt = document.querySelector<HTMLElement>('[data-provider-id="google_stt"]')!;
+    const header = googleStt.querySelector<HTMLElement>(".accordion-header")!;
+    const detail = googleStt.querySelector<HTMLElement>(".accordion-detail")!;
+
+    header.click(); // open
+    header.click(); // close
+
+    expect(detail.style.display).toBe("none");
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+    expect(header.classList.contains("accordion-header-collapsed")).toBe(true);
+  });
+
+  it("clicking openai_audio header opens its detail independently", () => {
+    buildProviderAccordion();
+    const openai = document.querySelector<HTMLElement>('[data-provider-id="openai_audio"]')!;
+    const header = openai.querySelector<HTMLElement>(".accordion-header")!;
+    const detail = openai.querySelector<HTMLElement>(".accordion-detail")!;
+
+    header.click();
+
+    expect(detail.style.display).toBe("");
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("badge is '設定済み' does NOT auto-expand the provider", () => {
+    buildProviderAccordion();
+    // Simulate that google_stt has a configured badge
+    const googleStt = document.querySelector<HTMLElement>('[data-provider-id="google_stt"]')!;
+    const badge = googleStt.querySelector<HTMLElement>("[data-status-badge]")!;
+    badge.classList.remove("status-unconfigured");
+    badge.classList.add("status-configured");
+    badge.textContent = "設定済み";
+
+    // Re-render is not triggered, but detail should still be closed
+    const detail = googleStt.querySelector<HTMLElement>(".accordion-detail")!;
+    expect(detail.style.display).toBe("none");
   });
 });

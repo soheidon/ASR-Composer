@@ -44,20 +44,16 @@ async function invokeTauri<T>(command: string, args?: Record<string, unknown>): 
 
 // ---- Template Builders ----
 
-function providerAccordionItem(p: ProviderDefinition, index: number, isFirst: boolean): string {
-  const chevronRotate = isFirst ? "rotate-90" : "";
-  const headerBg = isFirst ? "accordion-header-expanded" : "accordion-header-collapsed";
-  const detailDisplay = isFirst ? "" : 'style="display:none"';
-
+function providerAccordionItem(p: ProviderDefinition, index: number): string {
   const detailBody = p.id === "google_stt"
     ? buildGoogleSttDetail(p)
     : buildStandardDetail(p);
 
   return `
     <div class="accordion-item" data-index="${index}" data-provider-id="${p.id}">
-      <button class="accordion-header ${headerBg}" type="button">
+      <button class="accordion-header accordion-header-collapsed" type="button" aria-expanded="false">
         <div class="accordion-header-left">
-          <span class="material-symbols-outlined accordion-chevron ${chevronRotate}">chevron_right</span>
+          <span class="material-symbols-outlined accordion-chevron">chevron_right</span>
           <div class="accordion-icon-circle">
             <span class="material-symbols-outlined">${p.icon}</span>
           </div>
@@ -71,7 +67,7 @@ function providerAccordionItem(p: ProviderDefinition, index: number, isFirst: bo
           </span>
         </div>
       </button>
-      <div class="accordion-detail" ${detailDisplay}>
+      <div class="accordion-detail" style="display:none">
         <div class="accordion-detail-inner">
           ${detailBody}
         </div>
@@ -170,7 +166,7 @@ function buildGoogleSttDetail(_p: ProviderDefinition): string {
               詳細設定
             </button>
           </div>
-          <div class="google-stt-advanced-content" data-field="advanced-content" style="display:none;">
+          <div class="google-stt-advanced-content" data-field="advanced-content" hidden>
             <div class="api-field-group">
               <label class="api-field-label">Recognizer ID</label>
               <input type="text" class="google-stt-recognizer-id" data-field="recognizer-id"
@@ -253,8 +249,8 @@ function buildModelSection(p: ProviderDefinition): string {
     </div>`;
 }
 
-function buildProviderSection(title: string, description: string, providers: ProviderDefinition[], expandFirst: boolean): string {
-  const cards = providers.map((p, i) => providerAccordionItem(p, i, expandFirst && i === 0)).join("");
+function buildProviderSection(title: string, description: string, providers: ProviderDefinition[]): string {
+  const cards = providers.map((p, i) => providerAccordionItem(p, i)).join("");
   return `
     <div class="api-section">
       <div class="api-section-header">
@@ -423,8 +419,8 @@ const settingsApiPage = `
       </div>
       <div class="settings-content-body">
         <div class="settings-content-inner">
-          ${buildProviderSection("ASR用API連携", "文字起こしエンジン（ASR）の認証情報を管理します。", asrProviders, true)}
-          ${buildProviderSection("補正LLM用API連携", "文字起こしの補正、翻訳、要約、統合処理に使用する言語モデル（LLM）の認証情報を管理します。", cloudLlmProviders, false)}
+          ${buildProviderSection("ASR用API連携", "文字起こしエンジン（ASR）の認証情報を管理します。", asrProviders)}
+          ${buildProviderSection("補正LLM用API連携", "文字起こしの補正、翻訳、要約、統合処理に使用する言語モデル（LLM）の認証情報を管理します。", cloudLlmProviders)}
         </div>
       </div>
     </div>
@@ -763,11 +759,13 @@ function bindAccordions() {
         chevron.classList.remove("rotate-90");
         header.classList.remove("accordion-header-expanded");
         header.classList.add("accordion-header-collapsed");
+        header.setAttribute("aria-expanded", "false");
       } else {
         detail.style.display = "";
         chevron.classList.add("rotate-90");
         header.classList.remove("accordion-header-collapsed");
         header.classList.add("accordion-header-expanded");
+        header.setAttribute("aria-expanded", "true");
       }
     });
   });

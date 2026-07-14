@@ -4,13 +4,13 @@ import { asrProviders, llmProviders, cloudLlmProviders } from "./providers";
 describe("asrProviders", () => {
   it("has the expected id, company, name in order", () => {
     expect(asrProviders.map(({ id, company, name }) => ({ id, company, name }))).toEqual([
+      { id: "google_stt", company: "Google Cloud", name: "Speech-to-Text" },
       { id: "openai_audio", company: "OpenAI", name: "Audio API" },
+      { id: "azure_speech", company: "Microsoft Azure", name: "Azure Speech" },
+      { id: "xiaomi_mimo_asr", company: "Xiaomi MiMo", name: "Speech Recognition" },
       { id: "groq_speech", company: "Groq", name: "Speech API" },
       { id: "deepgram", company: "Deepgram", name: "Speech API" },
       { id: "assemblyai", company: "AssemblyAI", name: "Speech API" },
-      { id: "google_stt", company: "Google Cloud", name: "Speech-to-Text" },
-      { id: "azure_speech", company: "Microsoft Azure", name: "Azure Speech" },
-      { id: "xiaomi_mimo_asr", company: "Xiaomi MiMo", name: "Speech Recognition" },
     ]);
   });
 });
@@ -88,11 +88,11 @@ describe("model source classification", () => {
       .filter(p => p.modelSource === "manual")
       .map(p => p.id);
     expect(manualProviderIds).toEqual([
-      "deepgram",
-      "assemblyai",
       "google_stt",
       "azure_speech",
       "xiaomi_mimo_asr",
+      "deepgram",
+      "assemblyai",
       "xiaomi_mimo",
       "zai_glm",
     ]);
