@@ -45,9 +45,14 @@ async function invokeTauri<T>(command: string, args?: Record<string, unknown>): 
 // ---- Template Builders ----
 
 function providerAccordionItem(p: ProviderDefinition, index: number): string {
-  const detailBody = p.id === "google_stt"
-    ? buildGoogleSttDetail(p)
-    : buildStandardDetail(p);
+  let detailBody: string;
+  if (p.id === "google_stt") {
+    detailBody = buildGoogleSttDetail(p);
+  } else if (p.id === "xiaomi_mimo_asr") {
+    detailBody = buildXiaomiMimoAsrDetail(p);
+  } else {
+    detailBody = buildStandardDetail(p);
+  }
 
   return `
     <div class="accordion-item" data-index="${index}" data-provider-id="${p.id}">
@@ -189,6 +194,17 @@ function buildGoogleSttDetail(_p: ProviderDefinition): string {
               接続・認識テスト
             </button>
             <div class="google-stt-result" data-field="recognize-result" style="display:none;"></div>
+          </div>`;
+}
+
+function buildXiaomiMimoAsrDetail(_p: ProviderDefinition): string {
+  return `
+          <div class="xiaomi-mimo-asr-pending">
+            <div class="xiaomi-mimo-asr-pending-icon">
+              <span class="material-symbols-outlined">construction</span>
+            </div>
+            <p class="xiaomi-mimo-asr-pending-title">MiMo-V2.5-ASRの接続仕様を確認中です</p>
+            <p class="xiaomi-mimo-asr-pending-desc">現在のバージョンではまだ音声認識を実行できません。中国語・英語の音声認識サービスが公式提供されていますが、接続設定はまだ実装されていません。</p>
           </div>`;
 }
 

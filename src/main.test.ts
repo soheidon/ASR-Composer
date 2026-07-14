@@ -477,3 +477,96 @@ describe("Provider accordion initial state and toggle", () => {
     expect(detail.style.display).toBe("none");
   });
 });
+
+// ---- Xiaomi MiMo ASR pending UI ----
+
+describe("Xiaomi MiMo ASR pending UI", () => {
+  function buildMimoAsrAccordion(): HTMLElement {
+    document.body.innerHTML = `
+      <div class="accordion-item" data-provider-id="xiaomi_mimo_asr">
+        <button class="accordion-header accordion-header-collapsed" type="button" aria-expanded="false">
+          <span class="accordion-title">Xiaomi MiMo</span>
+          <span class="accordion-title-sub">Speech Recognition</span>
+        </button>
+        <div class="accordion-detail" style="display:none">
+          <div class="accordion-detail-inner">
+            <div class="xiaomi-mimo-asr-pending">
+              <div class="xiaomi-mimo-asr-pending-icon">
+                <span class="material-symbols-outlined">construction</span>
+              </div>
+              <p class="xiaomi-mimo-asr-pending-title">MiMo-V2.5-ASRの接続仕様を確認中です</p>
+              <p class="xiaomi-mimo-asr-pending-desc">現在のバージョンではまだ音声認識を実行できません。</p>
+            </div>
+          </div>
+        </div>
+      </div>`;
+
+    // Wire accordion toggle
+    const header = document.querySelector(".accordion-header") as HTMLElement;
+    header.addEventListener("click", () => {
+      const detail = document.querySelector(".accordion-detail") as HTMLElement;
+      const isOpen = detail.style.display !== "none";
+      detail.style.display = isOpen ? "none" : "";
+      header.setAttribute("aria-expanded", String(!isOpen));
+      header.classList.toggle("accordion-header-expanded", !isOpen);
+      header.classList.toggle("accordion-header-collapsed", isOpen);
+    });
+
+    return document.querySelector(".accordion-item") as HTMLElement;
+  }
+
+  it("shows pending message with construction icon", () => {
+    const item = buildMimoAsrAccordion();
+    const pending = item.querySelector(".xiaomi-mimo-asr-pending");
+    expect(pending).toBeTruthy();
+    expect(pending!.textContent).toContain("接続仕様を確認中");
+  });
+
+  it("does not show Base URL input", () => {
+    const item = buildMimoAsrAccordion();
+    const baseUrl = item.querySelector('[data-field="base-url"]');
+    expect(baseUrl).toBeNull();
+  });
+
+  it("does not show model input or select", () => {
+    const item = buildMimoAsrAccordion();
+    const model = item.querySelector('[data-field="model"]');
+    const modelManual = item.querySelector('[data-field="model-manual"]');
+    expect(model).toBeNull();
+    expect(modelManual).toBeNull();
+  });
+
+  it("does not show test send button", () => {
+    const item = buildMimoAsrAccordion();
+    const testBtn = item.querySelector(".btn-test-send");
+    expect(testBtn).toBeNull();
+  });
+
+  it("does not show API key input", () => {
+    const item = buildMimoAsrAccordion();
+    const apiKey = item.querySelector('[data-field="api-key"]');
+    expect(apiKey).toBeNull();
+  });
+
+  it("accordion header can be clicked to open", () => {
+    const item = buildMimoAsrAccordion();
+    const header = item.querySelector(".accordion-header") as HTMLElement;
+    const detail = item.querySelector(".accordion-detail") as HTMLElement;
+
+    expect(detail.style.display).toBe("none");
+    header.click();
+    expect(detail.style.display).toBe("");
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("accordion header can be clicked to close", () => {
+    const item = buildMimoAsrAccordion();
+    const header = item.querySelector(".accordion-header") as HTMLElement;
+    const detail = item.querySelector(".accordion-detail") as HTMLElement;
+
+    header.click(); // open
+    header.click(); // close
+    expect(detail.style.display).toBe("none");
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+  });
+});
