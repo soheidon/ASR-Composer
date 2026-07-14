@@ -11,7 +11,8 @@
   },
   "bundle": {
     "resources": [
-      "resources/google-stt-test-ja.wav"
+      "resources/google-stt-test-ja.wav",
+      "resources/xiaomi-mimo-asr-test-en.wav"
     ]
   },
   "app": {

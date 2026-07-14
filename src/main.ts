@@ -14,6 +14,8 @@ import {
   setGoogleSttStatus,
   invalidateGoogleSttVerification,
   getGoogleSttConfiguredState,
+  setButtonLoading,
+  restoreButtonLoading,
 } from "./provider-config-save";
 
 const app = document.getElementById("app")!;
@@ -197,14 +199,64 @@ function buildGoogleSttDetail(_p: ProviderDefinition): string {
           </div>`;
 }
 
-function buildXiaomiMimoAsrDetail(_p: ProviderDefinition): string {
+function buildXiaomiMimoAsrDetail(p: ProviderDefinition): string {
   return `
-          <div class="xiaomi-mimo-asr-pending">
-            <div class="xiaomi-mimo-asr-pending-icon">
-              <span class="material-symbols-outlined">construction</span>
+          <div class="api-field-group">
+            <label class="api-field-label">環境変数 / APIキー</label>
+            <div class="api-key-row">
+              <input type="text" class="api-env-input" value="${p.env}" data-default-env="${p.env}" />
+              <div class="api-key-input-wrap">
+                <input type="password" class="api-key-input" placeholder="APIキーを入力" data-field="api-key" />
+                <button class="api-visibility-btn" type="button" title="表示切替">
+                  <span class="material-symbols-outlined">visibility</span>
+                </button>
+              </div>
+              <button class="btn-api-save" type="button" data-provider-id="${p.id}">環境変数に保存</button>
             </div>
-            <p class="xiaomi-mimo-asr-pending-title">MiMo-V2.5-ASRの接続仕様を確認中です</p>
-            <p class="xiaomi-mimo-asr-pending-desc">現在のバージョンではまだ音声認識を実行できません。中国語・英語の音声認識サービスが公式提供されていますが、接続設定はまだ実装されていません。</p>
+          </div>
+          <div class="api-field-group">
+            <label class="api-field-label">Base URL</label>
+            <div class="api-baseurl-row">
+              <input type="text" class="api-baseurl-input" value="${p.defaultBaseUrl}" data-default-url="${p.defaultBaseUrl}" data-field="base-url" />
+              <button class="btn-reset-url" type="button">既定値に戻す</button>
+            </div>
+          </div>
+          <div class="api-field-group">
+            <label class="api-field-label">認識言語</label>
+            <select class="google-stt-language-code" data-field="language-code">
+              <option value="auto" selected>自動検出（auto）</option>
+              <option value="en">English（en）</option>
+              <option value="zh">Chinese（zh）</option>
+            </select>
+          </div>
+          <div class="api-field-group">
+            <label class="api-field-label">認識モデル</label>
+            <select class="model-select" data-field="model" disabled>
+              <option value="mimo-v2.5-asr" selected>mimo-v2.5-asr</option>
+            </select>
+          </div>
+          <div class="google-stt-advanced-toggle">
+            <button type="button" class="btn-google-stt-advanced" data-field="advanced-toggle" aria-expanded="false">
+              <span class="material-symbols-outlined accordion-chevron">chevron_right</span>
+              詳細設定
+            </button>
+          </div>
+          <div class="google-stt-advanced-content" data-field="advanced-content" hidden>
+            <div class="api-field-group">
+              <label class="api-field-label">詳細な確認</label>
+              <button class="btn-google-stt-select-file btn-mimo-asr-select-file" type="button">
+                <span class="material-symbols-outlined">folder_open</span>
+                別の音声ファイルで試す
+              </button>
+            </div>
+          </div>
+          <div class="google-stt-recognize-section">
+            <p class="google-stt-test-description">同梱された短い英語音声（en）で確認します</p>
+            <button class="btn-google-stt-builtin-test btn-mimo-asr-builtin-test" type="button">
+              <span class="material-symbols-outlined">mic</span>
+              接続・認識テスト
+            </button>
+            <div class="google-stt-result" data-field="recognize-result" hidden></div>
           </div>`;
 }
 
@@ -650,6 +702,7 @@ async function navigateTo(page: PageName) {
     bindFetchModelsButtons();
     bindTestSendButtons();
     bindGoogleSttHandlers();
+    bindXiaomiMimoAsrHandlers();
   } else if (page === "settings-ollama") {
     await loadOllamaSettings();
     if (currentPage !== "settings-ollama") return;
@@ -942,6 +995,22 @@ function bindApiSaveButtons() {
         // ステータスバッジ更新: setx失敗時は「一時設定」、成功時は「設定済み」
         const statusBadgeEl = item.querySelector<HTMLElement>("[data-status-badge]");
         setStatusBadge(statusBadgeEl, secretWarning ? "一時設定" : "設定済み");
+
+        // XIAOMI_API_KEYの場合は、xiaomi_mimoとxiaomi_mimo_asr両方の接続確認状態を無効化
+        if (envName === "XIAOMI_API_KEY") {
+          const relatedProviders = ["xiaomi_mimo", "xiaomi_mimo_asr"];
+          for (const relatedId of relatedProviders) {
+            const relatedItem = document.querySelector<HTMLElement>(`.accordion-item[data-provider-id="${relatedId}"]`);
+            if (relatedItem) {
+              const relatedBadge = relatedItem.querySelector<HTMLElement>("[data-status-badge]");
+              const currentState = relatedBadge?.getAttribute("data-connection-state");
+              if (currentState === "verified") {
+                setStatusBadge(relatedBadge, "設定済み");
+                relatedBadge?.setAttribute("data-connection-state", "configured");
+              }
+            }
+          }
+        }
 
         // APIキー入力欄をクリア（セキュリティ上、画面上に残さない）
         if (keyInput) keyInput.value = "";
@@ -1509,12 +1578,169 @@ function bindGoogleSttHandlers() {
     });
   });
 
-  // 接続・認識テスト（同梱音声）
-  document.querySelectorAll<HTMLElement>(".btn-google-stt-builtin-test").forEach((btn) => {
+  // 接続・認識テスト（同梱音声）- Google STTプロバイダー内のみ
+  document.querySelectorAll<HTMLElement>('.accordion-item[data-provider-id="google_stt"] .btn-google-stt-builtin-test').forEach((btn) => {
     btn.addEventListener("click", async () => {
       const item = btn.closest<HTMLElement>(".accordion-item");
       if (!item) return;
       await runBuiltinTest(item, btn);
+    });
+  });
+}
+
+// ---- Xiaomi MiMo ASR ----
+
+type XiaomiMimoAsrResult = {
+  transcript: string;
+  language: string;
+  model: string;
+  provider: string;
+  endpoint: string;
+  httpStatus: number;
+  requestId?: string;
+};
+
+function markXiaomiMimoAsrVerified(item: HTMLElement): void {
+  setStatusBadge(item.querySelector<HTMLElement>("[data-status-badge]"), "接続確認済み");
+  item.querySelector<HTMLElement>("[data-status-badge]")?.setAttribute("data-connection-state", "verified");
+}
+
+function invalidateXiaomiMimoAsrVerification(item: HTMLElement): void {
+  const badge = item.querySelector<HTMLElement>("[data-status-badge]");
+  const currentState = badge?.getAttribute("data-connection-state");
+  if (currentState === "verified") {
+    setStatusBadge(badge, "設定済み");
+    badge?.setAttribute("data-connection-state", "configured");
+  }
+}
+
+function renderXiaomiMimoAsrSuccess(
+  resultEl: HTMLElement,
+  result: XiaomiMimoAsrResult,
+  context: { sourceLabel: string },
+): void {
+  const lines: string[] = [`✓ ${result.provider} APIへの接続と音声認識に成功しました`, ""];
+  lines.push("認識結果:");
+  lines.push(result.transcript || "(空の文字起こし)");
+  lines.push("");
+  lines.push(`接続先: ${result.endpoint}`);
+  lines.push(`HTTP: ${result.httpStatus}`);
+  lines.push(`音声: ${context.sourceLabel}`);
+  lines.push(`認識言語: ${result.language}`);
+  lines.push(`モデル: ${result.model}`);
+  if (result.requestId) {
+    lines.push(`Request ID: ${result.requestId}`);
+  }
+  resultEl.textContent = lines.join("\n");
+  resultEl.className = "google-stt-result google-stt-result-success";
+  resultEl.hidden = false;
+}
+
+function renderXiaomiMimoAsrError(resultEl: HTMLElement, error: unknown, sourceLabel: string): void {
+  const msg = error instanceof Error ? error.message
+    : typeof error === "object" && error !== null && "message" in error ? String((error as { message: unknown }).message)
+    : String(error);
+  const lines = [
+    "✗ 音声認識に失敗しました",
+    "",
+    msg,
+    "",
+    `音声: ${sourceLabel}`,
+  ];
+  resultEl.textContent = lines.join("\n");
+  resultEl.className = "google-stt-result google-stt-result-error";
+  resultEl.hidden = false;
+}
+
+async function runXiaomiMimoAsrBuiltinTest(item: HTMLElement, btn: HTMLButtonElement): Promise<void> {
+  const baseUrl = item.querySelector<HTMLInputElement>('[data-field="base-url"]')?.value?.trim() || "https://api.xiaomimimo.com/v1";
+  const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
+
+  const loadingState = setButtonLoading(btn, '<span class="material-symbols-outlined spin">mic</span> 認識しています…');
+  if (resultEl) { resultEl.hidden = true; resultEl.textContent = ""; }
+
+  try {
+    const result = await invokeTauri<XiaomiMimoAsrResult>(
+      "xiaomi_mimo_asr_run_builtin_test",
+      { input: { baseUrl } },
+    );
+
+    if (resultEl) {
+      renderXiaomiMimoAsrSuccess(resultEl, result, {
+        sourceLabel: "同梱テスト音声（en）",
+      });
+    }
+    markXiaomiMimoAsrVerified(item);
+  } catch (e) {
+    if (resultEl) {
+      renderXiaomiMimoAsrError(resultEl, e, "同梱テスト音声（en）");
+    }
+  } finally {
+    restoreButtonLoading(btn, loadingState);
+  }
+}
+
+async function runXiaomiMimoAsrFileTest(item: HTMLElement, btn: HTMLButtonElement): Promise<void> {
+  const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
+
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: "音声ファイル", extensions: ["wav", "mp3"] }],
+    });
+    if (!selected || typeof selected !== "string") return;
+
+    const fileName = selected.split(/[/\\]/).pop() || selected;
+    const baseUrl = item.querySelector<HTMLInputElement>('[data-field="base-url"]')?.value?.trim() || "https://api.xiaomimimo.com/v1";
+    const language = item.querySelector<HTMLSelectElement>('[data-field="language-code"]')?.value || "auto";
+
+    if (resultEl) { resultEl.hidden = true; resultEl.textContent = ""; }
+
+    const loadingState = setButtonLoading(btn, '<span class="material-symbols-outlined spin">mic</span> 認識しています…');
+    try {
+      const result = await invokeTauri<XiaomiMimoAsrResult>("xiaomi_mimo_asr_recognize", {
+        input: { baseUrl, model: "mimo-v2.5-asr", language, audioPath: selected },
+      });
+      if (resultEl) {
+        renderXiaomiMimoAsrSuccess(resultEl, result, { sourceLabel: `使用ファイル: ${fileName}` });
+      }
+    } catch (e) {
+      if (resultEl) {
+        renderXiaomiMimoAsrError(resultEl, e, `使用ファイル: ${fileName}`);
+      }
+    } finally {
+      restoreButtonLoading(btn, loadingState);
+    }
+  } catch (e) {
+    console.error("open_audio_file_dialog error:", e);
+  }
+}
+
+function bindXiaomiMimoAsrHandlers() {
+  document.querySelectorAll<HTMLElement>('.accordion-item[data-provider-id="xiaomi_mimo_asr"]').forEach((item) => {
+    // 注意: 詳細設定トグルは bindProviderConfigAutoSave() で全プロバイダー共通に登録済み
+    // ここでは重複登録しない
+
+    // 接続・認識テスト（同梱音声）
+    item.querySelectorAll<HTMLButtonElement>(".btn-mimo-asr-builtin-test").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        await runXiaomiMimoAsrBuiltinTest(item, btn);
+      });
+    });
+
+    // 別の音声ファイルで試す（詳細設定内）
+    item.querySelectorAll<HTMLButtonElement>(".btn-mimo-asr-select-file").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        await runXiaomiMimoAsrFileTest(item, btn);
+      });
+    });
+
+    // Base URL変更時に接続確認状態を無効化
+    item.querySelectorAll<HTMLInputElement>('[data-field="base-url"]').forEach((input) => {
+      input.addEventListener("change", () => {
+        invalidateXiaomiMimoAsrVerification(item);
+      });
     });
   });
 }

@@ -186,6 +186,36 @@ fn save_provider_secret(
     }
 }
 
+const MIMO_ASR_MAX_BASE64_SIZE: usize = 10 * 1024 * 1024; // 10MB
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XiaomiMimoAsrRecognizeInput {
+    pub base_url: String,
+    pub model: String,
+    pub language: String,
+    pub audio_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XiaomiMimoAsrBuiltinTestInput {
+    pub base_url: String,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct XiaomiMimoAsrResult {
+    pub transcript: String,
+    pub language: String,
+    pub model: String,
+    pub provider: String,
+    pub endpoint: String,
+    pub http_status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
 fn is_openai_compatible(id: &str) -> bool {
     matches!(
         id,
@@ -266,7 +296,7 @@ fn provider_defaults(provider_id: &str) -> Option<ProviderDefaults> {
             env_name: "MINIMAX_API_KEY",
             base_url: "https://api.minimax.io/v1",
         }),
-        "xiaomi_mimo" => Some(ProviderDefaults {
+        "xiaomi_mimo" | "xiaomi_mimo_asr" => Some(ProviderDefaults {
             env_name: "XIAOMI_API_KEY",
             base_url: "https://api.xiaomimimo.com/v1",
         }),
@@ -1545,6 +1575,259 @@ async fn google_stt_run_builtin_test(
     .await
 }
 
+// ---- Xiaomi MiMo ASR (Chat Completions + input_audio) ----
+
+fn validate_xiaomi_mimo_asr_input(
+    base_url: &str,
+    model: &str,
+    language: &str,
+    audio_path: &std::path::Path,
+) -> Result<(), FetchModelsError> {
+    if base_url.trim().is_empty() {
+        return Err(FetchModelsError {
+            kind: FetchErrorKind::NotConfigured,
+            message: "Base URLを入力してください".to_string(),
+        });
+    }
+    if model.trim().is_empty() {
+        return Err(FetchModelsError {
+            kind: FetchErrorKind::NotConfigured,
+            message: "モデル名を入力してください".to_string(),
+        });
+    }
+    if !["auto", "zh", "en"].contains(&language) {
+        return Err(FetchModelsError {
+            kind: FetchErrorKind::NotConfigured,
+            message: "言語は auto, zh, en のいずれかを指定してください".to_string(),
+        });
+    }
+    if !audio_path.exists() {
+        return Err(FetchModelsError {
+            kind: FetchErrorKind::NotConfigured,
+            message: "音声ファイルが見つかりません".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_xiaomi_mimo_asr_response(
+    json: &serde_json::Value,
+    model: &str,
+    language: &str,
+    endpoint: &str,
+    http_status: u16,
+    request_id: Option<String>,
+) -> Result<XiaomiMimoAsrResult, FetchModelsError> {
+    let content = json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|msg| msg.get("content"));
+
+    let transcript = match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => {
+            // Array形式: [{"type": "text", "text": "..."}] または [{"type": "...", "text": "..."}]
+            let mut texts = Vec::new();
+            for item in arr {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        texts.push(text.to_string());
+                    }
+                }
+            }
+            texts.join("")
+        }
+        _ => {
+            return Err(FetchModelsError {
+                kind: FetchErrorKind::ConnectionError,
+                message: "レスポンスからテキストを取得できませんでした".to_string(),
+            });
+        }
+    };
+
+    Ok(XiaomiMimoAsrResult {
+        transcript,
+        language: language.to_string(),
+        model: model.to_string(),
+        provider: "Xiaomi MiMo".to_string(),
+        endpoint: endpoint.to_string(),
+        http_status,
+        request_id,
+    })
+}
+
+async fn recognize_xiaomi_mimo_audio(
+    base_url: &str,
+    model: &str,
+    language: &str,
+    audio_path: &std::path::Path,
+) -> Result<XiaomiMimoAsrResult, FetchModelsError> {
+    validate_xiaomi_mimo_asr_input(base_url, model, language, audio_path)?;
+
+    // 音声読み込み + base64
+    let audio_bytes = fs::read(audio_path).map_err(|e| FetchModelsError {
+        kind: FetchErrorKind::ConnectionError,
+        message: format!("音声ファイルの読み込みに失敗しました: {}", e),
+    })?;
+
+    if audio_bytes.len() > MIMO_ASR_MAX_BASE64_SIZE {
+        return Err(FetchModelsError {
+            kind: FetchErrorKind::NotConfigured,
+            message: format!(
+                "ファイルサイズが大きすぎます（{}MB）。上限は10MBです。",
+                audio_bytes.len() / 1024 / 1024
+            ),
+        });
+    }
+
+    use base64::Engine;
+    let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
+
+    // Data URL 構築
+    let data_url = format!("data:audio/wav;base64,{}", audio_base64);
+
+    // APIキー取得
+    let api_key = std::env::var("XIAOMI_API_KEY").map_err(|_| FetchModelsError {
+        kind: FetchErrorKind::NotConfigured,
+        message: "XIAOMI_API_KEY が設定されていません".to_string(),
+    })?;
+
+    // リクエスト構築
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": data_url
+                        }
+                    }
+                ]
+            }
+        ],
+        "asr_options": {
+            "language": language
+        }
+    });
+
+    // HTTPリクエスト（api-key ヘッダー使用、NOT Authorization: Bearer）
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("api-key", &api_key)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| FetchModelsError {
+            kind: FetchErrorKind::ConnectionError,
+            message: format!("リクエスト送信に失敗しました: {}", e),
+        })?;
+
+    let http_status = resp.status().as_u16();
+
+    // レスポンスヘッダーからrequest_idを取得（存在する場合）
+    let request_id = resp
+        .headers()
+        .get("x-request-id")
+        .or_else(|| resp.headers().get("x-ms-request-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(classify_http_error(status, &body_text));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| FetchModelsError {
+        kind: FetchErrorKind::ConnectionError,
+        message: format!("レスポンス解析に失敗しました: {}", e),
+    })?;
+
+    // JSON内からもrequest_idを探す（ヘッダーにない場合）
+    let request_id = request_id.or_else(|| {
+        json.get("request_id")
+            .or_else(|| json.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    // endpointからhost/path部分を安全に抽出
+    let endpoint = reqwest::Url::parse(&url)
+        .ok()
+        .map(|u| {
+            let host = u.host_str().unwrap_or("");
+            let path = u.path();
+            format!("{}{}", host, path)
+        })
+        .unwrap_or_else(|| url.clone());
+
+    parse_xiaomi_mimo_asr_response(&json, model, language, &endpoint, http_status, request_id)
+}
+
+fn resolve_xiaomi_mimo_asr_builtin_audio(
+    app: &tauri::AppHandle,
+) -> Result<std::path::PathBuf, FetchModelsError> {
+    let resource_path = app
+        .path()
+        .resolve(
+            "resources/xiaomi-mimo-asr-test-en.wav",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|_e| FetchModelsError {
+            kind: FetchErrorKind::NotConfigured,
+            message: "同梱テスト音声のパス解決に失敗しました".to_string(),
+        })?;
+    if !resource_path.is_file() {
+        return Err(FetchModelsError {
+            kind: FetchErrorKind::NotConfigured,
+            message: "同梱テスト音声が見つかりません".to_string(),
+        });
+    }
+    Ok(resource_path)
+}
+
+#[tauri::command]
+async fn xiaomi_mimo_asr_recognize(
+    app: tauri::AppHandle,
+    input: XiaomiMimoAsrRecognizeInput,
+) -> Result<XiaomiMimoAsrResult, FetchModelsError> {
+    let _ = &app; // Tauri command signature requires app handle
+    recognize_xiaomi_mimo_audio(
+        &input.base_url,
+        &input.model,
+        &input.language,
+        std::path::Path::new(&input.audio_path),
+    )
+    .await
+}
+
+const XIAOMI_MIMO_ASR_BUILTIN_MODEL: &str = "mimo-v2.5-asr";
+const XIAOMI_MIMO_ASR_BUILTIN_LANGUAGE: &str = "en";
+
+#[tauri::command]
+async fn xiaomi_mimo_asr_run_builtin_test(
+    app: tauri::AppHandle,
+    input: XiaomiMimoAsrBuiltinTestInput,
+) -> Result<XiaomiMimoAsrResult, FetchModelsError> {
+    let audio_path = resolve_xiaomi_mimo_asr_builtin_audio(&app)?;
+    recognize_xiaomi_mimo_audio(
+        &input.base_url,
+        XIAOMI_MIMO_ASR_BUILTIN_MODEL,
+        XIAOMI_MIMO_ASR_BUILTIN_LANGUAGE,
+        &audio_path,
+    )
+    .await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1559,7 +1842,9 @@ pub fn run() {
             google_stt_check_adc,
             google_stt_list_projects,
             google_stt_recognize,
-            google_stt_run_builtin_test
+            google_stt_run_builtin_test,
+            xiaomi_mimo_asr_recognize,
+            xiaomi_mimo_asr_run_builtin_test
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -3338,5 +3623,476 @@ mod tests {
         assert_eq!(err.kind, FetchErrorKind::ConnectionError);
         assert!(!err.message.contains("Some other error"));
         assert!(err.message.contains("400"));
+    }
+
+    // ---- xiaomi_mimo_asr provider_defaults ----
+
+    #[test]
+    fn test_xiaomi_mimo_asr_provider_defaults() {
+        let defaults = provider_defaults("xiaomi_mimo_asr").unwrap();
+        assert_eq!(defaults.env_name, "XIAOMI_API_KEY");
+        assert_eq!(defaults.base_url, "https://api.xiaomimimo.com/v1");
+    }
+
+    // ---- validate_xiaomi_mimo_asr_input ----
+
+    #[test]
+    fn test_validate_xiaomi_mimo_asr_input_valid() {
+        let tmp = std::env::temp_dir().join("__mimo_asr_test_valid__.wav");
+        fs::write(&tmp, b"test").unwrap();
+        let result = validate_xiaomi_mimo_asr_input(
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.5-asr",
+            "en",
+            &tmp,
+        );
+        assert!(result.is_ok());
+        fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_validate_xiaomi_mimo_asr_input_empty_base_url() {
+        let tmp = std::env::temp_dir().join("__mimo_asr_test_url__.wav");
+        fs::write(&tmp, b"test").unwrap();
+        let result = validate_xiaomi_mimo_asr_input("", "mimo-v2.5-asr", "en", &tmp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("Base URL"));
+        fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_validate_xiaomi_mimo_asr_input_invalid_language() {
+        let tmp = std::env::temp_dir().join("__mimo_asr_test_lang__.wav");
+        fs::write(&tmp, b"test").unwrap();
+        let result = validate_xiaomi_mimo_asr_input(
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.5-asr",
+            "ja",
+            &tmp,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("言語"));
+        fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_validate_xiaomi_mimo_asr_input_nonexistent_file() {
+        let result = validate_xiaomi_mimo_asr_input(
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.5-asr",
+            "en",
+            std::path::Path::new("/nonexistent/audio.wav"),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("音声ファイル"));
+    }
+
+    // ---- parse_xiaomi_mimo_asr_response ----
+
+    const TEST_ENDPOINT: &str = "api.xiaomimimo.com/v1/chat/completions";
+
+    #[test]
+    fn test_parse_xiaomi_mimo_asr_response_string_content() {
+        let json = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "Hello, how are you?"
+                    }
+                }
+            ]
+        });
+        let result = parse_xiaomi_mimo_asr_response(&json, "mimo-v2.5-asr", "en", TEST_ENDPOINT, 200, None).unwrap();
+        assert_eq!(result.transcript, "Hello, how are you?");
+        assert_eq!(result.language, "en");
+        assert_eq!(result.model, "mimo-v2.5-asr");
+        assert_eq!(result.provider, "Xiaomi MiMo");
+        assert_eq!(result.endpoint, TEST_ENDPOINT);
+        assert_eq!(result.http_status, 200);
+        assert!(result.request_id.is_none());
+    }
+
+    #[test]
+    fn test_parse_xiaomi_mimo_asr_response_array_content() {
+        let json = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Hello"},
+                            {"type": "text", "text": " world"}
+                        ]
+                    }
+                }
+            ]
+        });
+        let result = parse_xiaomi_mimo_asr_response(&json, "mimo-v2.5-asr", "en", TEST_ENDPOINT, 200, None).unwrap();
+        assert_eq!(result.transcript, "Hello world");
+    }
+
+    #[test]
+    fn test_parse_xiaomi_mimo_asr_response_empty_array() {
+        let json = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": []
+                    }
+                }
+            ]
+        });
+        let result = parse_xiaomi_mimo_asr_response(&json, "mimo-v2.5-asr", "en", TEST_ENDPOINT, 200, None).unwrap();
+        assert_eq!(result.transcript, "");
+    }
+
+    #[test]
+    fn test_parse_xiaomi_mimo_asr_response_no_choices() {
+        let json = serde_json::json!({ "error": "no choices" });
+        let result = parse_xiaomi_mimo_asr_response(&json, "mimo-v2.5-asr", "en", TEST_ENDPOINT, 200, None);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind, FetchErrorKind::ConnectionError);
+    }
+
+    #[test]
+    fn test_parse_xiaomi_mimo_asr_response_empty_string_content() {
+        let json = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": ""
+                    }
+                }
+            ]
+        });
+        // 空文字列でも正常に返す（音声なし=空結果とみなせる）
+        let result = parse_xiaomi_mimo_asr_response(&json, "mimo-v2.5-asr", "en", TEST_ENDPOINT, 200, None).unwrap();
+        assert_eq!(result.transcript, "");
+    }
+
+    #[test]
+    fn test_parse_xiaomi_mimo_asr_response_with_request_id() {
+        let json = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "test"
+                    }
+                }
+            ]
+        });
+        let result = parse_xiaomi_mimo_asr_response(
+            &json,
+            "mimo-v2.5-asr",
+            "en",
+            TEST_ENDPOINT,
+            200,
+            Some("req-abc123".to_string()),
+        ).unwrap();
+        assert_eq!(result.request_id, Some("req-abc123".to_string()));
+    }
+
+    // ---- XiaomiMimoAsrResult serialization ----
+
+    #[test]
+    fn test_xiaomi_mimo_asr_result_serialization() {
+        let result = XiaomiMimoAsrResult {
+            transcript: "Hello".to_string(),
+            language: "en".to_string(),
+            model: "mimo-v2.5-asr".to_string(),
+            provider: "Xiaomi MiMo".to_string(),
+            endpoint: "api.xiaomimimo.com/v1/chat/completions".to_string(),
+            http_status: 200,
+            request_id: Some("req-123".to_string()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("transcript"));
+        assert!(json.contains("language"));
+        assert!(json.contains("model"));
+        assert!(json.contains("Hello"));
+        assert!(json.contains("provider"));
+        assert!(json.contains("endpoint"));
+        assert!(json.contains("httpStatus"));
+        assert!(json.contains("requestId"));
+    }
+
+    #[test]
+    fn test_xiaomi_mimo_asr_result_no_request_id() {
+        let result = XiaomiMimoAsrResult {
+            transcript: "Hello".to_string(),
+            language: "en".to_string(),
+            model: "mimo-v2.5-asr".to_string(),
+            provider: "Xiaomi MiMo".to_string(),
+            endpoint: "api.xiaomimimo.com/v1/chat/completions".to_string(),
+            http_status: 200,
+            request_id: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("requestId"));
+    }
+
+    // ---- recognize_xiaomi_mimo_audio input shape ----
+
+    #[test]
+    fn test_xiaomi_mimo_asr_builtin_test_input_deserialization() {
+        let json = r#"{"baseUrl":"https://api.xiaomimimo.com/v1"}"#;
+        let input: XiaomiMimoAsrBuiltinTestInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.base_url, "https://api.xiaomimimo.com/v1");
+    }
+
+    #[test]
+    fn test_xiaomi_mimo_asr_builtin_test_input_no_model_required() {
+        let json = r#"{"baseUrl":"https://api.xiaomimimo.com/v1"}"#;
+        let input: XiaomiMimoAsrBuiltinTestInput = serde_json::from_str(json).unwrap();
+        // model フィールドが存在しなくてもデシリアライズできる
+        assert_eq!(input.base_url, "https://api.xiaomimimo.com/v1");
+    }
+
+    #[test]
+    fn test_xiaomi_mimo_asr_builtin_test_input_no_language_required() {
+        let json = r#"{"baseUrl":"https://api.xiaomimimo.com/v1"}"#;
+        let input: XiaomiMimoAsrBuiltinTestInput = serde_json::from_str(json).unwrap();
+        // language フィールドが存在しなくてもデシリアライズできる
+        assert_eq!(input.base_url, "https://api.xiaomimimo.com/v1");
+    }
+
+    #[test]
+    fn test_xiaomi_mimo_asr_builtin_test_input_no_audio_path_required() {
+        let json = r#"{"baseUrl":"https://api.xiaomimimo.com/v1"}"#;
+        let input: XiaomiMimoAsrBuiltinTestInput = serde_json::from_str(json).unwrap();
+        // audioPath フィールドが存在しなくてもデシリアライズできる
+        assert_eq!(input.base_url, "https://api.xiaomimimo.com/v1");
+    }
+
+    #[test]
+    fn test_xiaomi_mimo_asr_builtin_test_input_ignores_extra_fields() {
+        let json = r#"{"baseUrl":"https://api.xiaomimimo.com/v1","model":"ignored","language":"ignored","audioPath":"ignored"}"#;
+        let input: XiaomiMimoAsrBuiltinTestInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.base_url, "https://api.xiaomimimo.com/v1");
+    }
+
+    #[test]
+    fn test_xiaomi_mimo_asr_builtin_constants() {
+        assert_eq!(XIAOMI_MIMO_ASR_BUILTIN_MODEL, "mimo-v2.5-asr");
+        assert_eq!(XIAOMI_MIMO_ASR_BUILTIN_LANGUAGE, "en");
+    }
+
+    #[test]
+    fn test_xiaomi_mimo_asr_recognize_input_deserialization() {
+        let json = r#"{"baseUrl":"https://api.xiaomimimo.com/v1","model":"mimo-v2.5-asr","language":"en","audioPath":"/tmp/test.wav"}"#;
+        let input: XiaomiMimoAsrRecognizeInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.base_url, "https://api.xiaomimimo.com/v1");
+        assert_eq!(input.audio_path, "/tmp/test.wav");
+    }
+
+    // ---- validate_xiaomi_mimo_asr_input language variants ----
+
+    #[test]
+    fn test_validate_xiaomi_mimo_asr_input_language_auto() {
+        let tmp = std::env::temp_dir().join("__mimo_asr_test_auto__.wav");
+        fs::write(&tmp, b"test").unwrap();
+        let result = validate_xiaomi_mimo_asr_input(
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.5-asr",
+            "auto",
+            &tmp,
+        );
+        assert!(result.is_ok());
+        fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_validate_xiaomi_mimo_asr_input_language_zh() {
+        let tmp = std::env::temp_dir().join("__mimo_asr_test_zh__.wav");
+        fs::write(&tmp, b"test").unwrap();
+        let result = validate_xiaomi_mimo_asr_input(
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.5-asr",
+            "zh",
+            &tmp,
+        );
+        assert!(result.is_ok());
+        fs::remove_file(&tmp).ok();
+    }
+
+    // ---- Xiaomi MiMo ASR 実環境テスト ----
+
+    #[test]
+    #[ignore] // CI環境ではXIAOMI_API_KEYが未設定のため
+    fn test_xiaomi_mimo_asr_recognize_builtin_english() {
+        let api_key = match std::env::var("XIAOMI_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => key,
+            _ => {
+                eprintln!("XIAOMI_API_KEY が現在のプロセスから取得できません。");
+                eprintln!("プロセスを再起動してから再試行してください。");
+                return; // テストをスキップ（failさせない）
+            }
+        };
+
+        // 同梱テスト音声を探す
+        let audio_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("xiaomi-mimo-asr-test-en.wav");
+        assert!(
+            audio_path.exists(),
+            "同梱テスト音声が見つかりません: {}",
+            audio_path.display()
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            recognize_xiaomi_mimo_audio(
+                "https://api.xiaomimimo.com/v1",
+                "mimo-v2.5-asr",
+                "en",
+                &audio_path,
+            )
+            .await
+        });
+
+        match &result {
+            Ok(r) => {
+                eprintln!("=== Xiaomi MiMo ASR 実環境テスト ===");
+                eprintln!("language: {}", r.language);
+                eprintln!("model: {}", r.model);
+                eprintln!("transcript_length: {}", r.transcript.len());
+                eprintln!("transcript_empty: {}", r.transcript.is_empty());
+
+                // 基本検証
+                assert_eq!(r.model, "mimo-v2.5-asr");
+                assert_eq!(r.language, "en");
+                assert!(!r.transcript.is_empty(), "transcript should not be empty for English speech audio");
+
+                // APIキー漏洩チェック
+                let debug_str = format!("{:?}", r);
+                assert!(
+                    !debug_str.contains(&api_key),
+                    "API key must not appear in debug output"
+                );
+            }
+            Err(e) => {
+                let msg = &e.message;
+                eprintln!("=== Xiaomi MiMo ASR 実環境テスト FAILED ===");
+                eprintln!("error_kind: {:?}", e.kind);
+                eprintln!("error_message: {}", msg);
+
+                // APIキー漏洩チェック
+                assert!(
+                    !msg.contains(&api_key),
+                    "error message must not contain API key"
+                );
+
+                // 認証エラーの場合は明示的に報告
+                if e.kind == FetchErrorKind::AuthError {
+                    panic!("認証エラー: APIキーが無効です。{}", msg);
+                }
+
+                panic!("Xiaomi MiMo ASR 認識テスト失敗: {}", msg);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // CI環境ではXIAOMI_API_KEYが未設定のため
+    fn test_xiaomi_mimo_asr_response_shape_is_string() {
+        let api_key = match std::env::var("XIAOMI_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => key,
+            _ => {
+                eprintln!("XIAOMI_API_KEY が現在のプロセスから取得できません。");
+                return;
+            }
+        };
+
+        let audio_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("xiaomi-mimo-asr-test-en.wav");
+        assert!(audio_path.exists(), "同梱テスト音声が見つかりません");
+
+        // 生のレスポンスを確認するため、直接HTTPリクエストを送る
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            use base64::Engine;
+            let audio_bytes = fs::read(&audio_path).unwrap();
+            let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
+            let data_url = format!("data:audio/wav;base64,{}", audio_base64);
+
+            let body = serde_json::json!({
+                "model": "mimo-v2.5-asr",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": data_url
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "asr_options": {
+                    "language": "en"
+                }
+            });
+
+            let client = reqwest::Client::new();
+            let resp = client
+                .post("https://api.xiaomimimo.com/v1/chat/completions")
+                .header("api-key", &api_key)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+
+            assert!(resp.status().is_success(), "HTTP request failed: {}", resp.status());
+
+            let json: serde_json::Value = resp.json().await.unwrap();
+
+            // レスポンス構造を確認
+            let content = json
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|choice| choice.get("message"))
+                .and_then(|msg| msg.get("content"));
+
+            eprintln!("=== レスポンスshape確認 ===");
+            match content {
+                Some(serde_json::Value::String(s)) => {
+                    eprintln!("content type: string");
+                    eprintln!("content length: {}", s.len());
+                    assert!(!s.is_empty(), "transcript should not be empty");
+                }
+                Some(serde_json::Value::Array(arr)) => {
+                    eprintln!("content type: array");
+                    eprintln!("array length: {}", arr.len());
+                    // Array形式の場合、テキストを結合
+                    let mut texts = Vec::new();
+                    for item in arr {
+                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                            texts.push(text.to_string());
+                        }
+                    }
+                    let transcript = texts.join("");
+                    eprintln!("transcript length: {}", transcript.len());
+                    assert!(!transcript.is_empty(), "transcript should not be empty");
+                }
+                other => {
+                    eprintln!("content type: {:?}", other);
+                    panic!("unexpected content type");
+                }
+            }
+
+            // APIキー漏洩チェック
+            let json_str = serde_json::to_string(&json).unwrap();
+            assert!(!json_str.contains(&api_key), "API key must not appear in response");
+
+            json
+        });
+
+        eprintln!("テスト完了: レスポンスshape確認成功");
+        let _ = result;
+        let _ = api_key; // 未使用警告を抑制
     }
 }

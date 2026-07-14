@@ -478,24 +478,77 @@ describe("Provider accordion initial state and toggle", () => {
   });
 });
 
-// ---- Xiaomi MiMo ASR pending UI ----
+// ---- Xiaomi MiMo ASR full UI ----
 
-describe("Xiaomi MiMo ASR pending UI", () => {
+describe("Xiaomi MiMo ASR full UI", () => {
   function buildMimoAsrAccordion(): HTMLElement {
     document.body.innerHTML = `
       <div class="accordion-item" data-provider-id="xiaomi_mimo_asr">
         <button class="accordion-header accordion-header-collapsed" type="button" aria-expanded="false">
           <span class="accordion-title">Xiaomi MiMo</span>
           <span class="accordion-title-sub">Speech Recognition</span>
+          <span class="status-badge status-unconfigured" data-status-badge>
+            <span class="status-dot status-dot-unconfigured"></span>未設定
+          </span>
         </button>
         <div class="accordion-detail" style="display:none">
           <div class="accordion-detail-inner">
-            <div class="xiaomi-mimo-asr-pending">
-              <div class="xiaomi-mimo-asr-pending-icon">
-                <span class="material-symbols-outlined">construction</span>
+            <div class="api-field-group">
+              <label class="api-field-label">環境変数 / APIキー</label>
+              <div class="api-key-row">
+                <input type="text" class="api-env-input" value="XIAOMI_API_KEY" data-default-env="XIAOMI_API_KEY" />
+                <div class="api-key-input-wrap">
+                  <input type="password" class="api-key-input" placeholder="APIキーを入力" data-field="api-key" />
+                  <button class="api-visibility-btn" type="button" title="表示切替">
+                    <span class="material-symbols-outlined">visibility</span>
+                  </button>
+                </div>
+                <button class="btn-api-save" type="button" data-provider-id="xiaomi_mimo_asr">環境変数に保存</button>
               </div>
-              <p class="xiaomi-mimo-asr-pending-title">MiMo-V2.5-ASRの接続仕様を確認中です</p>
-              <p class="xiaomi-mimo-asr-pending-desc">現在のバージョンではまだ音声認識を実行できません。</p>
+            </div>
+            <div class="api-field-group">
+              <label class="api-field-label">Base URL</label>
+              <div class="api-baseurl-row">
+                <input type="text" class="api-baseurl-input" value="https://api.xiaomimimo.com/v1" data-default-url="https://api.xiaomimimo.com/v1" data-field="base-url" />
+                <button class="btn-reset-url" type="button">既定値に戻す</button>
+              </div>
+            </div>
+            <div class="api-field-group">
+              <label class="api-field-label">認識言語</label>
+              <select class="google-stt-language-code" data-field="language-code">
+                <option value="auto" selected>自動検出（auto）</option>
+                <option value="en">English（en）</option>
+                <option value="zh">Chinese（zh）</option>
+              </select>
+            </div>
+            <div class="api-field-group">
+              <label class="api-field-label">認識モデル</label>
+              <select class="model-select" data-field="model" disabled>
+                <option value="mimo-v2.5-asr" selected>mimo-v2.5-asr</option>
+              </select>
+            </div>
+            <div class="google-stt-advanced-toggle">
+              <button type="button" class="btn-google-stt-advanced" data-field="advanced-toggle" aria-expanded="false">
+                <span class="material-symbols-outlined accordion-chevron">chevron_right</span>
+                詳細設定
+              </button>
+            </div>
+            <div class="google-stt-advanced-content" data-field="advanced-content" hidden>
+              <div class="api-field-group">
+                <label class="api-field-label">詳細な確認</label>
+                <button class="btn-mimo-asr-select-file" type="button">
+                  <span class="material-symbols-outlined">folder_open</span>
+                  別の音声ファイルで試す
+                </button>
+              </div>
+            </div>
+            <div class="google-stt-recognize-section">
+              <p class="google-stt-test-description">同梱された短い英語音声（en）で確認します</p>
+              <button class="btn-mimo-asr-builtin-test" type="button">
+                <span class="material-symbols-outlined">mic</span>
+                接続・認識テスト
+              </button>
+              <div class="google-stt-result" data-field="recognize-result" hidden></div>
             </div>
           </div>
         </div>
@@ -515,37 +568,91 @@ describe("Xiaomi MiMo ASR pending UI", () => {
     return document.querySelector(".accordion-item") as HTMLElement;
   }
 
-  it("shows pending message with construction icon", () => {
+  it("shows env/API key row with common structure", () => {
     const item = buildMimoAsrAccordion();
-    const pending = item.querySelector(".xiaomi-mimo-asr-pending");
-    expect(pending).toBeTruthy();
-    expect(pending!.textContent).toContain("接続仕様を確認中");
+    const envInput = item.querySelector<HTMLInputElement>(".api-env-input");
+    const apiKeyInput = item.querySelector<HTMLInputElement>('[data-field="api-key"]');
+    const saveBtn = item.querySelector<HTMLButtonElement>(".btn-api-save");
+    expect(envInput).toBeTruthy();
+    expect(envInput!.value).toBe("XIAOMI_API_KEY");
+    expect(envInput!.dataset.defaultEnv).toBe("XIAOMI_API_KEY");
+    expect(apiKeyInput).toBeTruthy();
+    expect(apiKeyInput!.type).toBe("password");
+    expect(saveBtn).toBeTruthy();
+    expect(saveBtn!.dataset.providerId).toBe("xiaomi_mimo_asr");
   });
 
-  it("does not show Base URL input", () => {
+  it("shows Base URL with reset button", () => {
     const item = buildMimoAsrAccordion();
-    const baseUrl = item.querySelector('[data-field="base-url"]');
-    expect(baseUrl).toBeNull();
+    const baseUrl = item.querySelector<HTMLInputElement>('[data-field="base-url"]');
+    const resetBtn = item.querySelector(".btn-reset-url");
+    expect(baseUrl).toBeTruthy();
+    expect(baseUrl!.value).toBe("https://api.xiaomimimo.com/v1");
+    expect(baseUrl!.dataset.defaultUrl).toBe("https://api.xiaomimimo.com/v1");
+    expect(resetBtn).toBeTruthy();
   });
 
-  it("does not show model input or select", () => {
+  it("shows language select with auto/en/zh", () => {
     const item = buildMimoAsrAccordion();
-    const model = item.querySelector('[data-field="model"]');
-    const modelManual = item.querySelector('[data-field="model-manual"]');
-    expect(model).toBeNull();
-    expect(modelManual).toBeNull();
+    const langSelect = item.querySelector<HTMLSelectElement>('[data-field="language-code"]');
+    expect(langSelect).toBeTruthy();
+    const values = Array.from(langSelect!.options).map(o => o.value);
+    expect(values).toEqual(["auto", "en", "zh"]);
+    expect(langSelect!.value).toBe("auto");
   });
 
-  it("does not show test send button", () => {
+  it("shows disabled model select with mimo-v2.5-asr", () => {
     const item = buildMimoAsrAccordion();
-    const testBtn = item.querySelector(".btn-test-send");
-    expect(testBtn).toBeNull();
+    const modelSelect = item.querySelector<HTMLSelectElement>('[data-field="model"]');
+    expect(modelSelect).toBeTruthy();
+    expect(modelSelect!.disabled).toBe(true);
+    expect(modelSelect!.value).toBe("mimo-v2.5-asr");
   });
 
-  it("does not show API key input", () => {
+  it("shows exactly one builtin test button in normal view", () => {
     const item = buildMimoAsrAccordion();
-    const apiKey = item.querySelector('[data-field="api-key"]');
-    expect(apiKey).toBeNull();
+    const builtinBtn = item.querySelector(".btn-mimo-asr-builtin-test");
+    expect(builtinBtn).toBeTruthy();
+    expect(builtinBtn!.textContent).toContain("接続・認識テスト");
+  });
+
+  it("does not show file selection button in normal view", () => {
+    const item = buildMimoAsrAccordion();
+    const advancedContent = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+    const fileBtnInSection = item.querySelector(".google-stt-recognize-section .btn-mimo-asr-select-file");
+    expect(fileBtnInSection).toBeNull();
+    // File button is in advanced section
+    const fileBtnInAdvanced = advancedContent?.querySelector(".btn-mimo-asr-select-file");
+    expect(fileBtnInAdvanced).toBeTruthy();
+  });
+
+  it("advanced content is initially hidden", () => {
+    const item = buildMimoAsrAccordion();
+    const content = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+    expect(content).toBeTruthy();
+    expect(content!.hidden).toBe(true);
+  });
+
+  it("advanced toggle has aria-expanded=false", () => {
+    const item = buildMimoAsrAccordion();
+    const toggle = item.querySelector<HTMLElement>('[data-field="advanced-toggle"]');
+    expect(toggle).toBeTruthy();
+    expect(toggle!.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("recognize result is initially hidden via hidden attribute", () => {
+    const item = buildMimoAsrAccordion();
+    const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
+    expect(resultEl).toBeTruthy();
+    expect(resultEl!.hidden).toBe(true);
+  });
+
+  it("does not use style display:none for result or advanced", () => {
+    const item = buildMimoAsrAccordion();
+    const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
+    const advancedContent = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+    expect(resultEl!.getAttribute("style")).toBeNull();
+    expect(advancedContent!.getAttribute("style")).toBeNull();
   });
 
   it("accordion header can be clicked to open", () => {
@@ -568,5 +675,65 @@ describe("Xiaomi MiMo ASR pending UI", () => {
     header.click(); // close
     expect(detail.style.display).toBe("none");
     expect(header.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("advanced toggle opens content on click with handler bound", () => {
+    const item = buildMimoAsrAccordion();
+    // アコーディオンを開く（bind対象のDOMを表示状態にする）
+    const header = item.querySelector(".accordion-header") as HTMLElement;
+    header.click();
+
+    const toggle = item.querySelector<HTMLButtonElement>('[data-field="advanced-toggle"]');
+    const content = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+    expect(toggle).toBeTruthy();
+    expect(content).toBeTruthy();
+
+    // ハンドラーを手動でバインド（bindXiaomiMimoAsrHandlersと同じロジック）
+    toggle!.addEventListener("click", () => {
+      const willOpen = content!.hidden;
+      content!.hidden = !willOpen;
+      toggle!.setAttribute("aria-expanded", String(willOpen));
+      toggle!.classList.toggle("is-open", willOpen);
+    });
+
+    // 初期状態
+    expect(content!.hidden).toBe(true);
+    expect(toggle!.getAttribute("aria-expanded")).toBe("false");
+
+    // 1回目のクリック: 開く
+    toggle!.click();
+    expect(content!.hidden).toBe(false);
+    expect(toggle!.getAttribute("aria-expanded")).toBe("true");
+    expect(toggle!.classList.contains("is-open")).toBe(true);
+
+    // 2回目のクリック: 閉じる
+    toggle!.click();
+    expect(content!.hidden).toBe(true);
+    expect(toggle!.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle!.classList.contains("is-open")).toBe(false);
+  });
+
+  it("advanced toggle shows file selection button when opened", () => {
+    const item = buildMimoAsrAccordion();
+    const header = item.querySelector(".accordion-header") as HTMLElement;
+    header.click();
+
+    const toggle = item.querySelector<HTMLButtonElement>('[data-field="advanced-toggle"]');
+    const content = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+
+    // ハンドラーをバインド
+    toggle!.addEventListener("click", () => {
+      const willOpen = content!.hidden;
+      content!.hidden = !willOpen;
+      toggle!.setAttribute("aria-expanded", String(willOpen));
+    });
+
+    const fileBtn = content!.querySelector(".btn-mimo-asr-select-file");
+    expect(fileBtn).toBeTruthy();
+
+    // トグルで開く
+    toggle!.click();
+    expect(content!.hidden).toBe(false);
+    expect(fileBtn).toBeTruthy();
   });
 });

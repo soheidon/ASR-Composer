@@ -91,7 +91,6 @@ describe("model source classification", () => {
     expect(manualProviderIds).toEqual([
       "google_stt",
       "azure_speech",
-      "xiaomi_mimo_asr",
       "deepgram",
       "assemblyai",
       "zai_glm",
@@ -102,7 +101,7 @@ describe("model source classification", () => {
     const staticProviderIds = [...asrProviders, ...llmProviders]
       .filter(p => p.modelSource === "static")
       .map(p => p.id);
-    expect(staticProviderIds).toEqual([]);
+    expect(staticProviderIds).toEqual(["xiaomi_mimo_asr"]);
   });
 
   it("allows manual fallback for every current API-backed provider", () => {
