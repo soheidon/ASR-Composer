@@ -632,6 +632,7 @@ async function navigateTo(page: PageName) {
     bindModelSelects();
     bindProviderConfigAutoSave();
     bindFetchModelsButtons();
+    bindTestSendButtons();
     bindGoogleSttHandlers();
   } else if (page === "settings-ollama") {
     await loadOllamaSettings();
@@ -1387,6 +1388,46 @@ async function fetchProviderModels(providerId: string, item: Element, btn: HTMLE
 }
 
 // ---- Google STT ----
+
+// ---- LLM Test Send ----
+
+function bindTestSendButtons() {
+  document.querySelectorAll<HTMLElement>(".accordion-item[data-provider-id]").forEach((item) => {
+    const providerId = item.dataset.providerId;
+    if (!providerId || providerId === "ollama" || providerId === "google_stt") return;
+
+    const btn = item.querySelector<HTMLButtonElement>(".btn-test-send");
+    if (!btn) return;
+
+    btn.addEventListener("click", async () => {
+      const originalHtml = btn.innerHTML;
+      btn.innerHTML = '<span class="material-symbols-outlined spin">cable</span> テスト中...';
+      btn.disabled = true;
+
+      try {
+        const result = await invokeTauri<{ message: string; model: string; responseText: string }>(
+          "test_llm_connection",
+          { input: { providerId } },
+        );
+        if (!item.isConnected) return;
+        setStatusBadge(item.querySelector<HTMLElement>("[data-status-badge]"), "接続確認済み");
+        const detail = result.responseText ? `\n\n応答: ${result.responseText}` : "";
+        await showAppDialog({ title: "接続テスト", message: `${result.message}${detail}`, type: "success" });
+      } catch (e) {
+        console.error("test_llm_connection error:", e);
+        if (!item.isConnected) return;
+        const classified = classifyFetchError(e);
+        setStatusBadge(item.querySelector<HTMLElement>("[data-status-badge]"), classified.status);
+        await showAppDialog({ title: "接続テストに失敗しました", message: classified.message, type: "error" });
+      } finally {
+        if (item.isConnected) {
+          btn.disabled = false;
+          btn.innerHTML = originalHtml;
+        }
+      }
+    });
+  });
+}
 
 function bindGoogleSttHandlers() {
   // ADC認証チェック

@@ -78,6 +78,7 @@ describe("model source classification", () => {
       "mistral",
       "groq",
       "ollama",
+      "xiaomi_mimo",
       "moonshot",
       "minimax",
     ]);
@@ -93,9 +94,15 @@ describe("model source classification", () => {
       "xiaomi_mimo_asr",
       "deepgram",
       "assemblyai",
-      "xiaomi_mimo",
       "zai_glm",
     ]);
+  });
+
+  it("lists static-model providers", () => {
+    const staticProviderIds = [...asrProviders, ...llmProviders]
+      .filter(p => p.modelSource === "static")
+      .map(p => p.id);
+    expect(staticProviderIds).toEqual([]);
   });
 
   it("allows manual fallback for every current API-backed provider", () => {
@@ -129,5 +136,54 @@ describe("API provider env and defaultBaseUrl", () => {
   it("gemini uses GEMINI_API_KEY as default env", () => {
     const gemini = llmProviders.find(p => p.id === "gemini")!;
     expect(gemini.env).toBe("GEMINI_API_KEY");
+  });
+});
+
+describe("Xiaomi MiMo LLM provider", () => {
+  const mimo = llmProviders.find(p => p.id === "xiaomi_mimo")!;
+
+  it("uses XIAOMI_API_KEY", () => {
+    expect(mimo.env).toBe("XIAOMI_API_KEY");
+  });
+
+  it("has OpenAI-compatible base URL", () => {
+    expect(mimo.defaultBaseUrl).toBe("https://api.xiaomimimo.com/v1");
+  });
+
+  it("has api model source (supports GET /models)", () => {
+    expect(mimo.modelSource).toBe("api");
+  });
+
+  it("has preferred V2.5 models", () => {
+    expect(mimo.preferredModels).toContain("mimo-v2.5");
+    expect(mimo.preferredModels).toContain("mimo-v2.5-pro");
+  });
+
+  it("defaults to mimo-v2.5", () => {
+    expect(mimo.defaultModel).toBe("mimo-v2.5");
+  });
+
+  it("allows manual model input", () => {
+    expect(mimo.allowManualModel).toBe(true);
+  });
+
+  it("does not use MIMO_API_KEY", () => {
+    expect(mimo.env).not.toBe("MIMO_API_KEY");
+  });
+
+  it("models URL has no double slash or double v1", () => {
+    const url = `${mimo.defaultBaseUrl}/models`;
+    expect(url).toBe("https://api.xiaomimimo.com/v1/models");
+    const pathPortion = new URL(url).pathname;
+    expect(pathPortion).not.toMatch(/\/\//);
+  });
+
+  it("chat completions URL is correct", () => {
+    const url = `${mimo.defaultBaseUrl}/chat/completions`;
+    expect(url).toBe("https://api.xiaomimimo.com/v1/chat/completions");
+  });
+
+  it("does not include deprecated V2 models", () => {
+    expect(mimo.preferredModels?.some(m => m.includes("v2") && !m.includes("v2.5"))).toBeFalsy();
   });
 });

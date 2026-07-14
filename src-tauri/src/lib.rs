@@ -94,6 +94,13 @@ fn migrate_settings(settings: &mut AppSettings) {
             }
         }
     }
+    if let Some(mimo) = settings.providers.get_mut("xiaomi_mimo") {
+        if let Some(ref url) = mimo.base_url {
+            if url == "https://api.xiaomimimo.com/anthropic" {
+                mimo.base_url = Some("https://api.xiaomimimo.com/v1".to_string());
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -191,6 +198,7 @@ fn is_openai_compatible(id: &str) -> bool {
             | "mistral"
             | "moonshot"
             | "minimax"
+            | "xiaomi_mimo"
     )
 }
 
@@ -258,6 +266,10 @@ fn provider_defaults(provider_id: &str) -> Option<ProviderDefaults> {
             env_name: "MINIMAX_API_KEY",
             base_url: "https://api.minimax.io/v1",
         }),
+        "xiaomi_mimo" => Some(ProviderDefaults {
+            env_name: "XIAOMI_API_KEY",
+            base_url: "https://api.xiaomimimo.com/v1",
+        }),
         _ => None,
     }
 }
@@ -303,12 +315,17 @@ fn classify_http_error(status: reqwest::StatusCode, body: &str) -> FetchModelsEr
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         FetchModelsError {
             kind: FetchErrorKind::AuthError,
-            message: format!("認証エラー ({}): {}", status, body),
+            message: "APIキーが認証されませんでした。".to_string(),
+        }
+    } else if status == reqwest::StatusCode::BAD_REQUEST && body.contains("unsupported_parameter") {
+        FetchModelsError {
+            kind: FetchErrorKind::ConnectionError,
+            message: "選択したモデルでは、現在のリクエスト形式を使用できませんでした。モデルに対応した出力トークン設定へ切り替えて再試行してください。".to_string(),
         }
     } else {
         FetchModelsError {
             kind: FetchErrorKind::ConnectionError,
-            message: format!("APIエラー ({}): {}", status, body),
+            message: format!("APIエラー ({})", status),
         }
     }
 }
@@ -629,6 +646,20 @@ pub struct TestOllamaConnectionInput {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestLlmConnectionInput {
+    pub provider_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestLlmConnectionResult {
+    pub message: String,
+    pub model: String,
+    pub response_text: String,
+}
+
+#[derive(Deserialize)]
 struct OllamaVersionResponse {
     version: String,
 }
@@ -675,6 +706,176 @@ async fn test_connection_ollama(
     Ok(TestConnectionResult {
         version: version.clone(),
         message: format!("接続成功（Ollama v{}）", version),
+    })
+}
+
+fn is_anthropic_provider(provider_id: &str) -> bool {
+    matches!(provider_id, "anthropic")
+}
+
+enum TokenLimitField {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+fn openai_token_limit_field(provider_id: &str, model: &str) -> TokenLimitField {
+    // OpenAI公式は max_completion_tokens を使用
+    if provider_id == "openai" || provider_id == "openai_audio" {
+        return TokenLimitField::MaxCompletionTokens;
+    }
+    // OpenAI系の reasoning モデルも max_completion_tokens
+    let model_lower = model.to_lowercase();
+    if model_lower.starts_with("o1")
+        || model_lower.starts_with("o3")
+        || model_lower.starts_with("o4")
+        || model_lower.starts_with("gpt-5")
+    {
+        return TokenLimitField::MaxCompletionTokens;
+    }
+    // その他は互換性のため max_tokens
+    TokenLimitField::MaxTokens
+}
+
+#[tauri::command]
+async fn test_llm_connection(
+    app: tauri::AppHandle,
+    input: TestLlmConnectionInput,
+) -> Result<TestLlmConnectionResult, FetchModelsError> {
+    let settings = load_settings(&app);
+    let saved = settings.providers.get(&input.provider_id);
+    let resolved = resolve_provider_config(&input.provider_id, saved)?;
+
+    let api_key = std::env::var(&resolved.env_name).map_err(|_| FetchModelsError {
+        kind: FetchErrorKind::NotConfigured,
+        message: format!("{} が設定されていません", resolved.env_name),
+    })?;
+
+    let model = saved
+        .and_then(|p| p.default_model.as_deref())
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or("mimo-v2.5")
+        .to_string();
+
+    if is_anthropic_provider(&input.provider_id) {
+        test_llm_anthropic(&resolved.base_url, &api_key, &model).await
+    } else {
+        test_llm_openai(&input.provider_id, &resolved.base_url, &api_key, &model).await
+    }
+}
+
+async fn test_llm_anthropic(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<TestLlmConnectionResult, FetchModelsError> {
+    let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "Reply with only the number 1."}]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| FetchModelsError {
+            kind: FetchErrorKind::ConnectionError,
+            message: format!("リクエスト送信に失敗しました: {}", e),
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(classify_http_error(status, &body_text));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| FetchModelsError {
+        kind: FetchErrorKind::ConnectionError,
+        message: format!("レスポンス解析に失敗しました: {}", e),
+    })?;
+
+    let response_text = json
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|block| block.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(TestLlmConnectionResult {
+        message: format!("接続成功（{}）", model),
+        model: model.to_string(),
+        response_text,
+    })
+}
+
+async fn test_llm_openai(
+    provider_id: &str,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<TestLlmConnectionResult, FetchModelsError> {
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with only the number 1."}]
+    });
+
+    match openai_token_limit_field(provider_id, model) {
+        TokenLimitField::MaxCompletionTokens => {
+            body["max_completion_tokens"] = serde_json::json!(16);
+        }
+        TokenLimitField::MaxTokens => {
+            body["max_tokens"] = serde_json::json!(16);
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| FetchModelsError {
+            kind: FetchErrorKind::ConnectionError,
+            message: format!("リクエスト送信に失敗しました: {}", e),
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(classify_http_error(status, &body_text));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| FetchModelsError {
+        kind: FetchErrorKind::ConnectionError,
+        message: format!("レスポンス解析に失敗しました: {}", e),
+    })?;
+
+    let response_text = json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|msg| msg.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(TestLlmConnectionResult {
+        message: format!("接続成功（{}）", model),
+        model: model.to_string(),
+        response_text,
     })
 }
 
@@ -1353,6 +1554,7 @@ pub fn run() {
             save_provider_secret,
             fetch_models,
             test_connection_ollama,
+            test_llm_connection,
             get_env_var,
             google_stt_check_adc,
             google_stt_list_projects,
@@ -1384,7 +1586,7 @@ mod tests {
     fn test_non_openai_compatible_providers() {
         let not_compatible = vec![
             "anthropic", "gemini", "ollama", "assemblyai",
-            "google_stt", "azure_speech", "xiaomi_mimo", "xiaomi_mimo_asr", "zai_glm",
+            "google_stt", "azure_speech", "xiaomi_mimo_asr", "zai_glm",
         ];
         for id in &not_compatible {
             assert!(!is_openai_compatible(id), "{} should NOT be OpenAI-compatible", id);
@@ -1397,7 +1599,8 @@ mod tests {
     fn test_classify_http_error_401_is_auth() {
         let err = classify_http_error(reqwest::StatusCode::UNAUTHORIZED, "Unauthorized");
         assert_eq!(err.kind, FetchErrorKind::AuthError);
-        assert!(err.message.contains("401"));
+        assert!(err.message.contains("認証"));
+        assert!(!err.message.contains("Unauthorized"));
     }
 
     #[test]
@@ -1855,7 +2058,7 @@ mod tests {
 
     #[test]
     fn test_model_fetch_adapter_manual_providers_are_none() {
-        for id in &["deepgram", "assemblyai", "google_stt", "azure_speech", "xiaomi_mimo_asr", "xiaomi_mimo", "zai_glm"] {
+        for id in &["deepgram", "assemblyai", "google_stt", "azure_speech", "xiaomi_mimo_asr", "zai_glm"] {
             assert_eq!(model_fetch_adapter(id), None, "{} should be None (manual)", id);
         }
     }
@@ -2876,5 +3079,264 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("音声ファイルが見つかりません"));
+    }
+
+    // ---- is_anthropic_provider ----
+
+    #[test]
+    fn test_is_anthropic_provider_xiaomi_mimo() {
+        assert!(!is_anthropic_provider("xiaomi_mimo"));
+    }
+
+    #[test]
+    fn test_is_anthropic_provider_anthropic() {
+        assert!(is_anthropic_provider("anthropic"));
+    }
+
+    #[test]
+    fn test_is_anthropic_provider_not_openai() {
+        assert!(!is_anthropic_provider("openai"));
+        assert!(!is_anthropic_provider("deepseek"));
+        assert!(!is_anthropic_provider("moonshot"));
+    }
+
+    // ---- xiaomi_mimo provider defaults ----
+
+    #[test]
+    fn test_xiaomi_mimo_provider_defaults() {
+        let defaults = provider_defaults("xiaomi_mimo").unwrap();
+        assert_eq!(defaults.env_name, "XIAOMI_API_KEY");
+        assert_eq!(defaults.base_url, "https://api.xiaomimimo.com/v1");
+    }
+
+    #[test]
+    fn test_xiaomi_mimo_is_openai_compatible() {
+        assert!(is_openai_compatible("xiaomi_mimo"));
+    }
+
+    #[test]
+    fn test_xiaomi_mimo_openai_adapter() {
+        assert_eq!(model_fetch_adapter("xiaomi_mimo"), Some(ModelFetchAdapter::OpenAiCompatible));
+    }
+
+    // ---- OpenAI URL construction ----
+
+    #[test]
+    fn test_mimo_openai_models_url() {
+        let base_url = "https://api.xiaomimimo.com/v1";
+        let url = format!("{}/models", base_url.trim_end_matches('/'));
+        assert_eq!(url, "https://api.xiaomimimo.com/v1/models");
+    }
+
+    #[test]
+    fn test_mimo_openai_chat_url() {
+        let base_url = "https://api.xiaomimimo.com/v1";
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        assert_eq!(url, "https://api.xiaomimimo.com/v1/chat/completions");
+    }
+
+    // ---- MiMo migration ----
+
+    #[test]
+    fn test_migrate_mimo_old_anthropic_url_to_openai() {
+        let mut settings = AppSettings {
+            providers: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "xiaomi_mimo".to_string(),
+                    ProviderSettings {
+                        env_name: Some("XIAOMI_API_KEY".to_string()),
+                        base_url: Some("https://api.xiaomimimo.com/anthropic".to_string()),
+                        default_model: None,
+                        options: None,
+                    },
+                );
+                m
+            },
+        };
+        migrate_settings(&mut settings);
+        let mimo = settings.providers.get("xiaomi_mimo").unwrap();
+        assert_eq!(mimo.base_url.as_deref(), Some("https://api.xiaomimimo.com/v1"));
+    }
+
+    #[test]
+    fn test_migrate_mimo_custom_url_untouched() {
+        let mut settings = AppSettings {
+            providers: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "xiaomi_mimo".to_string(),
+                    ProviderSettings {
+                        env_name: Some("XIAOMI_API_KEY".to_string()),
+                        base_url: Some("https://custom.example.com/v1".to_string()),
+                        default_model: None,
+                        options: None,
+                    },
+                );
+                m
+            },
+        };
+        migrate_settings(&mut settings);
+        let mimo = settings.providers.get("xiaomi_mimo").unwrap();
+        assert_eq!(mimo.base_url.as_deref(), Some("https://custom.example.com/v1"));
+    }
+
+    // ---- Anthropic response parsing ----
+
+    #[test]
+    fn test_parse_anthropic_response_content_text() {
+        let json = serde_json::json!({
+            "content": [{"type": "text", "text": "1"}]
+        });
+        let text = json
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|block| block.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        assert_eq!(text, "1");
+    }
+
+    #[test]
+    fn test_parse_anthropic_response_empty_content() {
+        let json = serde_json::json!({"content": []});
+        let text = json
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|block| block.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn test_parse_openai_response_not_used_for_anthropic() {
+        // OpenAI format: choices[0].message.content
+        let json = serde_json::json!({
+            "choices": [{"message": {"content": "1"}}]
+        });
+        // Anthropic parser should NOT read this
+        let text = json
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|block| block.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        assert_eq!(text, ""); // correctly returns empty for non-Anthropic format
+    }
+
+    // ---- openai_token_limit_field ----
+
+    #[test]
+    fn test_openai_official_uses_max_completion_tokens() {
+        assert!(matches!(
+            openai_token_limit_field("openai", "gpt-5.6"),
+            TokenLimitField::MaxCompletionTokens
+        ));
+        assert!(matches!(
+            openai_token_limit_field("openai", "gpt-5"),
+            TokenLimitField::MaxCompletionTokens
+        ));
+        assert!(matches!(
+            openai_token_limit_field("openai", "gpt-4o"),
+            TokenLimitField::MaxCompletionTokens
+        ));
+    }
+
+    #[test]
+    fn test_openai_audio_uses_max_completion_tokens() {
+        assert!(matches!(
+            openai_token_limit_field("openai_audio", "whisper-1"),
+            TokenLimitField::MaxCompletionTokens
+        ));
+    }
+
+    #[test]
+    fn test_reasoning_models_use_max_completion_tokens() {
+        for model in &["o1-preview", "o1-mini", "o3-mini", "o4-mini", "gpt-5.6", "gpt-5-mini"] {
+            assert!(
+                matches!(
+                    openai_token_limit_field("other_provider", model),
+                    TokenLimitField::MaxCompletionTokens
+                ),
+                "{} should use MaxCompletionTokens",
+                model,
+            );
+        }
+    }
+
+    #[test]
+    fn test_xiaomi_mimo_uses_max_tokens() {
+        assert!(matches!(
+            openai_token_limit_field("xiaomi_mimo", "mimo-v2.5"),
+            TokenLimitField::MaxTokens
+        ));
+        assert!(matches!(
+            openai_token_limit_field("xiaomi_mimo", "mimo-v2.5-pro"),
+            TokenLimitField::MaxTokens
+        ));
+    }
+
+    #[test]
+    fn test_moonshot_uses_max_tokens() {
+        assert!(matches!(
+            openai_token_limit_field("moonshot", "kimi-k2"),
+            TokenLimitField::MaxTokens
+        ));
+    }
+
+    #[test]
+    fn test_deepseek_uses_max_tokens() {
+        assert!(matches!(
+            openai_token_limit_field("deepseek", "deepseek-chat"),
+            TokenLimitField::MaxTokens
+        ));
+    }
+
+    #[test]
+    fn test_openrouter_uses_max_tokens() {
+        assert!(matches!(
+            openai_token_limit_field("openrouter", "some-model"),
+            TokenLimitField::MaxTokens
+        ));
+    }
+
+    // ---- classify_http_error improvements ----
+
+    #[test]
+    fn test_classify_http_error_unsupported_parameter() {
+        let err = classify_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error": {"code": "unsupported_parameter", "param": "max_tokens"}}"#,
+        );
+        assert_eq!(err.kind, FetchErrorKind::ConnectionError);
+        assert!(err.message.contains("現在のリクエスト形式を使用できませんでした"));
+        assert!(!err.message.contains("max_tokens"));
+        assert!(!err.message.contains("unsupported_parameter"));
+    }
+
+    #[test]
+    fn test_classify_http_error_401_no_body_leak() {
+        let err = classify_http_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error": {"message": "Invalid API key: sk-abc123"}}"#,
+        );
+        assert_eq!(err.kind, FetchErrorKind::AuthError);
+        assert!(!err.message.contains("sk-abc123"));
+        assert!(!err.message.contains("Invalid API key"));
+    }
+
+    #[test]
+    fn test_classify_http_error_400_generic_no_full_body() {
+        let err = classify_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error": {"message": "Some other error"}}"#,
+        );
+        assert_eq!(err.kind, FetchErrorKind::ConnectionError);
+        assert!(!err.message.contains("Some other error"));
+        assert!(err.message.contains("400"));
     }
 }
