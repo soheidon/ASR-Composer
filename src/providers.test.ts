@@ -61,3 +61,73 @@ describe("provider ID uniqueness", () => {
     expect(new Set(allIds).size).toBe(allIds.length);
   });
 });
+
+describe("model source classification", () => {
+  it("lists API-backed providers in expected order", () => {
+    const apiProviderIds = [...asrProviders, ...llmProviders]
+      .filter(p => p.modelSource === "api")
+      .map(p => p.id);
+    expect(apiProviderIds).toEqual([
+      "openai_audio",
+      "groq_speech",
+      "openai",
+      "anthropic",
+      "gemini",
+      "deepseek",
+      "openrouter",
+      "mistral",
+      "groq",
+      "ollama",
+      "moonshot",
+      "minimax",
+    ]);
+  });
+
+  it("lists manual-entry providers in expected order", () => {
+    const manualProviderIds = [...asrProviders, ...llmProviders]
+      .filter(p => p.modelSource === "manual")
+      .map(p => p.id);
+    expect(manualProviderIds).toEqual([
+      "deepgram",
+      "assemblyai",
+      "google_stt",
+      "azure_speech",
+      "xiaomi_mimo_asr",
+      "xiaomi_mimo",
+      "zai_glm",
+    ]);
+  });
+
+  it("allows manual fallback for every current API-backed provider", () => {
+    const apiProviders = [...asrProviders, ...llmProviders]
+      .filter(p => p.modelSource === "api");
+    expect(apiProviders.every(p => p.allowManualModel)).toBe(true);
+  });
+});
+
+describe("API provider env and defaultBaseUrl", () => {
+  const apiProviders = [...asrProviders, ...llmProviders]
+    .filter(p => p.modelSource === "api");
+
+  // ollama はAPIキー不要のため env が空文字
+  const nonOllamaApiProviders = apiProviders.filter(p => p.id !== "ollama");
+
+  it.each(nonOllamaApiProviders)(
+    "$id has non-empty env",
+    (provider) => {
+      expect(provider.env).toBeTruthy();
+    }
+  );
+
+  it.each(apiProviders)(
+    "$id has non-empty defaultBaseUrl",
+    (provider) => {
+      expect(provider.defaultBaseUrl).toBeTruthy();
+    }
+  );
+
+  it("gemini uses GEMINI_API_KEY as default env", () => {
+    const gemini = llmProviders.find(p => p.id === "gemini")!;
+    expect(gemini.env).toBe("GEMINI_API_KEY");
+  });
+});

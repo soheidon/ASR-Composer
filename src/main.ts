@@ -2,6 +2,11 @@ import "./styles.css";
 import { setStatusBadge, classifyFetchError, populateModelSelect, showAppDialog } from "./status";
 import { asrProviders, llmProviders, cloudLlmProviders } from "./providers";
 import type { ProviderDefinition } from "./providers";
+import {
+  createProviderConfigState,
+  saveDirtyProviderConfig,
+  prepareProviderForModelFetch,
+} from "./provider-config-save";
 
 const app = document.getElementById("app")!;
 
@@ -36,7 +41,9 @@ function providerAccordionItem(p: ProviderDefinition, index: number, isFirst: bo
   const headerBg = isFirst ? "accordion-header-expanded" : "accordion-header-collapsed";
   const detailDisplay = isFirst ? "" : 'style="display:none"';
 
-  const modelSection = buildModelSection(p);
+  const detailBody = p.id === "google_stt"
+    ? buildGoogleSttDetail(p)
+    : buildStandardDetail(p);
 
   return `
     <div class="accordion-item" data-index="${index}" data-provider-id="${p.id}">
@@ -50,6 +57,7 @@ function providerAccordionItem(p: ProviderDefinition, index: number, isFirst: bo
           <span class="accordion-title-sub">${p.name}</span>
         </div>
         <div class="accordion-header-right">
+          <span class="auto-save-status"></span>
           <span class="status-badge status-unconfigured" data-status-badge>
             <span class="status-dot status-dot-unconfigured"></span>未設定
           </span>
@@ -57,6 +65,15 @@ function providerAccordionItem(p: ProviderDefinition, index: number, isFirst: bo
       </button>
       <div class="accordion-detail" ${detailDisplay}>
         <div class="accordion-detail-inner">
+          ${detailBody}
+        </div>
+      </div>
+    </div>`;
+}
+
+function buildStandardDetail(p: ProviderDefinition): string {
+  const modelSection = buildModelSection(p);
+  return `
           <div class="api-field-group">
             <label class="api-field-label">環境変数 / APIキー</label>
             <div class="api-key-row">
@@ -83,10 +100,75 @@ function providerAccordionItem(p: ProviderDefinition, index: number, isFirst: bo
               <span class="material-symbols-outlined">cable</span>
               テスト送信
             </button>
+          </div>`;
+}
+
+function buildGoogleSttDetail(_p: ProviderDefinition): string {
+  return `
+          <div class="google-stt-adc-section">
+            <div class="google-stt-adc-status-row">
+              <span class="google-stt-adc-status" data-field="adc-status">未確認</span>
+              <span class="google-stt-adc-quota" data-field="adc-quota"></span>
+            </div>
+            <button class="btn-google-stt-check-adc" type="button">
+              <span class="material-symbols-outlined">key</span>
+              ADC認証チェック
+            </button>
           </div>
-        </div>
-      </div>
-    </div>`;
+
+          <div class="api-field-group">
+            <label class="api-field-label">Project ID <span class="api-field-required">*</span></label>
+            <input type="text" class="google-stt-project-id" data-field="project-id"
+                   placeholder="例: my-project-123"
+                   pattern="^[a-z][a-z0-9\\-]{4,28}[a-z0-9]$" />
+            <p class="model-hint">小文字英数字とハイフン、6〜30文字、小文字英字で始まりハイフンで終わらない</p>
+          </div>
+
+          <div class="api-field-group">
+            <label class="api-field-label">Location <span class="api-field-required">*</span></label>
+            <select class="google-stt-location" data-field="location">
+              <option value="us-central1">us-central1</option>
+              <option value="asia-southeast1">asia-southeast1</option>
+              <option value="europe-west4">europe-west4</option>
+            </select>
+          </div>
+
+          <div class="api-field-group">
+            <label class="api-field-label">Recognizer ID</label>
+            <input type="text" class="google-stt-recognizer-id" data-field="recognizer-id"
+                   placeholder="_（既定の暗黙Recognizer）" value="_" />
+            <p class="model-hint">デフォルトの <code>_</code> のままにしておくと、明示的なRecognizer作成なしで利用できます</p>
+          </div>
+
+          <div class="api-field-group">
+            <label class="api-field-label">Model</label>
+            <div class="model-select-row">
+              <select class="model-select" data-field="model">
+                <option value="chirp_2" selected>chirp_2</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="api-field-group">
+            <label class="api-field-label">Language Code</label>
+            <input type="text" class="google-stt-language-code" data-field="language-code"
+                   value="ja-JP" />
+          </div>
+
+          <div class="google-stt-recognize-section">
+            <div class="google-stt-file-row">
+              <button class="btn-google-stt-select-file" type="button">
+                <span class="material-symbols-outlined">folder_open</span>
+                音声ファイルを選択
+              </button>
+              <span class="google-stt-selected-file" data-field="selected-file">未選択</span>
+            </div>
+            <button class="btn-google-stt-recognize" type="button">
+              <span class="material-symbols-outlined">mic</span>
+              認識テスト実行
+            </button>
+            <div class="google-stt-result" data-field="recognize-result" style="display:none;"></div>
+          </div>`;
 }
 
 function buildModelSection(p: ProviderDefinition): string {
@@ -430,6 +512,86 @@ function renderHeader(activePage: PageName): string {
 let currentPage: PageName | null = null;
 let sidebarDelegationBound = false;
 
+// ---- Provider Config: Dirty / Revision / Save Queue ----
+
+const providerConfigState = createProviderConfigState();
+
+function showAutoSaveStatus(item: HTMLElement, message: string): void {
+  const el = item.querySelector<HTMLElement>(".auto-save-status");
+  if (!el) return;
+  el.textContent = message;
+  el.classList.add("visible");
+  window.setTimeout(() => {
+    if (el.isConnected) el.classList.remove("visible");
+  }, 2000);
+}
+
+async function saveProviderConfigFromSection(
+  providerId: string,
+  section: HTMLElement,
+): Promise<boolean> {
+  const envInput = section.querySelector<HTMLInputElement>(".api-env-input");
+  const baseUrlInput = section.querySelector<HTMLInputElement>('[data-field="base-url"]');
+  const modelSelect = section.querySelector<HTMLSelectElement>('[data-field="model"]');
+  const modelManualInput = section.querySelector<HTMLInputElement>('[data-field="model-manual"]');
+
+  const envName = envInput?.value.trim() ?? "";
+  const baseUrl = baseUrlInput?.value.trim() ?? "";
+
+  // Google STT: options を読み取る
+  const options: Record<string, string> = {};
+  const projectIdInput = section.querySelector<HTMLInputElement>('[data-field="project-id"]');
+  const locationInput = section.querySelector<HTMLSelectElement>('[data-field="location"]');
+  const recognizerIdInput = section.querySelector<HTMLInputElement>('[data-field="recognizer-id"]');
+  const languageCodeInput = section.querySelector<HTMLInputElement>('[data-field="language-code"]');
+
+  if (projectIdInput) {
+    const v = projectIdInput.value.trim();
+    if (v) options.project_id = v;
+  }
+  if (locationInput) {
+    const v = locationInput.value.trim();
+    if (v) options.location = v;
+  }
+  if (recognizerIdInput) {
+    const v = recognizerIdInput.value.trim();
+    if (v) options.recognizer_id = v;
+  }
+  if (languageCodeInput) {
+    const v = languageCodeInput.value.trim();
+    if (v) options.language_code = v;
+  }
+
+  // Google STT 以外は envName が必須
+  if (!envName && providerId !== "google_stt") return false;
+
+  const selectedModel = modelSelect?.value.trim() ?? "";
+  const defaultModel = selectedModel === "__manual__"
+    ? (modelManualInput?.value.trim() ?? "")
+    : selectedModel;
+
+  const input: Record<string, unknown> = {
+    providerId,
+    envName: envName || null,
+    baseUrl,
+    defaultModel: defaultModel || null,
+  };
+  if (Object.keys(options).length > 0) {
+    input.options = options;
+  }
+
+  try {
+    await invokeTauri("save_provider_config", { input });
+
+    showAutoSaveStatus(section, "自動保存済み");
+    return true;
+  } catch (e) {
+    console.error("Failed to auto-save provider config:", e);
+    showAutoSaveStatus(section, "保存に失敗しました");
+    return false;
+  }
+}
+
 async function navigateTo(page: PageName) {
   if (currentPage === page) return;
   currentPage = page;
@@ -450,7 +612,9 @@ async function navigateTo(page: PageName) {
     bindVisibilityToggles();
     bindResetUrlButtons();
     bindModelSelects();
+    bindProviderConfigAutoSave();
     bindFetchModelsButtons();
+    bindGoogleSttHandlers();
   } else if (page === "settings-ollama") {
     await loadOllamaSettings();
     if (currentPage !== "settings-ollama") return;
@@ -593,6 +757,7 @@ interface SavedProviderSettings {
   env_name?: string;
   base_url?: string;
   default_model?: string;
+  options?: Record<string, string>;
 }
 
 interface SaveProviderSecretResult {
@@ -648,6 +813,18 @@ async function loadSavedSettings() {
       // ステータスバッジの初期設定: env_nameが保存済み → 設定済み（APIキーの実値はフロントに返さない）
       if (statusBadgeEl && saved?.env_name) {
         setStatusBadge(statusBadgeEl, "設定済み");
+      }
+
+      // Google STT options の復元
+      if (saved?.options) {
+        const projectInput = item.querySelector<HTMLInputElement>('[data-field="project-id"]');
+        const locationInput = item.querySelector<HTMLSelectElement>('[data-field="location"]');
+        const recognizerInput = item.querySelector<HTMLInputElement>('[data-field="recognizer-id"]');
+        const langInput = item.querySelector<HTMLInputElement>('[data-field="language-code"]');
+        if (projectInput && saved.options.project_id) projectInput.value = saved.options.project_id;
+        if (locationInput && saved.options.location) locationInput.value = saved.options.location;
+        if (recognizerInput && saved.options.recognizer_id) recognizerInput.value = saved.options.recognizer_id;
+        if (langInput && saved.options.language_code) langInput.value = saved.options.language_code;
       }
     });
   } catch (e) {
@@ -804,6 +981,82 @@ function bindModelSelects() {
   });
 }
 
+// ---- Provider Config: Auto Save on blur/change ----
+
+function bindProviderConfigAutoSave() {
+  document.querySelectorAll<HTMLElement>(".accordion-item[data-provider-id]").forEach((item) => {
+    const providerId = item.dataset.providerId;
+    if (!providerId || providerId === "ollama") return;
+
+    function scheduleSave() {
+      saveDirtyProviderConfig({
+        providerId: providerId!,
+        section: item,
+        state: providerConfigState,
+        saveConfig: saveProviderConfigFromSection,
+      });
+    }
+
+    // Google STT options: input→dirty, blur→save
+    item.querySelectorAll<HTMLInputElement>('[data-field="project-id"], [data-field="recognizer-id"], [data-field="language-code"]').forEach((optInput) => {
+      optInput.addEventListener("input", () => providerConfigState.markDirty(providerId));
+      optInput.addEventListener("blur", () => {
+        saveDirtyProviderConfig({
+          providerId: providerId!,
+          section: item,
+          state: providerConfigState,
+          saveConfig: saveProviderConfigFromSection,
+        });
+      });
+    });
+
+    item.querySelectorAll<HTMLSelectElement>('[data-field="location"]').forEach((optSelect) => {
+      optSelect.addEventListener("change", () => {
+        providerConfigState.markDirty(providerId);
+        saveDirtyProviderConfig({
+          providerId: providerId!,
+          section: item,
+          state: providerConfigState,
+          saveConfig: saveProviderConfigFromSection,
+        });
+      });
+    });
+
+    // envName: input→dirty, blur→save
+    const envInput = item.querySelector<HTMLInputElement>(".api-env-input");
+    if (envInput) {
+      envInput.addEventListener("input", () => providerConfigState.markDirty(providerId));
+      envInput.addEventListener("blur", () => {
+        if (!envInput.value.trim()) return;
+        scheduleSave();
+      });
+    }
+
+    // baseUrl: input→dirty, blur→save
+    const baseUrlInput = item.querySelector<HTMLInputElement>('[data-field="base-url"]');
+    if (baseUrlInput) {
+      baseUrlInput.addEventListener("input", () => providerConfigState.markDirty(providerId));
+      baseUrlInput.addEventListener("blur", scheduleSave);
+    }
+
+    // model select: change→dirty+save
+    const modelSelect = item.querySelector<HTMLSelectElement>('[data-field="model"]');
+    if (modelSelect) {
+      modelSelect.addEventListener("change", () => {
+        providerConfigState.markDirty(providerId);
+        scheduleSave();
+      });
+    }
+
+    // model manual input: input→dirty, blur→save
+    const modelManualInput = item.querySelector<HTMLInputElement>('[data-field="model-manual"]');
+    if (modelManualInput) {
+      modelManualInput.addEventListener("input", () => providerConfigState.markDirty(providerId));
+      modelManualInput.addEventListener("blur", scheduleSave);
+    }
+  });
+}
+
 // ---- Model Fetch Button ----
 
 function bindFetchModelsButtons() {
@@ -812,10 +1065,36 @@ function bindFetchModelsButtons() {
       const providerId = btn.dataset.providerId;
       if (!providerId) return;
 
-      const item = btn.closest(".accordion-item");
+      const item = btn.closest<HTMLElement>(".accordion-item");
       if (!item) return;
 
-      // ボタンをローディング状態に
+      // 1. envName検証（最優先）
+      const envInput = item.querySelector<HTMLInputElement>(".api-env-input");
+      if (envInput && !envInput.value.trim()) {
+        await showAppDialog({
+          title: "環境変数名が必要です",
+          message: "APIキーの保存先となる環境変数名を入力してください。",
+          type: "error",
+        });
+        envInput.focus();
+        return;
+      }
+
+      // 2. 進行中の保存を待ち、dirtyなら保存する
+      const prepareResult = await prepareProviderForModelFetch({
+        providerId,
+        section: item,
+        state: providerConfigState,
+        saveConfig: saveProviderConfigFromSection,
+      });
+      if (!prepareResult.ok) {
+        if (prepareResult.reason === "save-failed") {
+          showAutoSaveStatus(item, "保存に失敗しました");
+        }
+        return;
+      }
+
+      // 4. ボタンをローディング状態に
       const originalHtml = btn.innerHTML;
       btn.innerHTML = '<span class="material-symbols-outlined spin">refresh</span> 取得中...';
       (btn as HTMLButtonElement).disabled = true;
@@ -892,6 +1171,179 @@ async function fetchProviderModels(providerId: string, item: Element, btn: HTMLE
     btn.innerHTML = originalHtml;
     return false;
   } finally {
+    (btn as HTMLButtonElement).disabled = false;
+  }
+}
+
+// ---- Google STT ----
+
+function bindGoogleSttHandlers() {
+  // ADC認証チェック
+  document.querySelectorAll<HTMLElement>(".btn-google-stt-check-adc").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      await runAdcCheck(item, btn);
+    });
+  });
+
+  // 音声ファイル選択
+  document.querySelectorAll<HTMLElement>(".btn-google-stt-select-file").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      try {
+        const { open } = await import("@tauri-apps/plugin-dialog");
+        const selected = await open({
+          multiple: false,
+          filters: [{ name: "音声ファイル", extensions: ["wav", "mp3", "ogg", "flac", "m4a", "webm", "opus", "aac", "wma"] }],
+        });
+        if (selected && typeof selected === "string") {
+          const fileLabel = item.querySelector<HTMLElement>('[data-field="selected-file"]');
+          if (fileLabel) fileLabel.textContent = selected.split(/[/\\]/).pop() || selected;
+          item.dataset.googleSttAudioPath = selected;
+        }
+      } catch (e) {
+        console.error("open_audio_file_dialog error:", e);
+      }
+    });
+  });
+
+  // 認識テスト
+  document.querySelectorAll<HTMLElement>(".btn-google-stt-recognize").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      await runRecognizeTest(item, btn);
+    });
+  });
+}
+
+async function runAdcCheck(item: HTMLElement, btn: HTMLElement): Promise<void> {
+  const originalHtml = btn.innerHTML;
+  btn.innerHTML = '<span class="material-symbols-outlined spin">key</span> 確認中...';
+  (btn as HTMLButtonElement).disabled = true;
+  try {
+    const status = await invokeTauri<{ available: boolean; quota_project?: string; current_project?: string; error?: string }>("google_stt_check_adc");
+    const statusEl = item.querySelector<HTMLElement>('[data-field="adc-status"]');
+    const quotaEl = item.querySelector<HTMLElement>('[data-field="adc-quota"]');
+    if (status.available) {
+      if (statusEl) statusEl.textContent = "ADC利用可能";
+      const parts: string[] = [];
+      if (status.quota_project) parts.push(`クォータ: ${status.quota_project}`);
+      if (status.current_project) parts.push(`プロジェクト: ${status.current_project}`);
+      if (quotaEl) quotaEl.textContent = parts.join(" / ") || "プロジェクト情報なし";
+
+      // Project IDが空欄の場合のみcurrent_projectを自動入力
+      const projectIdInput = item.querySelector<HTMLInputElement>('[data-field="project-id"]');
+      if (projectIdInput && !projectIdInput.value.trim() && status.current_project) {
+        projectIdInput.value = status.current_project;
+        providerConfigState.markDirty("google_stt");
+        saveDirtyProviderConfig({
+          providerId: "google_stt",
+          section: item,
+          state: providerConfigState,
+          saveConfig: saveProviderConfigFromSection,
+        });
+      }
+    } else {
+      if (statusEl) statusEl.textContent = "ADC利用不可";
+      if (quotaEl) quotaEl.textContent = status.error || "";
+    }
+  } catch (e) {
+    const statusEl = item.querySelector<HTMLElement>('[data-field="adc-status"]');
+    if (statusEl) statusEl.textContent = "エラー";
+    console.error("google_stt_check_adc error:", e);
+  } finally {
+    btn.innerHTML = originalHtml;
+    (btn as HTMLButtonElement).disabled = false;
+  }
+}
+
+async function runRecognizeTest(item: HTMLElement, btn: HTMLElement): Promise<void> {
+  const audioPath = item.dataset.googleSttAudioPath;
+  if (!audioPath) {
+    await showAppDialog({ title: "ファイル未選択", message: "音声ファイルを選択してください。", type: "error" });
+    return;
+  }
+
+  const projectId = item.querySelector<HTMLInputElement>('[data-field="project-id"]')?.value?.trim();
+  if (!projectId) {
+    await showAppDialog({ title: "Project ID未入力", message: "Project IDを入力してください。", type: "error" });
+    return;
+  }
+
+  const projectIdPattern = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
+  if (!projectIdPattern.test(projectId)) {
+    await showAppDialog({
+      title: "Project ID形式エラー",
+      message: "Project IDは6〜30文字、小文字英数字とハイフン、小文字英字で始まりハイフンで終わらない必要があります。",
+      type: "error",
+    });
+    return;
+  }
+
+  const location = item.querySelector<HTMLSelectElement>('[data-field="location"]')?.value || "us-central1";
+  const recognizerId = item.querySelector<HTMLInputElement>('[data-field="recognizer-id"]')?.value?.trim() || "_";
+  const languageCode = item.querySelector<HTMLInputElement>('[data-field="language-code"]')?.value?.trim() || "ja-JP";
+
+  const originalHtml = btn.innerHTML;
+  btn.innerHTML = '<span class="material-symbols-outlined spin">mic</span> 認識中...';
+  (btn as HTMLButtonElement).disabled = true;
+
+  const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
+  if (resultEl) { resultEl.style.display = "none"; resultEl.textContent = ""; }
+
+  try {
+    type GoogleSttRecognizeResult = {
+      transcript: string;
+      segments: Array<{
+        transcript: string;
+        confidence?: number;
+        languageCode?: string;
+      }>;
+    };
+
+    const result = await invokeTauri<GoogleSttRecognizeResult>(
+      "google_stt_recognize",
+      {
+        input: {
+          projectId,
+          location,
+          recognizerId,
+          languageCode,
+          audioPath,
+          model: "chirp_2",
+        },
+      },
+    );
+
+    if (resultEl) {
+      const parts: string[] = [`【認識結果】\n${result.transcript}`];
+
+      if (result.segments.length > 0) {
+        parts.push("\n\n【セグメント】");
+        for (const segment of result.segments) {
+          const confidence = segment.confidence != null
+            ? ` (${(segment.confidence * 100).toFixed(1)}%)`
+            : "";
+          const language = segment.languageCode
+            ? ` [${segment.languageCode}]`
+            : "";
+          parts.push(`  ${segment.transcript}${language}${confidence}`);
+        }
+      }
+      resultEl.textContent = parts.join("");
+      resultEl.style.display = "block";
+    }
+  } catch (e) {
+    console.error("google_stt_recognize error:", e);
+    if (resultEl) {
+      resultEl.textContent = `エラー: ${e instanceof Error ? e.message : String(e)}`;
+      resultEl.style.display = "block";
+    }
+  } finally {
+    btn.innerHTML = originalHtml;
     (btn as HTMLButtonElement).disabled = false;
   }
 }
