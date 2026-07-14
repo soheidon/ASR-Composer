@@ -78,9 +78,21 @@ fn load_settings(app: &tauri::AppHandle) -> AppSettings {
     let path = settings_path(app);
     if path.exists() {
         let data = fs::read_to_string(&path).unwrap_or_default();
-        serde_json::from_str(&data).unwrap_or_default()
+        let mut settings: AppSettings = serde_json::from_str(&data).unwrap_or_default();
+        migrate_settings(&mut settings);
+        settings
     } else {
         AppSettings::default()
+    }
+}
+
+fn migrate_settings(settings: &mut AppSettings) {
+    if let Some(moonshot) = settings.providers.get_mut("moonshot") {
+        if let Some(ref url) = moonshot.base_url {
+            if url == "https://api.moonshot.cn/v1" {
+                moonshot.base_url = Some("https://api.moonshot.ai/v1".to_string());
+            }
+        }
     }
 }
 
@@ -240,7 +252,7 @@ fn provider_defaults(provider_id: &str) -> Option<ProviderDefaults> {
         }),
         "moonshot" => Some(ProviderDefaults {
             env_name: "MOONSHOT_API_KEY",
-            base_url: "https://api.moonshot.cn/v1",
+            base_url: "https://api.moonshot.ai/v1",
         }),
         "minimax" => Some(ProviderDefaults {
             env_name: "MINIMAX_API_KEY",
@@ -1528,6 +1540,65 @@ mod tests {
         let ollama = restored.providers.get("ollama").unwrap();
         assert!(ollama.env_name.is_none());
         assert_eq!(ollama.base_url.as_deref(), Some("http://localhost:11434"));
+    }
+
+    // ---- Moonshot base URL migration ----
+
+    #[test]
+    fn test_migrate_moonshot_old_url_to_new_url() {
+        let mut settings = AppSettings {
+            providers: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "moonshot".to_string(),
+                    ProviderSettings {
+                        env_name: Some("MOONSHOT_API_KEY".to_string()),
+                        base_url: Some("https://api.moonshot.cn/v1".to_string()),
+                        default_model: None,
+                        options: None,
+                    },
+                );
+                m
+            },
+        };
+        migrate_settings(&mut settings);
+        let moonshot = settings.providers.get("moonshot").unwrap();
+        assert_eq!(
+            moonshot.base_url.as_deref(),
+            Some("https://api.moonshot.ai/v1"),
+        );
+    }
+
+    #[test]
+    fn test_migrate_moonshot_custom_url_untouched() {
+        let mut settings = AppSettings {
+            providers: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "moonshot".to_string(),
+                    ProviderSettings {
+                        env_name: Some("MOONSHOT_API_KEY".to_string()),
+                        base_url: Some("https://custom.example.com/v1".to_string()),
+                        default_model: None,
+                        options: None,
+                    },
+                );
+                m
+            },
+        };
+        migrate_settings(&mut settings);
+        let moonshot = settings.providers.get("moonshot").unwrap();
+        assert_eq!(
+            moonshot.base_url.as_deref(),
+            Some("https://custom.example.com/v1"),
+        );
+    }
+
+    #[test]
+    fn test_migrate_no_moonshot_provider() {
+        let mut settings = AppSettings::default();
+        migrate_settings(&mut settings);
+        assert!(settings.providers.is_empty());
     }
 
     // ---- FetchModelsError serialization ----

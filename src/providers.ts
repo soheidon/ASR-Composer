@@ -38,7 +38,7 @@ export const llmProviders: ProviderDefinition[] = [
   { id: "groq", company: "Groq", name: "GroqCloud", icon: "auto_awesome", env: "GROQ_API_KEY", defaultBaseUrl: "https://api.groq.com/openai/v1", modelSource: "api", allowManualModel: true, modelFilter: "llm", preferredModels: ["llama-3.3-70b-versatile", "qwen-qwq-32b"] },
   { id: "ollama", company: "Ollama", name: "ローカルLLMランタイム", icon: "auto_awesome", env: "", defaultBaseUrl: "http://localhost:11434", modelSource: "api", allowManualModel: true, modelFilter: "llm" },
   { id: "xiaomi_mimo", company: "Xiaomi MiMo", name: "MiMo", icon: "auto_awesome", env: "XIAOMI_API_KEY", defaultBaseUrl: "", modelSource: "manual", allowManualModel: true, modelFilter: "llm" },
-  { id: "moonshot", company: "Moonshot AI", name: "Kimi", icon: "auto_awesome", env: "MOONSHOT_API_KEY", defaultBaseUrl: "https://api.moonshot.cn/v1", modelSource: "api", allowManualModel: true, modelFilter: "llm", preferredModels: ["kimi-k2"] },
+  { id: "moonshot", company: "Moonshot AI", name: "Kimi", icon: "auto_awesome", env: "MOONSHOT_API_KEY", defaultBaseUrl: "https://api.moonshot.ai/v1", modelSource: "api", allowManualModel: true, modelFilter: "llm", preferredModels: ["kimi-k2"] },
   { id: "minimax", company: "MiniMax", name: "MiniMax Models", icon: "auto_awesome", env: "MINIMAX_API_KEY", defaultBaseUrl: "https://api.minimax.io/v1", modelSource: "api", allowManualModel: true, modelFilter: "llm", preferredModels: ["MiniMax-M1.2"] },
   { id: "zai_glm", company: "Z.AI", name: "GLM", icon: "auto_awesome", env: "ZAI_API_KEY", defaultBaseUrl: "https://api.z.ai/api/paas/v4", modelSource: "manual", allowManualModel: true, modelFilter: "llm" },
 ];
