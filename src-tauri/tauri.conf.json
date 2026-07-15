@@ -12,7 +12,16 @@
   "bundle": {
     "resources": [
       "resources/google-stt-test-ja.wav",
-      "resources/xiaomi-mimo-asr-test-en.wav"
+      "resources/xiaomi-mimo-asr-test-en.wav",
+      "resources/local-asr/base/Dockerfile",
+      "resources/local-asr/common/requirements-diar.txt",
+      "resources/local-asr/common/diarize.py",
+      "resources/local-asr/common/orchestrator.py",
+      "resources/local-asr/common/output_writer.py",
+      "resources/local-asr/common/smoke_test.py",
+      "resources/local-asr/reazonspeech/Dockerfile",
+      "resources/local-asr/reazonspeech/requirements-asr.txt",
+      "resources/local-asr/reazonspeech/transcribe.py"
     ]
   },
   "app": {

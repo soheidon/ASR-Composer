@@ -2304,6 +2304,204 @@ fn hf_token_delete() -> HuggingFaceTokenSaveResult {
     }
 }
 
+// ---- Local ASR Engine Management ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalAsrEngineStatus {
+    pub engine: String,
+    pub display_name: String,
+    pub installed: bool,
+    pub image_name: String,
+    pub image_id: Option<String>,
+    pub environment_version: Option<String>,
+    pub model_name: Option<String>,
+    pub docker_available: bool,
+    pub docker_running: bool,
+}
+
+struct LocalAsrEngineDef {
+    engine: &'static str,
+    display_name: &'static str,
+    image_name: &'static str,
+}
+
+fn local_asr_engine_defs() -> Vec<LocalAsrEngineDef> {
+    vec![LocalAsrEngineDef {
+        engine: "reazonspeech",
+        display_name: "ReazonSpeech",
+        image_name: "asr-composer-reazonspeech:cu126",
+    }]
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerImageInspect {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Config", default)]
+    config: Option<DockerImageConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerImageConfig {
+    #[serde(rename = "Labels", default)]
+    labels: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone)]
+struct DockerImageInfo {
+    image_id: String,
+    labels: HashMap<String, String>,
+}
+
+/// `docker image inspect` のJSON出力をパースする（テスト可能な純粋関数）。
+fn parse_docker_image_inspect(stdout: &str) -> Result<DockerImageInfo, String> {
+    let arr: Vec<DockerImageInspect> =
+        serde_json::from_str(stdout).map_err(|e| format!("JSON解析失敗: {}", e))?;
+
+    let first = arr
+        .first()
+        .ok_or_else(|| "イメージが見つかりません".to_string())?;
+
+    let labels = first
+        .config
+        .as_ref()
+        .and_then(|c| c.labels.clone())
+        .unwrap_or_default();
+
+    Ok(DockerImageInfo {
+        image_id: first.id.clone(),
+        labels,
+    })
+}
+
+/// `docker image inspect <image_name>` を実行し、イメージ情報を取得する。
+fn inspect_docker_image(
+    docker_path: &std::path::Path,
+    image_name: &str,
+) -> Result<Option<DockerImageInfo>, String> {
+    let output = std::process::Command::new(docker_path)
+        .args(["image", "inspect", image_name])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("docker実行失敗: {}", e))?;
+
+    if !output.status.success() {
+        // イメージが存在しない場合（exit code 1）
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_docker_image_inspect(&stdout).map(Some)
+}
+
+fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
+    let defs = local_asr_engine_defs();
+    let docker_path = find_docker_cli();
+    let docker_available = docker_path.is_some();
+
+    // Docker CLIなし → 全エンジンを未利用状態で返す
+    if !docker_available {
+        return defs
+            .into_iter()
+            .map(|d| LocalAsrEngineStatus {
+                engine: d.engine.to_string(),
+                display_name: d.display_name.to_string(),
+                installed: false,
+                image_name: d.image_name.to_string(),
+                image_id: None,
+                environment_version: None,
+                model_name: None,
+                docker_available: false,
+                docker_running: false,
+            })
+            .collect();
+    }
+
+    let docker_path_ref = docker_path.as_ref().unwrap();
+
+    // daemon接続確認（同期版: 簡易チェック）
+    let docker_running = std::process::Command::new(docker_path_ref)
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    defs.into_iter()
+        .map(|d| {
+            // daemon停止時はinspect実行しない
+            if !docker_running {
+                return LocalAsrEngineStatus {
+                    engine: d.engine.to_string(),
+                    display_name: d.display_name.to_string(),
+                    installed: false,
+                    image_name: d.image_name.to_string(),
+                    image_id: None,
+                    environment_version: None,
+                    model_name: None,
+                    docker_available: true,
+                    docker_running: false,
+                };
+            }
+
+            let (installed, image_id, env_version, model_name) =
+                match inspect_docker_image(docker_path_ref, d.image_name) {
+                    Ok(Some(info)) => {
+                        let env_ver = info
+                            .labels
+                            .get("com.asr-composer.environment-version")
+                            .cloned();
+                        let model = info
+                            .labels
+                            .get("com.asr-composer.asr-model")
+                            .cloned();
+                        (true, Some(info.image_id), env_ver, model)
+                    }
+                    _ => (false, None, None, None),
+                };
+
+            LocalAsrEngineStatus {
+                engine: d.engine.to_string(),
+                display_name: d.display_name.to_string(),
+                installed,
+                image_name: d.image_name.to_string(),
+                image_id,
+                environment_version: env_version,
+                model_name,
+                docker_available: true,
+                docker_running: true,
+            }
+        })
+        .collect()
+}
+
+fn unavailable_local_asr_statuses() -> Vec<LocalAsrEngineStatus> {
+    local_asr_engine_defs()
+        .into_iter()
+        .map(|d| LocalAsrEngineStatus {
+            engine: d.engine.to_string(),
+            display_name: d.display_name.to_string(),
+            installed: false,
+            image_name: d.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            model_name: None,
+            docker_available: false,
+            docker_running: false,
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn local_asr_get_status() -> Vec<LocalAsrEngineStatus> {
+    tauri::async_runtime::spawn_blocking(local_asr_get_status_sync)
+        .await
+        .unwrap_or_else(|_| unavailable_local_asr_statuses())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2326,7 +2524,8 @@ pub fn run() {
             docker_start_desktop,
             hf_token_get_status,
             hf_token_save,
-            hf_token_delete
+            hf_token_delete,
+            local_asr_get_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -4871,5 +5070,126 @@ mod tests {
         let token = "sensitive_token_value_12345";
         let err = validate_hf_token("").unwrap_err();
         assert!(!err.contains(token));
+    }
+
+    // ---- LocalAsrEngineStatus ----
+
+    #[test]
+    fn local_asr_engine_status_serializes_camel_case() {
+        let status = LocalAsrEngineStatus {
+            engine: "reazonspeech".to_string(),
+            display_name: "ReazonSpeech".to_string(),
+            installed: true,
+            image_name: "asr-composer-reazonspeech:cu126".to_string(),
+            image_id: Some("sha256:abc123".to_string()),
+            environment_version: Some("1.0.0".to_string()),
+            model_name: Some("reazon-research/reazonspeech-espnet-v2".to_string()),
+            docker_available: true,
+            docker_running: true,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("displayName"));
+        assert!(json.contains("imageName"));
+        assert!(json.contains("imageId"));
+        assert!(json.contains("environmentVersion"));
+        assert!(json.contains("modelName"));
+        assert!(json.contains("dockerAvailable"));
+        assert!(json.contains("dockerRunning"));
+        assert!(!json.contains("display_name"));
+        assert!(!json.contains("image_name"));
+    }
+
+    // ---- local_asr_engine_defs ----
+
+    #[test]
+    fn local_asr_engine_defs_contains_reazonspeech() {
+        let defs = local_asr_engine_defs();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].engine, "reazonspeech");
+        assert_eq!(defs[0].display_name, "ReazonSpeech");
+        assert_eq!(defs[0].image_name, "asr-composer-reazonspeech:cu126");
+    }
+
+    // ---- parse_docker_image_inspect ----
+
+    #[test]
+    fn parse_docker_image_inspect_normal() {
+        let json = r#"[
+            {
+                "Id": "sha256:d80986f40b0b954d5f19292cf08b8506171b91cb5a9ad80358f79775572d2226",
+                "Config": {
+                    "Labels": {
+                        "com.asr-composer.engine": "reazonspeech",
+                        "com.asr-composer.environment-version": "1.0.0",
+                        "com.asr-composer.asr-model": "reazon-research/reazonspeech-espnet-v2"
+                    }
+                }
+            }
+        ]"#;
+        let info = parse_docker_image_inspect(json).unwrap();
+        assert_eq!(info.image_id, "sha256:d80986f40b0b954d5f19292cf08b8506171b91cb5a9ad80358f79775572d2226");
+        assert_eq!(info.labels.get("com.asr-composer.engine").unwrap(), "reazonspeech");
+        assert_eq!(info.labels.get("com.asr-composer.environment-version").unwrap(), "1.0.0");
+        assert_eq!(info.labels.get("com.asr-composer.asr-model").unwrap(), "reazon-research/reazonspeech-espnet-v2");
+    }
+
+    #[test]
+    fn parse_docker_image_inspect_labels_null() {
+        let json = r#"[
+            {
+                "Id": "sha256:abc123",
+                "Config": {
+                    "Labels": null
+                }
+            }
+        ]"#;
+        let info = parse_docker_image_inspect(json).unwrap();
+        assert_eq!(info.image_id, "sha256:abc123");
+        assert!(info.labels.is_empty());
+    }
+
+    #[test]
+    fn parse_docker_image_inspect_config_missing() {
+        let json = r#"[
+            {
+                "Id": "sha256:abc123"
+            }
+        ]"#;
+        let info = parse_docker_image_inspect(json).unwrap();
+        assert_eq!(info.image_id, "sha256:abc123");
+        assert!(info.labels.is_empty());
+    }
+
+    #[test]
+    fn parse_docker_image_inspect_empty_array() {
+        let json = r#"[]"#;
+        let result = parse_docker_image_inspect(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("見つかりません"));
+    }
+
+    #[test]
+    fn parse_docker_image_inspect_invalid_json() {
+        let result = parse_docker_image_inspect("not json");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("JSON解析失敗"));
+    }
+
+    #[test]
+    fn parse_docker_image_inspect_empty_string() {
+        let result = parse_docker_image_inspect("");
+        assert!(result.is_err());
+    }
+
+    // ---- unavailable_local_asr_statuses ----
+
+    #[test]
+    fn unavailable_local_asr_statuses_returns_all_engines() {
+        let statuses = unavailable_local_asr_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].engine, "reazonspeech");
+        assert!(!statuses[0].installed);
+        assert!(!statuses[0].docker_available);
+        assert!(!statuses[0].docker_running);
     }
 }
