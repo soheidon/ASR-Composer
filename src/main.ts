@@ -770,6 +770,7 @@ async function navigateTo(page: PageName) {
     void loadAndRenderDockerStatus();
     void loadAndRenderHuggingFaceToken();
     void loadAndRenderLocalAsrStatus();
+    bindLocalAsrDelegation();
   }
 }
 
@@ -2339,24 +2340,31 @@ function bindHfTokenVisibility(): void {
 
 // ---- Local ASR Event Handlers ----
 
-function bindLocalAsrInstallBtns(): void {
-  document.querySelectorAll<HTMLButtonElement>(".btn-local-asr-install").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const engine = btn.dataset.installEngine;
-      if (engine) void handleLocalAsrInstall(engine, btn);
-    }, { once: true });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-local-asr-refresh]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      btn.disabled = true;
+let localAsrDelegationBound = false;
+
+function bindLocalAsrDelegation(): void {
+  if (localAsrDelegationBound) return;
+  localAsrDelegationBound = true;
+  const container = document.getElementById("localAsrContainer");
+  if (!container) return;
+
+  container.addEventListener("click", (e) => {
+    const target = (e.target as HTMLElement).closest<HTMLButtonElement>("button");
+    if (!target) return;
+
+    if (target.classList.contains("btn-local-asr-install")) {
+      const engine = target.dataset.installEngine;
+      if (engine) {
+        target.disabled = true;
+        void handleLocalAsrInstall(engine, target);
+      }
+    } else if (target.hasAttribute("data-local-asr-refresh")) {
+      target.disabled = true;
       void loadAndRenderLocalAsrStatus();
-    }, { once: true });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-uninstall-engine]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const engine = btn.dataset.uninstallEngine;
+    } else if (target.hasAttribute("data-uninstall-engine")) {
+      const engine = target.dataset.uninstallEngine;
       if (engine) void handleLocalAsrUninstall(engine);
-    }, { once: true });
+    }
   });
 }
 
@@ -2423,7 +2431,6 @@ async function handleLocalAsrInstall(engine: string, btn: HTMLButtonElement): Pr
           再試行
         </button>
       </div>`;
-    bindLocalAsrInstallBtns();
   } finally {
     unlisten();
   }
@@ -2463,7 +2470,6 @@ async function handleLocalAsrUninstall(engine: string): Promise<void> {
           再試行
         </button>
       </div>`;
-    bindLocalAsrInstallBtns();
   }
 }
 
@@ -2476,7 +2482,6 @@ async function loadAndRenderLocalAsrStatus(): Promise<void> {
     const engines = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status");
     if (!container.isConnected) return;
     container.innerHTML = renderLocalAsrSection(engines);
-    bindLocalAsrInstallBtns();
   } catch (e) {
     console.error("local_asr_get_status error:", e);
     if (!container.isConnected) return;
