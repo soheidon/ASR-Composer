@@ -420,4 +420,25 @@ describe("renderLocalAsrSection", () => {
     document.body.innerHTML = html;
     expect(document.querySelector(".btn-local-asr-install")).toBeNull();
   });
+
+  it("all non-loading states show refresh button", () => {
+    const states = [
+      { ...baseEngine },                                                          // no-docker
+      { ...baseEngine, dockerAvailable: true },                                    // docker-stopped
+      { ...baseEngine, dockerAvailable: true, dockerRunning: true },               // not-installed
+      { ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: true }, // installed
+    ];
+    for (const s of states) {
+      const html = renderLocalAsrSection([s]);
+      document.body.innerHTML = html;
+      expect(document.querySelector("[data-local-asr-refresh]")).toBeTruthy();
+    }
+  });
+
+  it("refresh button has correct text", () => {
+    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true, dockerRunning: true }]);
+    document.body.innerHTML = html;
+    const btn = document.querySelector("[data-local-asr-refresh]");
+    expect(btn?.textContent).toContain("状態を再確認");
+  });
 });

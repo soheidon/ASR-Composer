@@ -279,7 +279,13 @@ function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
           <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
           <span>Dockerがインストールされていません</span>
         </div>
-        <p class="docker-status-desc">ローカルASRを使用するには、Docker Desktopのインストールが必要です。上の「Docker Desktop」セクションを確認してください。</p>`;
+        <p class="docker-status-desc">ローカルASRを使用するには、Docker Desktopのインストールが必要です。上の「Docker Desktop」セクションを確認してください。</p>
+        <div class="docker-status-actions">
+          <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+            <span class="material-symbols-outlined">refresh</span>
+            状態を再確認
+          </button>
+        </div>`;
       break;
     case "docker-stopped":
       statusHtml = `
@@ -287,7 +293,13 @@ function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
           <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-warning, #f59e0b);">warning</span>
           <span>Docker Desktopが起動していません</span>
         </div>
-        <p class="docker-status-desc">Docker Desktopを起動してから、ページを再読み込みしてください。</p>`;
+        <p class="docker-status-desc">Docker Desktopを起動してから、状態を再確認してください。</p>
+        <div class="docker-status-actions">
+          <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+            <span class="material-symbols-outlined">refresh</span>
+            状態を再確認
+          </button>
+        </div>`;
       break;
     case "not-installed":
       statusHtml = `
@@ -300,6 +312,10 @@ function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
             <span class="material-symbols-outlined">download</span>
             インストール
           </button>
+          <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+            <span class="material-symbols-outlined">refresh</span>
+            状態を再確認
+          </button>
         </div>`;
       break;
     case "installed": {
@@ -311,7 +327,13 @@ function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
           <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-success, #22c55e);">check_circle</span>
           <span>インストール済み</span>
         </div>
-        ${details.length > 0 ? `<div class="local-asr-details">${details.map(d => `<p class="docker-detail-item">${d}</p>`).join("")}</div>` : ""}`;
+        ${details.length > 0 ? `<div class="local-asr-details">${details.map(d => `<p class="docker-detail-item">${d}</p>`).join("")}</div>` : ""}
+        <div class="docker-status-actions">
+          <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+            <span class="material-symbols-outlined">refresh</span>
+            状態を再確認
+          </button>
+        </div>`;
       break;
     }
     case "error":
@@ -319,6 +341,12 @@ function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
         <div class="docker-status-row">
           <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
           <span>状態を取得できませんでした</span>
+        </div>
+        <div class="docker-status-actions">
+          <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+            <span class="material-symbols-outlined">refresh</span>
+            状態を再確認
+          </button>
         </div>`;
       break;
   }

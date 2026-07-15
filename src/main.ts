@@ -2346,6 +2346,12 @@ function bindLocalAsrInstallBtns(): void {
       if (engine) void handleLocalAsrInstall(engine, btn);
     }, { once: true });
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-local-asr-refresh]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      btn.disabled = true;
+      void loadAndRenderLocalAsrStatus();
+    }, { once: true });
+  });
 }
 
 async function handleLocalAsrInstall(engine: string, btn: HTMLButtonElement): Promise<void> {
