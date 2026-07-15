@@ -18,8 +18,10 @@ export function getDockerUiState(status: DockerStatus | null): DockerUiState {
   if (!status) return "checking";
   if (!status.cliFound && !status.desktopFound) return "not-installed";
   if (!status.cliFound && status.desktopFound) return "cli-missing";
-  if (status.errorKind === "check_timeout") return "error";
-  if (!status.daemonRunning) return "stopped";
+  if (!status.daemonRunning) {
+    if (status.errorKind === "permission_denied") return "error";
+    return "stopped";
+  }
   return "ready";
 }
 
@@ -97,7 +99,7 @@ export function renderDockerStatusContent(status: DockerStatus | null): string {
             <span class="material-symbols-outlined" style="color: var(--color-warning, #f59e0b);">warning</span>
             <span>Docker Engineは起動していません</span>
           </div>
-          <p class="docker-status-desc">Docker Desktopを起動して、Docker Engineを開始してください。</p>
+          ${status?.errorMessage ? `<p class="docker-status-desc">${escapeHtml(status.errorMessage)}</p>` : '<p class="docker-status-desc">Docker Desktopを起動して、Docker Engineを開始してください。</p>'}
           <div class="docker-status-actions">
             <button class="btn-docker-start" type="button">
               <span class="material-symbols-outlined">play_arrow</span>

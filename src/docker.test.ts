@@ -31,7 +31,7 @@ describe("getDockerUiState", () => {
   });
 
   it("errorKind:'check_timeout' → 'error'", () => {
-    expect(getDockerUiState({ ...baseStatus, cliFound: true, errorKind: "check_timeout" })).toBe("error");
+    expect(getDockerUiState({ ...baseStatus, cliFound: true, errorKind: "check_timeout" })).toBe("stopped");
   });
 
   it("cliFound:true, daemonRunning:false → 'stopped'", () => {
@@ -165,17 +165,34 @@ describe("renderDockerStatusContent", () => {
     expect(html).toContain("&lt;img");
   });
 
-  it("error state renders error message", () => {
+  it("check_timeout renders as stopped with error message", () => {
     const html = renderDockerStatusContent({
       ...baseStatus,
       cliFound: true,
       desktopFound: true,
+      daemonRunning: false,
       errorKind: "check_timeout",
-      errorMessage: "タイムアウトしました",
+      errorMessage: "Docker Engineへの接続がタイムアウトしました。",
+    });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("Docker Engineは起動していません");
+    expect(document.body.textContent).toContain("タイムアウトしました");
+    expect(document.querySelector(".btn-docker-start")).toBeTruthy();
+    expect(document.querySelector(".btn-docker-refresh")).toBeTruthy();
+  });
+
+  it("permission_denied renders as error", () => {
+    const html = renderDockerStatusContent({
+      ...baseStatus,
+      cliFound: true,
+      desktopFound: true,
+      daemonRunning: false,
+      errorKind: "permission_denied",
+      errorMessage: "権限エラー: access denied",
     });
     document.body.innerHTML = html;
     expect(document.body.textContent).toContain("エラーが発生しました");
-    expect(document.body.textContent).toContain("タイムアウトしました");
+    expect(document.body.textContent).toContain("権限エラー");
     expect(document.querySelector(".btn-docker-refresh")).toBeTruthy();
   });
 
@@ -183,7 +200,9 @@ describe("renderDockerStatusContent", () => {
     const html = renderDockerStatusContent({
       ...baseStatus,
       cliFound: true,
-      errorKind: "check_timeout",
+      desktopFound: true,
+      daemonRunning: false,
+      errorKind: "permission_denied",
       errorMessage: '<script>alert("xss")</script>',
     });
     expect(html).not.toContain("<script>");
