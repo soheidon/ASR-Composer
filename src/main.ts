@@ -2352,17 +2352,16 @@ function bindHfTokenVisibility(): void {
 
 // ---- Local ASR Event Handlers ----
 
-let localAsrDelegationBound = false;
-
 function bindLocalAsrDelegation(): void {
-  if (localAsrDelegationBound) return;
-  localAsrDelegationBound = true;
   const container = document.getElementById("localAsrContainer");
   if (!container) return;
 
+  if (container.dataset.delegationBound === "true") return;
+  container.dataset.delegationBound = "true";
+
   container.addEventListener("click", (e) => {
     const target = (e.target as HTMLElement).closest<HTMLButtonElement>("button");
-    if (!target) return;
+    if (!target || !container.contains(target)) return;
 
     if (target.classList.contains("btn-local-asr-install")) {
       const engine = target.dataset.installEngine;
@@ -2370,12 +2369,21 @@ function bindLocalAsrDelegation(): void {
         target.disabled = true;
         void handleLocalAsrInstall(engine, target);
       }
-    } else if (target.hasAttribute("data-local-asr-refresh")) {
+      return;
+    }
+
+    if (target.hasAttribute("data-local-asr-refresh")) {
       target.disabled = true;
       void loadAndRenderLocalAsrStatus();
-    } else if (target.hasAttribute("data-uninstall-engine")) {
+      return;
+    }
+
+    if (target.hasAttribute("data-uninstall-engine")) {
       const engine = target.dataset.uninstallEngine;
-      if (engine) void handleLocalAsrUninstall(engine);
+      if (engine) {
+        target.disabled = true;
+        void handleLocalAsrUninstall(engine, target);
+      }
     }
   });
 }
@@ -2448,19 +2456,32 @@ async function handleLocalAsrInstall(engine: string, btn: HTMLButtonElement): Pr
   }
 }
 
-async function handleLocalAsrUninstall(engine: string): Promise<void> {
+async function handleLocalAsrUninstall(engine: string, button: HTMLButtonElement): Promise<void> {
   const { ask } = await import("@tauri-apps/plugin-dialog");
   const confirmed = await ask(
     "Dockerイメージを削除します。モデルキャッシュや出力ファイルは削除されません。",
     { title: "ReazonSpeech環境を削除", kind: "warning" },
   );
-  if (!confirmed) return;
+  if (!confirmed) {
+    if (button.isConnected) button.disabled = false;
+    return;
+  }
+
+  const originalHtml = button.innerHTML;
+  button.disabled = true;
+  button.innerHTML = '<span class="material-symbols-outlined spin">progress_activity</span> 削除中…';
 
   try {
     await invokeTauri("local_asr_uninstall", { engine });
     await loadAndRenderLocalAsrStatus();
   } catch (e) {
     console.error("local_asr_uninstall error:", e);
+
+    if (button.isConnected) {
+      button.disabled = false;
+      button.innerHTML = originalHtml;
+    }
+
     const container = document.getElementById("localAsrContainer");
     if (!container) return;
     const card = container.querySelector(".local-asr-engine-card");
