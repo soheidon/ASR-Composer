@@ -2117,31 +2117,67 @@ async fn docker_check_status() -> DockerStatus {
     }
 }
 
+/// `docker desktop start --detach` の結果を分類する（テスト可能な純粋関数）。
+fn classify_docker_start_result(
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> DockerStartResult {
+    if success {
+        return DockerStartResult {
+            launched: true,
+            message: "Docker Desktopの起動を開始しました。".to_string(),
+        };
+    }
+
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
+
+    DockerStartResult {
+        launched: false,
+        message: if detail.is_empty() {
+            "Docker Desktopの起動に失敗しました。".to_string()
+        } else {
+            format!("Docker Desktopの起動に失敗しました: {}", detail)
+        },
+    }
+}
+
 #[tauri::command]
 async fn docker_start_desktop() -> DockerStartResult {
-    let desktop_path = match find_docker_desktop() {
-        Some(p) => p,
+    let docker_path = match find_docker_cli() {
+        Some(path) => path,
         None => {
             return DockerStartResult {
                 launched: false,
-                message: "Docker Desktopが見つかりません。公式サイトからダウンロードしてください。"
-                    .to_string(),
+                message: "Docker CLIが見つかりません。".to_string(),
             };
         }
     };
 
-    match std::process::Command::new(&desktop_path).spawn() {
-        Ok(_) => DockerStartResult {
-            launched: true,
-            message:
-                "Docker Desktopを起動しました。起動が完了したら「状態を再確認」を押してください。"
-                    .to_string(),
-        },
-        Err(e) => DockerStartResult {
-            launched: false,
-            message: format!("Docker Desktopの起動に失敗しました: {}", e),
-        },
-    }
+    let output = match tokio::process::Command::new(&docker_path)
+        .args(["desktop", "start", "--detach"])
+        .kill_on_drop(true)
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            return DockerStartResult {
+                launched: false,
+                message: format!("Docker Desktopの起動に失敗しました: {}", e),
+            };
+        }
+    };
+
+    classify_docker_start_result(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
 }
 
 // ---- HuggingFace Token Management ----
@@ -5544,6 +5580,45 @@ mod tests {
         assert!(!statuses[0].installed);
         assert!(!statuses[0].docker_available);
         assert!(!statuses[0].docker_running);
+    }
+
+    // ---- classify_docker_start_result ----
+
+    #[test]
+    fn classify_docker_start_success() {
+        let result = classify_docker_start_result(true, "", "");
+        assert!(result.launched);
+        assert!(result.message.contains("起動を開始しました"));
+    }
+
+    #[test]
+    fn classify_docker_start_failure_with_stderr() {
+        let result = classify_docker_start_result(false, "", "error: something went wrong");
+        assert!(!result.launched);
+        assert!(result.message.contains("起動に失敗しました"));
+        assert!(result.message.contains("something went wrong"));
+    }
+
+    #[test]
+    fn classify_docker_start_failure_with_stdout_fallback() {
+        let result = classify_docker_start_result(false, "some output", "");
+        assert!(!result.launched);
+        assert!(result.message.contains("some output"));
+    }
+
+    #[test]
+    fn classify_docker_start_failure_empty_output() {
+        let result = classify_docker_start_result(false, "", "");
+        assert!(!result.launched);
+        assert!(result.message.contains("起動に失敗しました"));
+        assert!(!result.message.contains("失敗しました:")); // コロンなし
+    }
+
+    #[test]
+    fn classify_docker_start_stderr_preferred_over_stdout() {
+        let result = classify_docker_start_result(false, "stdout msg", "stderr msg");
+        assert!(result.message.contains("stderr msg"));
+        assert!(!result.message.contains("stdout msg"));
     }
 
     // ---- tail_stderr ----

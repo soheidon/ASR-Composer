@@ -2181,24 +2181,36 @@ function bindDockerStartBtn(): void {
       try {
         const result = await invokeTauri<{ launched: boolean; message: string }>("docker_start_desktop");
         if (!btn.isConnected) return;
-        await showAppDialog({
-          title: "Docker Desktop",
-          message: result.message,
-          type: result.launched ? "success" : "error",
-        });
+        if (!result.launched) {
+          await showAppDialog({ title: "Docker Desktop", message: result.message, type: "error" });
+          btn.disabled = false;
+          btn.innerHTML = originalHtml;
+          return;
+        }
+        // 起動要求成功 → daemon起動をポーリング
+        const statusRow = btn.closest(".docker-status-card")?.querySelector(".docker-status-row");
+        if (statusRow) {
+          statusRow.innerHTML = '<span class="material-symbols-outlined spin" style="font-size:18px;color:var(--color-text-secondary);">progress_activity</span><span>Docker Desktopを起動しています…</span>';
+        }
+        for (let i = 0; i < 18; i++) {
+          await new Promise(r => setTimeout(r, 5000));
+          if (!btn.isConnected) return;
+          try {
+            const status = await invokeTauri<DockerStatus>("docker_check_status");
+            if (status.daemonRunning) {
+              await loadAndRenderDockerStatus();
+              return;
+            }
+          } catch { /* retry */ }
+        }
+        // タイムアウト: 手動再確認を促す
+        await loadAndRenderDockerStatus();
       } catch (e) {
         console.error("docker_start_desktop error:", e);
         if (!btn.isConnected) return;
-        await showAppDialog({
-          title: "Docker Desktop",
-          message: `起動に失敗しました: ${e}`,
-          type: "error",
-        });
-      } finally {
-        if (btn.isConnected) {
-          btn.disabled = false;
-          btn.innerHTML = originalHtml;
-        }
+        await showAppDialog({ title: "Docker Desktop", message: `起動に失敗しました: ${e}`, type: "error" });
+        btn.disabled = false;
+        btn.innerHTML = originalHtml;
       }
     }, { once: true });
   });
