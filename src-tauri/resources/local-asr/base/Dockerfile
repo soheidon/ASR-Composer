@@ -5,7 +5,8 @@ LABEL com.asr-composer.version="1.0.0"
 ENV DEBIAN_FRONTEND=noninteractive
 
 # deadsnakes PPAでPython 3.11をインストール
-RUN apt-get update \
+RUN echo "ASR_PROGRESS:installing-system-packages" \
+    && apt-get update \
     && apt-get install -y --no-install-recommends software-properties-common \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update \

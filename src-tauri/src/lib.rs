@@ -2532,7 +2532,21 @@ fn tail_stderr(source: &str, max_lines: usize) -> String {
     }
 }
 
-/// Docker buildを実行し、進捗をemitする。
+const ASR_PROGRESS_PREFIX: &str = "ASR_PROGRESS:";
+
+/// stdout行からASR_PROGRESSマーカーを抽出する（テスト可能な純粋関数）。
+/// ステージ名は英数字とハイフンのみで構成され、それ以降の文字は無視する。
+fn extract_asr_stage(line: &str) -> Option<&str> {
+    let pos = line.find(ASR_PROGRESS_PREFIX)?;
+    let after = &line[pos + ASR_PROGRESS_PREFIX.len()..];
+    let end = after
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .unwrap_or(after.len());
+    let stage = &after[..end];
+    if stage.is_empty() { None } else { Some(stage) }
+}
+
+/// Docker buildを実行し、stdoutからASR_PROGRESSマーカーを抽出して進捗をemitする。
 async fn run_docker_build(
     docker_path: &std::path::Path,
     tag: &str,
@@ -2540,8 +2554,8 @@ async fn run_docker_build(
     context: &std::path::Path,
     app: &tauri::AppHandle,
     engine: &str,
-    stage: &str,
-    message: &str,
+    initial_stage: &str,
+    initial_message: &str,
 ) -> Result<(), String> {
     use tauri::Emitter;
 
@@ -2549,39 +2563,77 @@ async fn run_docker_build(
         "local-asr-progress",
         LocalAsrProgress {
             engine: engine.to_string(),
-            stage: stage.to_string(),
-            message: message.to_string(),
+            stage: initial_stage.to_string(),
+            message: initial_message.to_string(),
         },
     )
     .map_err(|e| format!("進捗通知に失敗しました: {e}"))?;
 
     let mut command = tokio::process::Command::new(docker_path);
     command
-        .args([
-            "build",
-            "-t",
-            tag,
-            "-f",
-            dockerfile,
-            ".",
-        ])
+        .args(["build", "--progress=plain", "-t", tag, "-f", dockerfile, "."])
         .current_dir(context)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
-    let output = command
-        .output()
-        .await
+    let mut child = command
+        .spawn()
         .map_err(|e| format!("Docker buildの実行に失敗しました: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail_source = if stderr.trim().is_empty() {
-            stdout.as_ref()
+    let stdout = child.stdout.take().unwrap();
+    let stderr_handle = child.stderr.take().unwrap();
+
+    // stdoutを行単位でストリーミングし、ASR_PROGRESSマーカーを抽出
+    let engine_clone = engine.to_string();
+    let app_clone = app.clone();
+    let stdout_task = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let mut last_emitted_stage = String::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(stage) = extract_asr_stage(&line) {
+                if stage != last_emitted_stage {
+                    last_emitted_stage = stage.to_string();
+                    let _ = app_clone.emit(
+                        "local-asr-progress",
+                        LocalAsrProgress {
+                            engine: engine_clone.clone(),
+                            stage: stage.to_string(),
+                            message: String::new(),
+                        },
+                    );
+                }
+            }
+        }
+    });
+
+    // stderrは最後にまとめて取得
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = String::new();
+        let mut reader = stderr_handle;
+        let _ = reader.read_to_string(&mut buf).await;
+        buf
+    });
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Docker buildの待機に失敗しました: {e}"))?;
+
+    let _ = stdout_task.await;
+    let stderr_output = stderr_task.await.unwrap_or_default();
+
+    if !status.success() {
+        let detail = if stderr_output.trim().is_empty() {
+            // stderrが空の場合、stdoutの最後の出力を使用（Docker BuildKit対策）
+            "Docker buildが失敗しました。詳細ログを確認してください。".to_string()
         } else {
-            stderr.as_ref()
+            tail_stderr(&stderr_output, 30)
         };
-        return Err(tail_stderr(detail_source, 30));
+        return Err(detail);
     }
 
     Ok(())
@@ -2626,7 +2678,7 @@ async fn local_asr_install(
         LocalAsrProgress {
             engine: engine.clone(),
             stage: "checking".to_string(),
-            message: "Docker環境を確認しています".to_string(),
+            message: String::new(),
         },
     )
     .ok();
@@ -2641,6 +2693,17 @@ async fn local_asr_install(
         return Err("ローカルASRリソースが見つかりません".to_string());
     }
 
+    // resolving-resources
+    app.emit(
+        "local-asr-progress",
+        LocalAsrProgress {
+            engine: engine.clone(),
+            stage: "resolving-resources".to_string(),
+            message: String::new(),
+        },
+    )
+    .ok();
+
     // base build
     run_docker_build(
         &docker_path,
@@ -2649,7 +2712,7 @@ async fn local_asr_install(
         &local_asr_root,
         &app,
         &engine,
-        "building-base",
+        "building-base-start",
         "ベース環境を構築しています",
     )
     .await
@@ -2663,13 +2726,23 @@ async fn local_asr_install(
         &local_asr_root,
         &app,
         &engine,
-        "building-engine",
+        "building-engine-start",
         &format!("{}環境を構築しています", def.display_name),
     )
     .await
     .map_err(|detail| format!("{}環境の構築に失敗しました\n{detail}", def.display_name))?;
 
     // installed確認
+    app.emit(
+        "local-asr-progress",
+        LocalAsrProgress {
+            engine: engine.clone(),
+            stage: "verifying-image".to_string(),
+            message: String::new(),
+        },
+    )
+    .ok();
+
     let status = get_single_engine_status(&docker_path, true, &def);
     if !status.installed {
         return Err(format!(
@@ -2684,7 +2757,7 @@ async fn local_asr_install(
         LocalAsrProgress {
             engine: engine.clone(),
             stage: "completed".to_string(),
-            message: format!("{}環境の構築が完了しました", def.display_name),
+            message: String::new(),
         },
     )
     .ok();
@@ -5412,6 +5485,43 @@ mod tests {
     #[test]
     fn tail_stderr_empty() {
         assert_eq!(tail_stderr("", 30), "");
+    }
+
+    // ---- LocalAsrProgress serialization ----
+
+    // ---- extract_asr_stage ----
+
+    #[test]
+    fn extract_asr_stage_normal() {
+        assert_eq!(extract_asr_stage("ASR_PROGRESS:installing-pyannote"), Some("installing-pyannote"));
+    }
+
+    #[test]
+    fn extract_asr_stage_with_surrounding_text() {
+        assert_eq!(
+            extract_asr_stage("#5 [2/3] RUN echo ASR_PROGRESS:building-base-start && apt-get ..."),
+            Some("building-base-start")
+        );
+    }
+
+    #[test]
+    fn extract_asr_stage_no_marker() {
+        assert_eq!(extract_asr_stage("some random build output"), None);
+    }
+
+    #[test]
+    fn extract_asr_stage_empty_after_prefix() {
+        assert_eq!(extract_asr_stage("ASR_PROGRESS:"), None);
+    }
+
+    #[test]
+    fn extract_asr_stage_whitespace_trimmed() {
+        assert_eq!(extract_asr_stage("ASR_PROGRESS:checking  "), Some("checking"));
+    }
+
+    #[test]
+    fn extract_asr_stage_completed() {
+        assert_eq!(extract_asr_stage("ASR_PROGRESS:completed"), Some("completed"));
     }
 
     // ---- LocalAsrProgress serialization ----

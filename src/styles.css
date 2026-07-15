@@ -1769,3 +1769,36 @@ html, body {
   flex-direction: column;
   gap: 2px;
 }
+
+/* Local ASR install progress bar */
+
+.local-asr-install-progress {
+  margin-top: 4px;
+}
+
+.local-asr-progress-track {
+  height: 6px;
+  background: var(--surface-container-high);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.local-asr-progress-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.local-asr-progress-percent {
+  margin-top: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--on-surface);
+}
+
+.local-asr-progress-message {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--on-surface-variant);
+}

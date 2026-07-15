@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
-import { getDockerUiState, escapeHtml, renderDockerStatusContent, renderHuggingFaceTokenSection, getLocalAsrUiState, renderLocalAsrSection } from "./docker";
+import { getDockerUiState, escapeHtml, renderDockerStatusContent, renderHuggingFaceTokenSection, getLocalAsrUiState, renderLocalAsrSection, getLocalAsrProgressDisplay } from "./docker";
 import type { DockerStatus, LocalAsrEngineStatus } from "./docker";
 
 // ---- getDockerUiState ----
@@ -440,5 +440,67 @@ describe("renderLocalAsrSection", () => {
     document.body.innerHTML = html;
     const btn = document.querySelector("[data-local-asr-refresh]");
     expect(btn?.textContent).toContain("状態を再確認");
+  });
+});
+
+// ---- getLocalAsrProgressDisplay ----
+
+describe("getLocalAsrProgressDisplay", () => {
+  it("checking returns5%", () => {
+    const d = getLocalAsrProgressDisplay("checking");
+    expect(d.percent).toBe(5);
+    expect(d.message).toContain("Docker");
+  });
+
+  it("completed returns 100%", () => {
+    const d = getLocalAsrProgressDisplay("completed");
+    expect(d.percent).toBe(100);
+    expect(d.message).toContain("完了");
+  });
+
+  it("installing-pyannote returns60%", () => {
+    const d = getLocalAsrProgressDisplay("installing-pyannote");
+    expect(d.percent).toBe(60);
+    expect(d.message).toContain("pyannote");
+  });
+
+  it("unknown stage returns0%", () => {
+    const d = getLocalAsrProgressDisplay("unknown-stage");
+    expect(d.percent).toBe(0);
+    expect(d.message).toContain("開始");
+  });
+
+  it("stages are monotonically increasing", () => {
+    const stageOrder = [
+      "checking", "resolving-resources", "building-base-start",
+      "installing-system-packages", "building-base-export",
+      "building-engine-start", "installing-diar-torch",
+      "installing-pyannote", "installing-asr-torch",
+      "installing-reazonspeech", "rebuilding-ctc",
+      "checking-dependencies", "exporting-engine-image",
+      "verifying-image", "completed",
+    ];
+    let prev = 0;
+    for (const stage of stageOrder) {
+      const d = getLocalAsrProgressDisplay(stage);
+      expect(d.percent).toBeGreaterThan(prev);
+      prev = d.percent;
+    }
+  });
+
+  it("all stages have non-empty messages", () => {
+    const stageOrder = [
+      "checking", "resolving-resources", "building-base-start",
+      "installing-system-packages", "building-base-export",
+      "building-engine-start", "installing-diar-torch",
+      "installing-pyannote", "installing-asr-torch",
+      "installing-reazonspeech", "rebuilding-ctc",
+      "checking-dependencies", "exporting-engine-image",
+      "verifying-image", "completed",
+    ];
+    for (const stage of stageOrder) {
+      const d = getLocalAsrProgressDisplay(stage);
+      expect(d.message.length).toBeGreaterThan(0);
+    }
   });
 });

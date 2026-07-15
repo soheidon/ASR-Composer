@@ -237,6 +237,33 @@ export function getLocalAsrUiState(status: LocalAsrEngineStatus | null): LocalAs
   return "installed";
 }
 
+export interface LocalAsrProgressDisplay {
+  percent: number;
+  message: string;
+}
+
+const LOCAL_ASR_STAGES: Record<string, LocalAsrProgressDisplay> = {
+  "checking": { percent: 5, message: "Docker環境を確認しています" },
+  "resolving-resources": { percent: 10, message: "ローカルASRファイルを確認しています" },
+  "building-base-start": { percent: 15, message: "ベースイメージの構築を開始しています" },
+  "installing-system-packages": { percent: 25, message: "Python・FFmpegなどをインストールしています" },
+  "building-base-export": { percent: 35, message: "ベースイメージを書き出しています" },
+  "building-engine-start": { percent: 40, message: "ReazonSpeech環境の構築を開始しています" },
+  "installing-diar-torch": { percent: 50, message: "話者分離用PyTorchをインストールしています" },
+  "installing-pyannote": { percent: 60, message: "pyannoteをインストールしています" },
+  "installing-asr-torch": { percent: 67, message: "音声認識用PyTorchをインストールしています" },
+  "installing-reazonspeech": { percent: 78, message: "ReazonSpeech・ESPnetをインストールしています" },
+  "rebuilding-ctc": { percent: 84, message: "ctc-segmentationを再構築しています" },
+  "checking-dependencies": { percent: 88, message: "依存関係を確認しています" },
+  "exporting-engine-image": { percent: 94, message: "ReazonSpeechイメージを書き出しています" },
+  "verifying-image": { percent: 98, message: "作成したイメージを確認しています" },
+  "completed": { percent: 100, message: "インストールが完了しました" },
+};
+
+export function getLocalAsrProgressDisplay(stage: string): LocalAsrProgressDisplay {
+  return LOCAL_ASR_STAGES[stage] ?? { percent: 0, message: "処理を開始しています" };
+}
+
 export function renderLocalAsrSection(engines: LocalAsrEngineStatus[] | null): string {
   if (engines === null) {
     return `

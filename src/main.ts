@@ -17,7 +17,7 @@ import {
   setButtonLoading,
   restoreButtonLoading,
 } from "./provider-config-save";
-import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection, escapeHtml } from "./docker";
+import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection, escapeHtml, getLocalAsrProgressDisplay } from "./docker";
 import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus, LocalAsrProgress } from "./docker";
 
 const app = document.getElementById("app")!;
@@ -2354,6 +2354,33 @@ function bindLocalAsrInstallBtns(): void {
   });
 }
 
+function renderLocalAsrProgressBar(percent: number, message: string): string {
+  return `
+    <div class="local-asr-install-progress">
+      <div class="local-asr-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}">
+        <div class="local-asr-progress-fill" style="width: ${percent}%"></div>
+      </div>
+      <div class="local-asr-progress-percent">${percent}%</div>
+      <div class="local-asr-progress-message">${escapeHtml(message)}</div>
+    </div>`;
+}
+
+function updateLocalAsrProgress(container: HTMLElement, progress: LocalAsrProgress): void {
+  const display = getLocalAsrProgressDisplay(progress.stage);
+  const bar = container.querySelector<HTMLElement>(".local-asr-progress-fill");
+  const track = container.querySelector<HTMLElement>(".local-asr-progress-track");
+  const percentEl = container.querySelector<HTMLElement>(".local-asr-progress-percent");
+  const messageEl = container.querySelector<HTMLElement>(".local-asr-progress-message");
+
+  const current = Number(track?.getAttribute("aria-valuenow") ?? "0");
+  const next = Math.max(current, display.percent);
+
+  if (bar) bar.style.width = `${next}%`;
+  if (track) track.setAttribute("aria-valuenow", String(next));
+  if (percentEl) percentEl.textContent = `${next}%`;
+  if (messageEl) messageEl.textContent = display.message;
+}
+
 async function handleLocalAsrInstall(engine: string, btn: HTMLButtonElement): Promise<void> {
   const card = btn.closest(".local-asr-engine-card");
   if (!card) return;
@@ -2364,20 +2391,12 @@ async function handleLocalAsrInstall(engine: string, btn: HTMLButtonElement): Pr
   const { listen } = await import("@tauri-apps/api/event");
   const unlisten = await listen<LocalAsrProgress>("local-asr-progress", ({ payload }) => {
     if (payload.engine === engine && statusEl.isConnected) {
-      statusEl.innerHTML = `
-        <div class="docker-status-row">
-          <span class="material-symbols-outlined spin" style="font-size: 18px; color: var(--color-text-secondary);">progress_activity</span>
-          <span>${escapeHtml(payload.message)}</span>
-        </div>`;
+      updateLocalAsrProgress(statusEl, payload);
     }
   });
 
   btn.disabled = true;
-  statusEl.innerHTML = `
-    <div class="docker-status-row">
-      <span class="material-symbols-outlined spin" style="font-size: 18px; color: var(--color-text-secondary);">progress_activity</span>
-      <span>インストールしています…</span>
-    </div>`;
+  statusEl.innerHTML = renderLocalAsrProgressBar(0, "インストールを準備しています…");
 
   try {
     await invokeTauri<LocalAsrEngineStatus>("local_asr_install", { engine });
