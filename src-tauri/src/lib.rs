@@ -2396,15 +2396,63 @@ fn inspect_docker_image(
     parse_docker_image_inspect(&stdout).map(Some)
 }
 
+/// 単一エンジンの状態を取得する（テスト可能、Docker実行を含む）。
+fn get_single_engine_status(
+    docker_path: &std::path::Path,
+    docker_running: bool,
+    def: &LocalAsrEngineDef,
+) -> LocalAsrEngineStatus {
+    if !docker_running {
+        return LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            model_name: None,
+            docker_available: true,
+            docker_running: false,
+        };
+    }
+
+    let (installed, image_id, env_version, model_name) =
+        match inspect_docker_image(docker_path, def.image_name) {
+            Ok(Some(info)) => {
+                let env_ver = info
+                    .labels
+                    .get("com.asr-composer.environment-version")
+                    .cloned();
+                let model = info
+                    .labels
+                    .get("com.asr-composer.asr-model")
+                    .cloned();
+                (true, Some(info.image_id), env_ver, model)
+            }
+            _ => (false, None, None, None),
+        };
+
+    LocalAsrEngineStatus {
+        engine: def.engine.to_string(),
+        display_name: def.display_name.to_string(),
+        installed,
+        image_name: def.image_name.to_string(),
+        image_id,
+        environment_version: env_version,
+        model_name,
+        docker_available: true,
+        docker_running: true,
+    }
+}
+
 fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
     let defs = local_asr_engine_defs();
     let docker_path = find_docker_cli();
     let docker_available = docker_path.is_some();
 
-    // Docker CLIなし → 全エンジンを未利用状態で返す
     if !docker_available {
         return defs
-            .into_iter()
+            .iter()
             .map(|d| LocalAsrEngineStatus {
                 engine: d.engine.to_string(),
                 display_name: d.display_name.to_string(),
@@ -2421,7 +2469,6 @@ fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
 
     let docker_path_ref = docker_path.as_ref().unwrap();
 
-    // daemon接続確認（同期版: 簡易チェック）
     let docker_running = std::process::Command::new(docker_path_ref)
         .args(["version", "--format", "{{.Server.Version}}"])
         .stdout(std::process::Stdio::null())
@@ -2430,57 +2477,14 @@ fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    defs.into_iter()
-        .map(|d| {
-            // daemon停止時はinspect実行しない
-            if !docker_running {
-                return LocalAsrEngineStatus {
-                    engine: d.engine.to_string(),
-                    display_name: d.display_name.to_string(),
-                    installed: false,
-                    image_name: d.image_name.to_string(),
-                    image_id: None,
-                    environment_version: None,
-                    model_name: None,
-                    docker_available: true,
-                    docker_running: false,
-                };
-            }
-
-            let (installed, image_id, env_version, model_name) =
-                match inspect_docker_image(docker_path_ref, d.image_name) {
-                    Ok(Some(info)) => {
-                        let env_ver = info
-                            .labels
-                            .get("com.asr-composer.environment-version")
-                            .cloned();
-                        let model = info
-                            .labels
-                            .get("com.asr-composer.asr-model")
-                            .cloned();
-                        (true, Some(info.image_id), env_ver, model)
-                    }
-                    _ => (false, None, None, None),
-                };
-
-            LocalAsrEngineStatus {
-                engine: d.engine.to_string(),
-                display_name: d.display_name.to_string(),
-                installed,
-                image_name: d.image_name.to_string(),
-                image_id,
-                environment_version: env_version,
-                model_name,
-                docker_available: true,
-                docker_running: true,
-            }
-        })
+    defs.iter()
+        .map(|d| get_single_engine_status(docker_path_ref, docker_running, d))
         .collect()
 }
 
 fn unavailable_local_asr_statuses() -> Vec<LocalAsrEngineStatus> {
     local_asr_engine_defs()
-        .into_iter()
+        .iter()
         .map(|d| LocalAsrEngineStatus {
             engine: d.engine.to_string(),
             display_name: d.display_name.to_string(),
@@ -2500,6 +2504,192 @@ async fn local_asr_get_status() -> Vec<LocalAsrEngineStatus> {
     tauri::async_runtime::spawn_blocking(local_asr_get_status_sync)
         .await
         .unwrap_or_else(|_| unavailable_local_asr_statuses())
+}
+
+// ---- Local ASR Install ----
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAsrProgress {
+    engine: String,
+    stage: String,
+    message: String,
+}
+
+fn local_asr_install_lock() -> &'static tokio::sync::Mutex<()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// stderr/stdoutの末尾N行を返す。
+fn tail_stderr(source: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    if lines.len() <= max_lines {
+        source.trim().to_string()
+    } else {
+        lines[lines.len() - max_lines..].join("\n")
+    }
+}
+
+/// Docker buildを実行し、進捗をemitする。
+async fn run_docker_build(
+    docker_path: &std::path::Path,
+    tag: &str,
+    dockerfile: &str,
+    context: &std::path::Path,
+    app: &tauri::AppHandle,
+    engine: &str,
+    stage: &str,
+    message: &str,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    app.emit(
+        "local-asr-progress",
+        LocalAsrProgress {
+            engine: engine.to_string(),
+            stage: stage.to_string(),
+            message: message.to_string(),
+        },
+    )
+    .map_err(|e| format!("進捗通知に失敗しました: {e}"))?;
+
+    let mut command = tokio::process::Command::new(docker_path);
+    command
+        .args([
+            "build",
+            "-t",
+            tag,
+            "-f",
+            dockerfile,
+            ".",
+        ])
+        .current_dir(context)
+        .kill_on_drop(true);
+
+    let output = command
+        .output()
+        .await
+        .map_err(|e| format!("Docker buildの実行に失敗しました: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail_source = if stderr.trim().is_empty() {
+            stdout.as_ref()
+        } else {
+            stderr.as_ref()
+        };
+        return Err(tail_stderr(detail_source, 30));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn local_asr_install(
+    app: tauri::AppHandle,
+    engine: String,
+) -> Result<LocalAsrEngineStatus, String> {
+    use tauri::Emitter;
+
+    // 排他制御
+    let _guard = local_asr_install_lock()
+        .try_lock()
+        .map_err(|_| "ローカルASR環境の処理がすでに実行中です".to_string())?;
+
+    // engine検証
+    let def = local_asr_engine_defs()
+        .into_iter()
+        .find(|d| d.engine == engine)
+        .ok_or_else(|| format!("未対応のエンジンです: {}", engine))?;
+
+    // Docker CLI確認
+    let docker_path = find_docker_cli().ok_or("Dockerがインストールされていません")?;
+
+    // daemon確認
+    let daemon_ok = std::process::Command::new(&docker_path)
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !daemon_ok {
+        return Err("Docker Desktopが起動していません".to_string());
+    }
+
+    // checking
+    app.emit(
+        "local-asr-progress",
+        LocalAsrProgress {
+            engine: engine.clone(),
+            stage: "checking".to_string(),
+            message: "Docker環境を確認しています".to_string(),
+        },
+    )
+    .ok();
+
+    // resource directory 解決
+    let local_asr_root = app
+        .path()
+        .resolve("resources/local-asr", tauri::path::BaseDirectory::Resource)
+        .map_err(|_| "ローカルASRリソースが見つかりません".to_string())?;
+
+    if !local_asr_root.exists() {
+        return Err("ローカルASRリソースが見つかりません".to_string());
+    }
+
+    // base build
+    run_docker_build(
+        &docker_path,
+        "asr-composer-base:cu126",
+        "base/Dockerfile",
+        &local_asr_root,
+        &app,
+        &engine,
+        "building-base",
+        "ベース環境を構築しています",
+    )
+    .await
+    .map_err(|detail| format!("ベース環境の構築に失敗しました\n{detail}"))?;
+
+    // engine build
+    run_docker_build(
+        &docker_path,
+        &def.image_name,
+        &format!("{}/Dockerfile", engine),
+        &local_asr_root,
+        &app,
+        &engine,
+        "building-engine",
+        &format!("{}環境を構築しています", def.display_name),
+    )
+    .await
+    .map_err(|detail| format!("{}環境の構築に失敗しました\n{detail}", def.display_name))?;
+
+    // installed確認
+    let status = get_single_engine_status(&docker_path, true, &def);
+    if !status.installed {
+        return Err(format!(
+            "{}環境を構築しましたが、Dockerイメージを確認できませんでした",
+            def.display_name
+        ));
+    }
+
+    // completed
+    app.emit(
+        "local-asr-progress",
+        LocalAsrProgress {
+            engine: engine.clone(),
+            stage: "completed".to_string(),
+            message: format!("{}環境の構築が完了しました", def.display_name),
+        },
+    )
+    .ok();
+
+    Ok(status)
 }
 
 pub fn run() {
@@ -2525,7 +2715,8 @@ pub fn run() {
             hf_token_get_status,
             hf_token_save,
             hf_token_delete,
-            local_asr_get_status
+            local_asr_get_status,
+            local_asr_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -5191,5 +5382,52 @@ mod tests {
         assert!(!statuses[0].installed);
         assert!(!statuses[0].docker_available);
         assert!(!statuses[0].docker_running);
+    }
+
+    // ---- tail_stderr ----
+
+    #[test]
+    fn tail_stderr_short_returns_all() {
+        let input = "line1\nline2\nline3";
+        assert_eq!(tail_stderr(input, 30), "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn tail_stderr_exact_limit_returns_all() {
+        let input: String = (0..30).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let result = tail_stderr(&input, 30);
+        assert!(result.starts_with("line0"));
+        assert!(result.ends_with("line29"));
+    }
+
+    #[test]
+    fn tail_stderr_long_truncates() {
+        let input: String = (0..50).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let result = tail_stderr(&input, 30);
+        assert!(!result.contains("line0"));
+        assert!(result.contains("line20"));
+        assert!(result.ends_with("line49"));
+    }
+
+    #[test]
+    fn tail_stderr_empty() {
+        assert_eq!(tail_stderr("", 30), "");
+    }
+
+    // ---- LocalAsrProgress serialization ----
+
+    #[test]
+    fn local_asr_progress_serializes_camel_case() {
+        let progress = LocalAsrProgress {
+            engine: "reazonspeech".to_string(),
+            stage: "building-base".to_string(),
+            message: "ベース環境を構築しています".to_string(),
+        };
+        let json = serde_json::to_string(&progress).unwrap();
+        assert!(json.contains("engine"));
+        assert!(json.contains("stage"));
+        assert!(json.contains("message"));
+        assert!(json.contains("building-base")); // stage値はそのまま
+        assert!(json.contains("ベース環境"));
     }
 }

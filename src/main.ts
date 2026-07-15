@@ -17,8 +17,8 @@ import {
   setButtonLoading,
   restoreButtonLoading,
 } from "./provider-config-save";
-import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection } from "./docker";
-import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus } from "./docker";
+import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection, escapeHtml } from "./docker";
+import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus, LocalAsrProgress } from "./docker";
 
 const app = document.getElementById("app")!;
 
@@ -2339,6 +2339,65 @@ function bindHfTokenVisibility(): void {
 
 // ---- Local ASR Event Handlers ----
 
+function bindLocalAsrInstallBtns(): void {
+  document.querySelectorAll<HTMLButtonElement>(".btn-local-asr-install").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const engine = btn.dataset.installEngine;
+      if (engine) void handleLocalAsrInstall(engine, btn);
+    }, { once: true });
+  });
+}
+
+async function handleLocalAsrInstall(engine: string, btn: HTMLButtonElement): Promise<void> {
+  const card = btn.closest(".local-asr-engine-card");
+  if (!card) return;
+  const statusEl = card.querySelector<HTMLElement>(".local-asr-engine-status");
+  if (!statusEl) return;
+
+  // listen登録 → invoke → finally unlisten
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<LocalAsrProgress>("local-asr-progress", ({ payload }) => {
+    if (payload.engine === engine && statusEl.isConnected) {
+      statusEl.innerHTML = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined spin" style="font-size: 18px; color: var(--color-text-secondary);">progress_activity</span>
+          <span>${escapeHtml(payload.message)}</span>
+        </div>`;
+    }
+  });
+
+  btn.disabled = true;
+  statusEl.innerHTML = `
+    <div class="docker-status-row">
+      <span class="material-symbols-outlined spin" style="font-size: 18px; color: var(--color-text-secondary);">progress_activity</span>
+      <span>インストールしています…</span>
+    </div>`;
+
+  try {
+    await invokeTauri<LocalAsrEngineStatus>("local_asr_install", { engine });
+    await loadAndRenderLocalAsrStatus();
+  } catch (e) {
+    console.error("local_asr_install error:", e);
+    if (!statusEl.isConnected) return;
+    const msg = typeof e === "string" ? e : String(e);
+    const shortMsg = msg.split("\n")[0];
+    statusEl.innerHTML = `
+      <div class="docker-status-row">
+        <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
+        <span>${escapeHtml(shortMsg)}</span>
+      </div>
+      <div class="docker-status-actions">
+        <button class="btn-docker-start btn-local-asr-install" type="button" data-install-engine="${escapeHtml(engine)}">
+          <span class="material-symbols-outlined">refresh</span>
+          再試行
+        </button>
+      </div>`;
+    bindLocalAsrInstallBtns();
+  } finally {
+    unlisten();
+  }
+}
+
 async function loadAndRenderLocalAsrStatus(): Promise<void> {
   const container = document.getElementById("localAsrContainer");
   if (!container) return;
@@ -2348,6 +2407,7 @@ async function loadAndRenderLocalAsrStatus(): Promise<void> {
     const engines = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status");
     if (!container.isConnected) return;
     container.innerHTML = renderLocalAsrSection(engines);
+    bindLocalAsrInstallBtns();
   } catch (e) {
     console.error("local_asr_get_status error:", e);
     if (!container.isConnected) return;

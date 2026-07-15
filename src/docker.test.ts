@@ -388,4 +388,36 @@ describe("renderLocalAsrSection", () => {
     expect(html).not.toContain("<script>");
     expect(html).toContain("&lt;script&gt;");
   });
+
+  it("not-installed shows install button", () => {
+    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true, dockerRunning: true }]);
+    document.body.innerHTML = html;
+    const btn = document.querySelector(".btn-local-asr-install");
+    expect(btn).toBeTruthy();
+    expect(btn!.textContent).toContain("インストール");
+    expect(btn!.getAttribute("data-install-engine")).toBe("reazonspeech");
+  });
+
+  it("installed does not show install button", () => {
+    const html = renderLocalAsrSection([{
+      ...baseEngine,
+      dockerAvailable: true,
+      dockerRunning: true,
+      installed: true,
+    }]);
+    document.body.innerHTML = html;
+    expect(document.querySelector(".btn-local-asr-install")).toBeNull();
+  });
+
+  it("no-docker does not show install button", () => {
+    const html = renderLocalAsrSection([{ ...baseEngine }]);
+    document.body.innerHTML = html;
+    expect(document.querySelector(".btn-local-asr-install")).toBeNull();
+  });
+
+  it("docker-stopped does not show install button", () => {
+    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true }]);
+    document.body.innerHTML = html;
+    expect(document.querySelector(".btn-local-asr-install")).toBeNull();
+  });
 });

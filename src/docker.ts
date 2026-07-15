@@ -223,6 +223,12 @@ export interface LocalAsrEngineStatus {
 
 export type LocalAsrUiState = "loading" | "error" | "no-docker" | "docker-stopped" | "not-installed" | "installed";
 
+export interface LocalAsrProgress {
+  engine: string;
+  stage: string;
+  message: string;
+}
+
 export function getLocalAsrUiState(status: LocalAsrEngineStatus | null): LocalAsrUiState {
   if (!status) return "loading";
   if (!status.dockerAvailable) return "no-docker";
@@ -288,6 +294,12 @@ function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
         <div class="docker-status-row">
           <span class="material-symbols-outlined" style="font-size: 18px; color: var(--outline);">info</span>
           <span>未インストール</span>
+        </div>
+        <div class="docker-status-actions">
+          <button class="btn-docker-start btn-local-asr-install" type="button" data-install-engine="${escapeHtml(e.engine)}">
+            <span class="material-symbols-outlined">download</span>
+            インストール
+          </button>
         </div>`;
       break;
     case "installed": {
