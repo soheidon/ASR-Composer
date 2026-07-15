@@ -162,7 +162,7 @@ export interface HuggingFaceTokenSaveResult {
 export function renderHuggingFaceTokenSection(status: HuggingFaceTokenStatus | null): string {
   if (!status || !status.configured) {
     return `
-      <div class="hf-token-section">
+      <div class="docker-status-card">
         <div class="api-field-group">
           <label class="api-field-label">アクセストークン</label>
           <div class="hf-token-input-row">
@@ -185,7 +185,7 @@ export function renderHuggingFaceTokenSection(status: HuggingFaceTokenStatus | n
   }
 
   return `
-    <div class="hf-token-section">
+    <div class="docker-status-card docker-status-ready">
       <div class="hf-token-status-row">
         <span class="material-symbols-outlined" style="color: var(--color-success, #22c55e); font-size: 18px;">check_circle</span>
         <span>HF_TOKENは設定済みです</span>
