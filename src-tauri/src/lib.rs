@@ -2516,7 +2516,7 @@ struct LocalAsrProgress {
     message: String,
 }
 
-fn local_asr_install_lock() -> &'static tokio::sync::Mutex<()> {
+fn local_asr_operation_lock() -> &'static tokio::sync::Mutex<()> {
     use std::sync::OnceLock;
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -2647,7 +2647,7 @@ async fn local_asr_install(
     use tauri::Emitter;
 
     // 排他制御
-    let _guard = local_asr_install_lock()
+    let _guard = local_asr_operation_lock()
         .try_lock()
         .map_err(|_| "ローカルASR環境の処理がすでに実行中です".to_string())?;
 
@@ -2765,6 +2765,94 @@ async fn local_asr_install(
     Ok(status)
 }
 
+#[tauri::command]
+async fn local_asr_uninstall(
+    app: tauri::AppHandle,
+    engine: String,
+) -> Result<LocalAsrEngineStatus, String> {
+    // 排他制御
+    let _guard = local_asr_operation_lock()
+        .try_lock()
+        .map_err(|_| "ローカルASR環境の処理がすでに実行中です".to_string())?;
+
+    // engine検証
+    let def = local_asr_engine_defs()
+        .into_iter()
+        .find(|d| d.engine == engine)
+        .ok_or_else(|| format!("未対応のエンジンです: {}", engine))?;
+
+    // Docker CLI確認
+    let docker_path = find_docker_cli().ok_or("Dockerがインストールされていません")?;
+
+    // daemon確認
+    let daemon_ok = std::process::Command::new(&docker_path)
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !daemon_ok {
+        return Err("Docker Desktopが起動していません".to_string());
+    }
+
+    // イメージ存在確認
+    match inspect_docker_image(&docker_path, &def.image_name) {
+        Ok(None) => {
+            return Err(format!("{}環境はインストールされていません", def.display_name));
+        }
+        Ok(Some(_)) => { /* 存在する → 削除へ進む */ }
+        Err(e) => {
+            return Err(format!("イメージの確認に失敗しました: {}", e));
+        }
+    }
+
+    // docker image rm（-f なし）
+    let output = std::process::Command::new(&docker_path)
+        .args(["image", "rm", &def.image_name])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("Docker image rmの実行に失敗しました: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail_source = if stderr.trim().is_empty() {
+            stdout.as_ref()
+        } else {
+            stderr.as_ref()
+        };
+        let detail = tail_stderr(detail_source, 30);
+
+        // コンテナ参照による削除失敗を検出
+        if detail.contains("is being used") || detail.contains("running") {
+            return Err(format!(
+                "{}イメージを使用しているDockerコンテナが残っています。\n\
+                 Docker Desktopで対象コンテナを削除してから再試行してください。",
+                def.display_name
+            ));
+        }
+
+        return Err(format!(
+            "{}環境の削除に失敗しました\n{}",
+            def.display_name, detail
+        ));
+    }
+
+    // 削除確認
+    match inspect_docker_image(&docker_path, &def.image_name) {
+        Ok(Some(_)) => {
+            return Err("削除後もDockerイメージが確認されました".to_string());
+        }
+        Ok(None) => { /* 正常に削除された */ }
+        Err(_) => { /* inspect失敗は削除成功とみなす */ }
+    }
+
+    // 最新状態を返す
+    Ok(get_single_engine_status(&docker_path, true, &def))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2789,7 +2877,8 @@ pub fn run() {
             hf_token_save,
             hf_token_delete,
             local_asr_get_status,
-            local_asr_install
+            local_asr_install,
+            local_asr_uninstall
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

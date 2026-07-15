@@ -441,6 +441,32 @@ describe("renderLocalAsrSection", () => {
     const btn = document.querySelector("[data-local-asr-refresh]");
     expect(btn?.textContent).toContain("状態を再確認");
   });
+
+  it("installed state shows uninstall button", () => {
+    const html = renderLocalAsrSection([{
+      ...baseEngine,
+      dockerAvailable: true,
+      dockerRunning: true,
+      installed: true,
+    }]);
+    document.body.innerHTML = html;
+    const btn = document.querySelector("[data-uninstall-engine]");
+    expect(btn).toBeTruthy();
+    expect(btn!.textContent).toContain("削除");
+    expect(btn!.getAttribute("data-uninstall-engine")).toBe("reazonspeech");
+  });
+
+  it("not-installed state does not show uninstall button", () => {
+    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true, dockerRunning: true }]);
+    document.body.innerHTML = html;
+    expect(document.querySelector("[data-uninstall-engine]")).toBeNull();
+  });
+
+  it("no-docker state does not show uninstall button", () => {
+    const html = renderLocalAsrSection([{ ...baseEngine }]);
+    document.body.innerHTML = html;
+    expect(document.querySelector("[data-uninstall-engine]")).toBeNull();
+  });
 });
 
 // ---- getLocalAsrProgressDisplay ----

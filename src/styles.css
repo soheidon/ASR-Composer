@@ -1802,3 +1802,24 @@ html, body {
   font-size: 12px;
   color: var(--on-surface-variant);
 }
+
+/* Danger outline button (uninstall) */
+
+.btn-danger-outline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 7px 14px;
+  background: transparent;
+  border: 1px solid var(--color-error, #ef4444);
+  border-radius: 6px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  color: var(--color-error, #ef4444);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.btn-danger-outline:hover {
+  background: rgba(239, 68, 68, 0.08);
+}

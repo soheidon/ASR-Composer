@@ -360,6 +360,9 @@ function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
             <span class="material-symbols-outlined">refresh</span>
             状態を再確認
           </button>
+          <button class="btn-danger-outline" type="button" data-uninstall-engine="${escapeHtml(e.engine)}">
+            削除
+          </button>
         </div>`;
       break;
     }

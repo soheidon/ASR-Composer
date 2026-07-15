@@ -2352,6 +2352,12 @@ function bindLocalAsrInstallBtns(): void {
       void loadAndRenderLocalAsrStatus();
     }, { once: true });
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-uninstall-engine]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const engine = btn.dataset.uninstallEngine;
+      if (engine) void handleLocalAsrUninstall(engine);
+    }, { once: true });
+  });
 }
 
 function renderLocalAsrProgressBar(percent: number, message: string): string {
@@ -2420,6 +2426,44 @@ async function handleLocalAsrInstall(engine: string, btn: HTMLButtonElement): Pr
     bindLocalAsrInstallBtns();
   } finally {
     unlisten();
+  }
+}
+
+async function handleLocalAsrUninstall(engine: string): Promise<void> {
+  const { ask } = await import("@tauri-apps/plugin-dialog");
+  const confirmed = await ask(
+    "Dockerイメージを削除します。モデルキャッシュや出力ファイルは削除されません。",
+    { title: "ReazonSpeech環境を削除", kind: "warning" },
+  );
+  if (!confirmed) return;
+
+  try {
+    await invokeTauri("local_asr_uninstall", { engine });
+    await loadAndRenderLocalAsrStatus();
+  } catch (e) {
+    console.error("local_asr_uninstall error:", e);
+    const container = document.getElementById("localAsrContainer");
+    if (!container) return;
+    const card = container.querySelector(".local-asr-engine-card");
+    const statusEl = card?.querySelector<HTMLElement>(".local-asr-engine-status");
+    if (!statusEl) return;
+    const msg = typeof e === "string" ? e : String(e);
+    const shortMsg = msg.split("\n")[0];
+    statusEl.innerHTML = `
+      <div class="docker-status-row">
+        <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
+        <span>${escapeHtml(shortMsg)}</span>
+      </div>
+      <div class="docker-status-actions">
+        <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+          <span class="material-symbols-outlined">refresh</span>
+          状態を再確認
+        </button>
+        <button class="btn-danger-outline" type="button" data-uninstall-engine="${escapeHtml(engine)}">
+          再試行
+        </button>
+      </div>`;
+    bindLocalAsrInstallBtns();
   }
 }
 
