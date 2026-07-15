@@ -1828,9 +1828,486 @@ async fn xiaomi_mimo_asr_run_builtin_test(
     .await
 }
 
+// ---- Docker Desktop / CLI Detection ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerStatus {
+    pub cli_found: bool,
+    pub cli_version: Option<String>,
+    pub daemon_running: bool,
+    pub server_version: Option<String>,
+    pub desktop_found: bool,
+    pub cli_path: Option<String>,
+    pub desktop_path: Option<String>,
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerStartResult {
+    pub launched: bool,
+    pub message: String,
+}
+
+#[derive(Debug)]
+enum DockerCheckError {
+    CliNotFound,
+    DaemonNotRunning(String),
+    Timeout,
+    PermissionDenied(String),
+    Io(std::io::Error),
+    UnexpectedOutput,
+}
+
+fn docker_error_to_status(err: DockerCheckError) -> (Option<String>, Option<String>) {
+    match err {
+        DockerCheckError::CliNotFound => (
+            Some("cli_not_found".to_string()),
+            Some("Docker CLIが見つかりません。".to_string()),
+        ),
+        DockerCheckError::DaemonNotRunning(detail) => (
+            Some("daemon_not_running".to_string()),
+            Some(format!("Docker Engineに接続できません: {}", detail)),
+        ),
+        DockerCheckError::Timeout => (
+            Some("check_timeout".to_string()),
+            Some("Docker Engineへの接続がタイムアウトしました。".to_string()),
+        ),
+        DockerCheckError::PermissionDenied(detail) => (
+            Some("permission_denied".to_string()),
+            Some(format!("権限エラー: {}", detail)),
+        ),
+        DockerCheckError::Io(e) => (
+            Some("unknown".to_string()),
+            Some(format!("入出力エラー: {}", e)),
+        ),
+        DockerCheckError::UnexpectedOutput => (
+            Some("unknown".to_string()),
+            Some("Docker CLIから予期しない出力を受け取りました。".to_string()),
+        ),
+    }
+}
+
+/// Docker Desktop候補パスを生成する（テスト可能な純粋関数）。
+fn docker_desktop_candidate_paths(
+    program_files: Option<&std::path::Path>,
+    local_app_data: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(pf) = program_files {
+        candidates.push(pf.join("Docker").join("Docker").join("Docker Desktop.exe"));
+    }
+    if let Some(la) = local_app_data {
+        candidates.push(
+            la.join("Programs")
+                .join("DockerDesktop")
+                .join("Docker Desktop.exe"),
+        );
+    }
+    candidates
+}
+
+/// Docker CLI候補パスを生成する（テスト可能な純粋関数）。
+fn docker_candidate_paths(
+    program_files: Option<&std::path::Path>,
+    local_app_data: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(pf) = program_files {
+        candidates.push(
+            pf.join("Docker")
+                .join("Docker")
+                .join("resources")
+                .join("bin")
+                .join("docker.exe"),
+        );
+    }
+    if let Some(la) = local_app_data {
+        // ユーザー単位インストール（Docker Desktop 4.x+）
+        candidates.push(
+            la.join("Programs")
+                .join("DockerDesktop")
+                .join("resources")
+                .join("bin")
+                .join("docker.exe"),
+        );
+        // 旧版 / 特殊構成
+        candidates.push(la.join("Docker").join("resources").join("bin").join("docker.exe"));
+    }
+    candidates
+}
+
+/// PATH上から `docker` を検索する。
+fn find_docker_on_path() -> Option<std::path::PathBuf> {
+    for name in &["docker.exe", "docker"] {
+        if let Ok(output) = std::process::Command::new("cmd.exe")
+            .args(["/C", "where", name])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                let path_str = String::from_utf8_lossy(&output.stdout);
+                let first_line = path_str.lines().next().unwrap_or("").trim();
+                if !first_line.is_empty() {
+                    return Some(std::path::PathBuf::from(first_line));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Docker CLIの実行ファイルを検出する。
+fn find_docker_cli() -> Option<std::path::PathBuf> {
+    // 1. PATH検索
+    if let Some(path) = find_docker_on_path() {
+        return Some(path);
+    }
+
+    // 2. 候補パス探索
+    let program_files = std::env::var_os("ProgramFiles").map(std::path::PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+
+    for candidate in docker_candidate_paths(program_files.as_deref(), local_app_data.as_deref()) {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// Docker Desktopの実行ファイルを検出する。
+fn find_docker_desktop() -> Option<std::path::PathBuf> {
+    let program_files = std::env::var_os("ProgramFiles").map(std::path::PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+
+    for candidate in
+        docker_desktop_candidate_paths(program_files.as_deref(), local_app_data.as_deref())
+    {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// `docker --version` の出力を取得する（trimmed全文を返す）。
+fn read_docker_cli_version(docker_path: &std::path::Path) -> Result<String, DockerCheckError> {
+    let output = std::process::Command::new(docker_path)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(DockerCheckError::Io)?;
+
+    if !output.status.success() {
+        return Err(DockerCheckError::UnexpectedOutput);
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        return Err(DockerCheckError::UnexpectedOutput);
+    }
+
+    Ok(version)
+}
+
+/// `docker version --format "{{.Server.Version}}"` でServer接続を確認する（タイムアウト5秒）。
+async fn read_docker_server_version(
+    docker_path: &std::path::Path,
+) -> Result<String, DockerCheckError> {
+    let mut command = tokio::process::Command::new(docker_path);
+    command
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .kill_on_drop(true);
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await;
+
+    let output = match result {
+        Ok(inner) => inner.map_err(DockerCheckError::Io)?,
+        Err(_) => return Err(DockerCheckError::Timeout),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // 権限エラーの判定
+        if stderr.contains("permission denied")
+            || stderr.contains("Got permission denied")
+            || stderr.contains("access denied")
+        {
+            return Err(DockerCheckError::PermissionDenied(stderr));
+        }
+        return Err(DockerCheckError::DaemonNotRunning(stderr));
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        return Err(DockerCheckError::UnexpectedOutput);
+    }
+
+    Ok(version)
+}
+
+#[tauri::command]
+async fn docker_check_status() -> DockerStatus {
+    // 1. Desktop検出を先に行う
+    let desktop_path = find_docker_desktop();
+    let desktop_found = desktop_path.is_some();
+
+    // 2. CLI検出
+    let cli_path = find_docker_cli();
+    let cli_found = cli_path.is_some();
+
+    // 3. CLI未検出 → Desktop有無で状態を分ける
+    if !cli_found {
+        return DockerStatus {
+            cli_found: false,
+            cli_version: None,
+            daemon_running: false,
+            server_version: None,
+            desktop_found,
+            cli_path: None,
+            desktop_path: desktop_path.map(|p| p.to_string_lossy().to_string()),
+            error_kind: Some("cli_not_found".to_string()),
+            error_message: if desktop_found {
+                Some(
+                    "Docker Desktopは見つかりましたが、Docker CLIを検出できませんでした。\
+                     Docker Desktopを起動し、状態を再確認してください。"
+                        .to_string(),
+                )
+            } else {
+                Some("Docker Desktopが見つかりません。インストールしてください。".to_string())
+            },
+        };
+    }
+
+    let cli_path_ref = cli_path.as_ref().unwrap();
+
+    // 4. CLIバージョン取得
+    let cli_version = match read_docker_cli_version(cli_path_ref) {
+        Ok(v) => Some(v),
+        Err(_) => None,
+    };
+
+    // 5. Serverバージョン取得（タイムアウト付き）
+    let (daemon_running, server_version, error_kind, error_message) =
+        match read_docker_server_version(cli_path_ref).await {
+            Ok(v) => (true, Some(v), None, None),
+            Err(e) => {
+                let (kind, msg) = docker_error_to_status(e);
+                (false, None, kind, msg)
+            }
+        };
+
+    DockerStatus {
+        cli_found: true,
+        cli_version,
+        daemon_running,
+        server_version,
+        desktop_found,
+        cli_path: Some(cli_path_ref.to_string_lossy().to_string()),
+        desktop_path: desktop_path.map(|p| p.to_string_lossy().to_string()),
+        error_kind,
+        error_message,
+    }
+}
+
+#[tauri::command]
+async fn docker_start_desktop() -> DockerStartResult {
+    let desktop_path = match find_docker_desktop() {
+        Some(p) => p,
+        None => {
+            return DockerStartResult {
+                launched: false,
+                message: "Docker Desktopが見つかりません。公式サイトからダウンロードしてください。"
+                    .to_string(),
+            };
+        }
+    };
+
+    match std::process::Command::new(&desktop_path).spawn() {
+        Ok(_) => DockerStartResult {
+            launched: true,
+            message:
+                "Docker Desktopを起動しました。起動が完了したら「状態を再確認」を押してください。"
+                    .to_string(),
+        },
+        Err(e) => DockerStartResult {
+            launched: false,
+            message: format!("Docker Desktopの起動に失敗しました: {}", e),
+        },
+    }
+}
+
+// ---- HuggingFace Token Management ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HuggingFaceTokenStatus {
+    pub configured: bool,
+    pub masked_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HuggingFaceTokenSaveInput {
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HuggingFaceTokenSaveResult {
+    pub success: bool,
+    pub message: String,
+}
+
+/// HF_TOKENのバリデーション（テスト可能な純粋関数）。
+fn validate_hf_token(token: &str) -> Result<(), String> {
+    if token.is_empty() {
+        return Err("アクセストークンを入力してください".to_string());
+    }
+    if token.contains('\n') || token.contains('\r') || token.contains('\0') {
+        return Err(
+            "アクセストークンに改行または無効な文字を含めることはできません".to_string(),
+        );
+    }
+    if token.chars().count() > 4096 {
+        return Err("アクセストークンが長すぎます".to_string());
+    }
+    Ok(())
+}
+
+/// HF_TOKENのマスク表示（テスト可能な純粋関数）。
+/// 文字数ベースで処理し、UTF-8境界を安全に扱う。
+fn mask_hf_token(token: &str) -> String {
+    let char_count = token.chars().count();
+    if char_count < 7 {
+        return "設定済み".to_string();
+    }
+    if char_count <= 12 {
+        let prefix: String = token.chars().take(3).collect();
+        return format!("{}****", prefix);
+    }
+    let prefix: String = token.chars().take(3).collect();
+    let suffix: String = token.chars().skip(char_count - 4).collect();
+    let masked_len = char_count - 7;
+    format!("{}{}{}", prefix, "*".repeat(masked_len), suffix)
+}
+
+#[tauri::command]
+fn hf_token_get_status() -> HuggingFaceTokenStatus {
+    match std::env::var("HF_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => HuggingFaceTokenStatus {
+            configured: true,
+            masked_value: Some(mask_hf_token(token.trim())),
+        },
+        _ => HuggingFaceTokenStatus {
+            configured: false,
+            masked_value: None,
+        },
+    }
+}
+
+#[tauri::command]
+fn hf_token_save(input: HuggingFaceTokenSaveInput) -> HuggingFaceTokenSaveResult {
+    let token = input.token.trim().to_string();
+
+    // バリデーション
+    if let Err(e) = validate_hf_token(&token) {
+        return HuggingFaceTokenSaveResult {
+            success: false,
+            message: e,
+        };
+    }
+
+    // 1. Windowsユーザー環境変数へ永続化
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        let result = Command::new("setx")
+            .arg("HF_TOKEN")
+            .arg(&token)
+            .status();
+
+        match result {
+            Ok(status) if status.success() => {
+                // 永続化成功後にプロセスにも設定
+                std::env::set_var("HF_TOKEN", &token);
+                HuggingFaceTokenSaveResult {
+                    success: true,
+                    message: "HF_TOKENを保存しました".to_string(),
+                }
+            }
+            _ => HuggingFaceTokenSaveResult {
+                success: false,
+                message: "HF_TOKENをWindowsユーザー環境変数へ保存できませんでした".to_string(),
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::set_var("HF_TOKEN", &token);
+        HuggingFaceTokenSaveResult {
+            success: true,
+            message: "HF_TOKENを保存しました（現在のセッションのみ）".to_string(),
+        }
+    }
+}
+
+#[tauri::command]
+fn hf_token_delete() -> HuggingFaceTokenSaveResult {
+    // 1. Windowsユーザー環境変数から削除
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        let result = Command::new("cmd.exe")
+            .args(["/C", "REG", "delete", "HKCU\\Environment", "/v", "HF_TOKEN", "/f"])
+            .status();
+
+        match result {
+            Ok(status) if status.success() => {
+                // 削除成功後にプロセスからも除去
+                std::env::remove_var("HF_TOKEN");
+                HuggingFaceTokenSaveResult {
+                    success: true,
+                    message: "HF_TOKENを削除しました".to_string(),
+                }
+            }
+            Ok(_) => {
+                // レジストリキーが存在しない場合も成功扱い
+                std::env::remove_var("HF_TOKEN");
+                HuggingFaceTokenSaveResult {
+                    success: true,
+                    message: "HF_TOKENを削除しました".to_string(),
+                }
+            }
+            Err(e) => HuggingFaceTokenSaveResult {
+                success: false,
+                message: format!("HF_TOKENの削除に失敗しました: {}", e),
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::remove_var("HF_TOKEN");
+        HuggingFaceTokenSaveResult {
+            success: true,
+            message: "HF_TOKENを削除しました".to_string(),
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             load_api_settings,
             save_provider_config,
@@ -1844,7 +2321,12 @@ pub fn run() {
             google_stt_recognize,
             google_stt_run_builtin_test,
             xiaomi_mimo_asr_recognize,
-            xiaomi_mimo_asr_run_builtin_test
+            xiaomi_mimo_asr_run_builtin_test,
+            docker_check_status,
+            docker_start_desktop,
+            hf_token_get_status,
+            hf_token_save,
+            hf_token_delete
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -4094,5 +4576,300 @@ mod tests {
         eprintln!("テスト完了: レスポンスshape確認成功");
         let _ = result;
         let _ = api_key; // 未使用警告を抑制
+    }
+
+    // ---- Docker candidate paths ----
+
+    #[test]
+    fn docker_candidate_paths_include_program_files() {
+        let pf = std::path::PathBuf::from("C:\\Program Files");
+        let la = std::path::PathBuf::from("C:\\Users\\test\\AppData\\Local");
+        let paths = docker_candidate_paths(Some(&pf), Some(&la));
+        let pf_docker = pf.join("Docker").join("Docker").join("resources").join("bin").join("docker.exe");
+        assert!(paths.contains(&pf_docker), "should include ProgramFiles Docker path, got: {:?}", paths);
+    }
+
+    #[test]
+    fn docker_candidate_paths_include_per_user_desktop() {
+        let pf = std::path::PathBuf::from("C:\\Program Files");
+        let la = std::path::PathBuf::from("C:\\Users\\test\\AppData\\Local");
+        let paths = docker_candidate_paths(Some(&pf), Some(&la));
+        let la_docker = la.join("Programs").join("DockerDesktop").join("resources").join("bin").join("docker.exe");
+        assert!(paths.contains(&la_docker), "should include per-user DockerDesktop path, got: {:?}", paths);
+    }
+
+    #[test]
+    fn docker_desktop_candidate_paths_include_program_files() {
+        let pf = std::path::PathBuf::from("C:\\Program Files");
+        let la = std::path::PathBuf::from("C:\\Users\\test\\AppData\\Local");
+        let paths = docker_desktop_candidate_paths(Some(&pf), Some(&la));
+        let pf_desktop = pf.join("Docker").join("Docker").join("Docker Desktop.exe");
+        assert!(paths.contains(&pf_desktop), "should include ProgramFiles Desktop path, got: {:?}", paths);
+    }
+
+    #[test]
+    fn docker_desktop_candidate_paths_include_per_user() {
+        let pf = std::path::PathBuf::from("C:\\Program Files");
+        let la = std::path::PathBuf::from("C:\\Users\\test\\AppData\\Local");
+        let paths = docker_desktop_candidate_paths(Some(&pf), Some(&la));
+        let la_desktop = la.join("Programs").join("DockerDesktop").join("Docker Desktop.exe");
+        assert!(paths.contains(&la_desktop), "should include per-user DockerDesktop path, got: {:?}", paths);
+    }
+
+    #[test]
+    fn docker_candidate_paths_empty_when_no_env() {
+        let paths = docker_candidate_paths(None, None);
+        assert!(paths.is_empty(), "should be empty when no env vars, got: {:?}", paths);
+    }
+
+    // ---- DockerStatus serialization ----
+
+    #[test]
+    fn docker_status_serializes_as_camel_case() {
+        let status = DockerStatus {
+            cli_found: true,
+            cli_version: Some("Docker version 24.0.7".to_string()),
+            daemon_running: true,
+            server_version: Some("24.0.7".to_string()),
+            desktop_found: true,
+            cli_path: Some("C:\\docker.exe".to_string()),
+            desktop_path: Some("C:\\Docker Desktop.exe".to_string()),
+            error_kind: None,
+            error_message: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("cliFound"));
+        assert!(json.contains("cliVersion"));
+        assert!(json.contains("daemonRunning"));
+        assert!(json.contains("serverVersion"));
+        assert!(json.contains("desktopFound"));
+        assert!(json.contains("cliPath"));
+        assert!(json.contains("desktopPath"));
+        assert!(!json.contains("cli_found"));
+        assert!(!json.contains("cli_found"));
+    }
+
+    #[test]
+    fn docker_status_none_fields_excluded() {
+        let status = DockerStatus {
+            cli_found: false,
+            cli_version: None,
+            daemon_running: false,
+            server_version: None,
+            desktop_found: false,
+            cli_path: None,
+            desktop_path: None,
+            error_kind: Some("cli_not_found".to_string()),
+            error_message: Some("not found".to_string()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("errorKind"));
+        assert!(json.contains("errorMessage"));
+    }
+
+    // ---- DockerStartResult serialization ----
+
+    #[test]
+    fn docker_start_result_serializes_as_camel_case() {
+        let result = DockerStartResult {
+            launched: true,
+            message: "起動しました".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("launched"));
+        assert!(json.contains("message"));
+        assert!(json.contains("起動しました"));
+    }
+
+    // ---- DockerCheckError → error_kind conversion ----
+
+    #[test]
+    fn docker_error_cli_not_found_to_status() {
+        let (kind, msg) = docker_error_to_status(DockerCheckError::CliNotFound);
+        assert_eq!(kind.unwrap(), "cli_not_found");
+        assert!(msg.unwrap().contains("Docker CLI"));
+    }
+
+    #[test]
+    fn docker_error_daemon_not_running_to_status() {
+        let (kind, msg) = docker_error_to_status(DockerCheckError::DaemonNotRunning("Cannot connect".to_string()));
+        assert_eq!(kind.unwrap(), "daemon_not_running");
+        assert!(msg.unwrap().contains("Cannot connect"));
+    }
+
+    #[test]
+    fn docker_error_timeout_to_status() {
+        let (kind, msg) = docker_error_to_status(DockerCheckError::Timeout);
+        assert_eq!(kind.unwrap(), "check_timeout");
+        assert!(msg.unwrap().contains("タイムアウト"));
+    }
+
+    #[test]
+    fn docker_error_permission_denied_to_status() {
+        let (kind, msg) = docker_error_to_status(DockerCheckError::PermissionDenied("access denied".to_string()));
+        assert_eq!(kind.unwrap(), "permission_denied");
+        assert!(msg.unwrap().contains("権限エラー"));
+    }
+
+    // ---- Docker 実環境テスト ----
+
+    #[test]
+    #[ignore]
+    fn test_docker_check_status_on_this_machine() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let status = rt.block_on(docker_check_status());
+        eprintln!("=== Docker Status ===");
+        eprintln!("cli_found: {}", status.cli_found);
+        eprintln!("cli_version: {:?}", status.cli_version);
+        eprintln!("daemon_running: {}", status.daemon_running);
+        eprintln!("server_version: {:?}", status.server_version);
+        eprintln!("desktop_found: {}", status.desktop_found);
+        eprintln!("cli_path: {:?}", status.cli_path);
+        eprintln!("desktop_path: {:?}", status.desktop_path);
+        eprintln!("error_kind: {:?}", status.error_kind);
+        eprintln!("error_message: {:?}", status.error_message);
+    }
+
+    // ---- mask_hf_token ----
+
+    #[test]
+    fn mask_hf_token_normal_29_chars() {
+        let token = "hf_abcdefghijklmnopqrstuvwxyz";
+        let masked = mask_hf_token(token);
+        // 29文字: 先頭3 + *×22 + 末尾4 = 29
+        assert_eq!(masked, "hf_**********************wxyz");
+        assert_eq!(masked.chars().count(), 29);
+        assert!(!masked.contains("abcdefg"));
+        assert!(masked.starts_with("hf_"));
+        assert!(masked.ends_with("wxyz"));
+    }
+
+    #[test]
+    fn mask_hf_token_exactly_12_chars() {
+        let token = "hf_123456789";
+        let masked = mask_hf_token(token);
+        assert_eq!(masked, "hf_****");
+    }
+
+    #[test]
+    fn mask_hf_token_exactly_7_chars() {
+        let token = "hf_1234";
+        let masked = mask_hf_token(token);
+        assert_eq!(masked, "hf_****");
+    }
+
+    #[test]
+    fn mask_hf_token_short_6_chars() {
+        let masked = mask_hf_token("hf_abc");
+        assert_eq!(masked, "設定済み");
+    }
+
+    #[test]
+    fn mask_hf_token_empty() {
+        assert_eq!(mask_hf_token(""), "設定済み");
+    }
+
+    #[test]
+    fn mask_hf_token_13_chars() {
+        let token = "hf_1234567890"; // 13文字
+        let masked = mask_hf_token(token);
+        // 13文字: 先頭3 + *×6 + 末尾4 = 13
+        assert_eq!(masked.chars().count(), 13);
+        assert!(masked.starts_with("hf_"));
+        assert!(masked.ends_with("7890"));
+    }
+
+    // ---- validate_hf_token ----
+
+    #[test]
+    fn validate_hf_token_rejects_empty() {
+        assert!(validate_hf_token("").is_err());
+    }
+
+    #[test]
+    fn validate_hf_token_rejects_newline() {
+        assert!(validate_hf_token("hf_test\ntoken").is_err());
+    }
+
+    #[test]
+    fn validate_hf_token_rejects_carriage_return() {
+        assert!(validate_hf_token("hf_test\rntoken").is_err());
+    }
+
+    #[test]
+    fn validate_hf_token_rejects_null_char() {
+        assert!(validate_hf_token("hf_test\0token").is_err());
+    }
+
+    #[test]
+    fn validate_hf_token_rejects_too_long() {
+        let long_token = format!("hf_{}", "a".repeat(4094));
+        assert!(validate_hf_token(&long_token).is_err());
+    }
+
+    #[test]
+    fn validate_hf_token_accepts_valid_token() {
+        assert!(validate_hf_token("hf_abcdefghijklmnopqrstuvwxyz").is_ok());
+    }
+
+    #[test]
+    fn validate_hf_token_accepts_no_prefix() {
+        // hf_プレフィックスなしも保存許可
+        assert!(validate_hf_token("some_other_token").is_ok());
+    }
+
+    #[test]
+    fn validate_hf_token_accepts_exactly_4096() {
+        let token = format!("hf_{}", "a".repeat(4093));
+        assert_eq!(token.chars().count(), 4096);
+        assert!(validate_hf_token(&token).is_ok());
+    }
+
+    // ---- HuggingFaceTokenStatus serialization ----
+
+    #[test]
+    fn hf_token_status_serializes_camel_case() {
+        let status = HuggingFaceTokenStatus {
+            configured: true,
+            masked_value: Some("hf_****abcd".to_string()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("configured"));
+        assert!(json.contains("maskedValue"));
+        assert!(!json.contains("masked_value"));
+    }
+
+    #[test]
+    fn hf_token_status_no_raw_token() {
+        let status = HuggingFaceTokenStatus {
+            configured: true,
+            masked_value: Some("hf_****abcd".to_string()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        // maskedValue以外のフィールドがないことを確認
+        assert!(!json.contains("token"));
+        assert!(!json.contains("value"));
+    }
+
+    // ---- HuggingFaceTokenSaveResult serialization ----
+
+    #[test]
+    fn hf_token_save_result_serializes_camel_case() {
+        let result = HuggingFaceTokenSaveResult {
+            success: true,
+            message: "保存しました".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("success"));
+        assert!(json.contains("message"));
+    }
+
+    // ---- validate_hf_token error messages don't leak input ----
+
+    #[test]
+    fn validate_hf_token_error_does_not_contain_input() {
+        let token = "sensitive_token_value_12345";
+        let err = validate_hf_token("").unwrap_err();
+        assert!(!err.contains(token));
     }
 }

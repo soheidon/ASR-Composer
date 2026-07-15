@@ -17,6 +17,8 @@ import {
   setButtonLoading,
   restoreButtonLoading,
 } from "./provider-config-save";
+import { renderDockerStatusContent, renderHuggingFaceTokenSection } from "./docker";
+import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult } from "./docker";
 
 const app = document.getElementById("app")!;
 
@@ -438,11 +440,20 @@ const transcribePage = `
   </main>
 `;
 
-type SettingsPageId = "api" | "ollama";
+type SettingsPageId = "api" | "ollama" | "docker";
+
+function settingsPageToRoute(page: SettingsPageId): PageName {
+  switch (page) {
+    case "api": return "settings";
+    case "ollama": return "settings-ollama";
+    case "docker": return "settings-docker";
+  }
+}
 
 function buildSettingsSidebar(activePage: SettingsPageId): string {
   const apiActive = activePage === "api" ? " settings-nav-active" : "";
   const ollamaActive = activePage === "ollama" ? " settings-nav-active" : "";
+  const dockerActive = activePage === "docker" ? " settings-nav-active" : "";
   return `
     <aside class="settings-sidebar">
       <h2 class="settings-sidebar-title">設定</h2>
@@ -470,8 +481,8 @@ function buildSettingsSidebar(activePage: SettingsPageId): string {
           <span class="material-symbols-outlined">smart_toy</span>
           <span>Ollama設定</span>
         </button>
-        <button class="settings-nav-item" type="button">
-          <span class="material-symbols-outlined">terminal</span>
+        <button class="settings-nav-item${dockerActive}" type="button" data-settings-page="docker">
+          <span class="material-symbols-outlined" style="font-variation-settings: 'FILL' ${activePage === "docker" ? "1" : "0"};">terminal</span>
           <span>Docker設定</span>
         </button>
       </nav>
@@ -564,13 +575,47 @@ const settingsOllamaPage = `
   </div>
 `;
 
+// renderDockerStatusContent is imported from ./docker
+
+const settingsDockerPage = `
+  <div class="settings-layout">
+    ${buildSettingsSidebar("docker")}
+    <div class="settings-content">
+      <div class="settings-content-header">
+        <h2 class="settings-content-title">Docker設定</h2>
+      </div>
+      <div class="settings-content-body">
+        <div class="settings-content-inner">
+          <div class="api-section">
+            <div class="api-section-header">
+              <h4 class="api-section-title">Docker Desktop</h4>
+              <p class="api-section-desc">ローカルASRエンジンの実行にDockerが必要です。</p>
+            </div>
+            <div class="docker-status-container" id="dockerStatusContainer">
+              ${renderDockerStatusContent(null)}
+            </div>
+          </div>
+          <div class="api-section">
+            <div class="api-section-header">
+              <h4 class="api-section-title">Hugging Face認証</h4>
+              <p class="api-section-desc">pyannoteモデルの取得に使用するアクセストークンを設定します。トークンはDockerイメージには保存されません。</p>
+            </div>
+            <div class="hf-token-container" id="hfTokenContainer">
+              ${renderHuggingFaceTokenSection(null)}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+
 // ---- Render ----
 
-type PageName = "transcribe" | "settings" | "settings-ollama";
+type PageName = "transcribe" | "settings" | "settings-ollama" | "settings-docker";
 
 function renderHeader(activePage: PageName): string {
   const transcribeActive = activePage === "transcribe" ? "active" : "";
-  const settingsActive = (activePage === "settings" || activePage === "settings-ollama") ? "active" : "";
+  const settingsActive = (activePage === "settings" || activePage === "settings-ollama" || activePage === "settings-docker") ? "active" : "";
   return `
   <header class="app-header">
     <div class="header-left">
@@ -684,6 +729,7 @@ async function navigateTo(page: PageName) {
 
   const body = page === "transcribe" ? transcribePage
     : page === "settings-ollama" ? settingsOllamaPage
+    : page === "settings-docker" ? settingsDockerPage
     : settingsApiPage;
   app.innerHTML = renderHeader(page) + body;
 
@@ -711,6 +757,9 @@ async function navigateTo(page: PageName) {
     bindModelSelects();
     bindOllamaFetchButton();
     bindOllamaTestButton();
+  } else if (page === "settings-docker") {
+    void loadAndRenderDockerStatus();
+    void loadAndRenderHuggingFaceToken();
   }
 }
 
@@ -721,11 +770,9 @@ function bindSettingsSidebarNav() {
     const target = (e.target as HTMLElement).closest<HTMLElement>("[data-settings-page]");
     if (!target) return;
     e.preventDefault();
-    const settingsPage = target.dataset.settingsPage;
-    if (settingsPage === "api") {
-      void navigateTo("settings");
-    } else if (settingsPage === "ollama") {
-      void navigateTo("settings-ollama");
+    const settingsPage = target.dataset.settingsPage as SettingsPageId | undefined;
+    if (settingsPage) {
+      void navigateTo(settingsPageToRoute(settingsPage));
     }
   });
 }
@@ -2069,6 +2116,214 @@ function bindOllamaTestButton() {
         btn.innerHTML = originalHtml;
       }
     }
+  });
+}
+
+// ---- Docker Event Handlers ----
+
+async function loadAndRenderDockerStatus(): Promise<void> {
+  const container = document.getElementById("dockerStatusContainer");
+  if (!container) return;
+
+  container.innerHTML = renderDockerStatusContent(null);
+  bindDockerRefreshBtn();
+  try {
+    const status = await invokeTauri<DockerStatus>("docker_check_status");
+    if (!container.isConnected) return;
+    container.innerHTML = renderDockerStatusContent(status);
+    bindDockerRefreshBtn();
+    bindDockerStartBtn();
+    bindDockerDownloadBtn();
+  } catch (e) {
+    console.error("docker_check_status error:", e);
+    if (!container.isConnected) return;
+    const errorStatus: DockerStatus = {
+      cliFound: false,
+      cliVersion: null,
+      daemonRunning: false,
+      serverVersion: null,
+      desktopFound: false,
+      cliPath: null,
+      desktopPath: null,
+      errorKind: "unknown",
+      errorMessage: `状態確認中にエラーが発生しました: ${e}`,
+    };
+    container.innerHTML = renderDockerStatusContent(errorStatus);
+    bindDockerRefreshBtn();
+  }
+}
+
+function bindDockerRefreshBtn(): void {
+  document.querySelectorAll<HTMLButtonElement>(".btn-docker-refresh").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      void loadAndRenderDockerStatus();
+    }, { once: true });
+  });
+}
+
+function bindDockerStartBtn(): void {
+  document.querySelectorAll<HTMLButtonElement>(".btn-docker-start").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const originalHtml = btn.innerHTML;
+      btn.innerHTML = '<span class="material-symbols-outlined spin">progress_activity</span> 起動中…';
+      btn.disabled = true;
+      try {
+        const result = await invokeTauri<{ launched: boolean; message: string }>("docker_start_desktop");
+        if (!btn.isConnected) return;
+        await showAppDialog({
+          title: "Docker Desktop",
+          message: result.message,
+          type: result.launched ? "success" : "error",
+        });
+      } catch (e) {
+        console.error("docker_start_desktop error:", e);
+        if (!btn.isConnected) return;
+        await showAppDialog({
+          title: "Docker Desktop",
+          message: `起動に失敗しました: ${e}`,
+          type: "error",
+        });
+      } finally {
+        if (btn.isConnected) {
+          btn.disabled = false;
+          btn.innerHTML = originalHtml;
+        }
+      }
+    }, { once: true });
+  });
+}
+
+async function openDockerDownloadPage(): Promise<void> {
+  try {
+    const { openUrl } = await import("@tauri-apps/plugin-opener");
+    await openUrl("https://www.docker.com/products/docker-desktop/");
+  } catch (e) {
+    console.error("openUrl failed, falling back to window.open:", e);
+    window.open("https://www.docker.com/products/docker-desktop/", "_blank");
+  }
+}
+
+function bindDockerDownloadBtn(): void {
+  document.querySelectorAll<HTMLButtonElement>(".btn-docker-download").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      void openDockerDownloadPage();
+    }, { once: true });
+  });
+}
+
+// ---- HuggingFace Token Event Handlers ----
+
+async function loadAndRenderHuggingFaceToken(): Promise<void> {
+  const container = document.getElementById("hfTokenContainer");
+  if (!container) return;
+
+  try {
+    const status = await invokeTauri<HuggingFaceTokenStatus>("hf_token_get_status");
+    if (!container.isConnected) return;
+    container.innerHTML = renderHuggingFaceTokenSection(status);
+    bindHfTokenButtons();
+  } catch (e) {
+    console.error("hf_token_get_status error:", e);
+    if (!container.isConnected) return;
+    container.innerHTML = renderHuggingFaceTokenSection(null);
+    bindHfTokenButtons();
+  }
+}
+
+function bindHfTokenButtons(): void {
+  bindHfTokenSaveBtn();
+  bindHfTokenEditBtn();
+  bindHfTokenDeleteBtn();
+  bindHfTokenVisibility();
+}
+
+function bindHfTokenSaveBtn(): void {
+  document.querySelectorAll<HTMLButtonElement>(".btn-hf-token-save").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const input = document.querySelector<HTMLInputElement>(".hf-token-input");
+      if (!input) return;
+      const token = input.value.trim();
+      if (!token) {
+        await showAppDialog({ title: "Hugging Face", message: "アクセストークンを入力してください", type: "error" });
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const result = await invokeTauri<HuggingFaceTokenSaveResult>("hf_token_save", { input: { token } });
+        if (!btn.isConnected) return;
+        if (result.success) {
+          input.value = "";
+          await showAppDialog({ title: "Hugging Face", message: result.message, type: "success" });
+          void loadAndRenderHuggingFaceToken();
+        } else {
+          await showAppDialog({ title: "Hugging Face", message: result.message, type: "error" });
+        }
+      } catch (e) {
+        console.error("hf_token_save error:", e);
+        if (!btn.isConnected) return;
+        await showAppDialog({ title: "Hugging Face", message: `保存に失敗しました: ${e}`, type: "error" });
+      } finally {
+        if (btn.isConnected) btn.disabled = false;
+      }
+    }, { once: true });
+  });
+}
+
+function bindHfTokenEditBtn(): void {
+  document.querySelectorAll<HTMLButtonElement>(".btn-hf-token-edit").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const container = document.getElementById("hfTokenContainer");
+      if (!container) return;
+      container.innerHTML = renderHuggingFaceTokenSection(null);
+      bindHfTokenButtons();
+    }, { once: true });
+  });
+}
+
+function bindHfTokenDeleteBtn(): void {
+  document.querySelectorAll<HTMLButtonElement>(".btn-hf-token-delete").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const { ask } = await import("@tauri-apps/plugin-dialog");
+      const confirmed = await ask(
+        "保存済みのHF_TOKENを削除しますか？\n\n削除後は、pyannoteモデルの新規取得や、認証が必要なモデルの実行ができなくなる場合があります。",
+        { title: "HF_TOKENの削除", kind: "warning" },
+      );
+      if (!confirmed) return;
+      btn.disabled = true;
+      try {
+        const result = await invokeTauri<HuggingFaceTokenSaveResult>("hf_token_delete");
+        if (!btn.isConnected) return;
+        if (result.success) {
+          await showAppDialog({ title: "Hugging Face", message: result.message, type: "success" });
+          void loadAndRenderHuggingFaceToken();
+        } else {
+          await showAppDialog({ title: "Hugging Face", message: result.message, type: "error" });
+        }
+      } catch (e) {
+        console.error("hf_token_delete error:", e);
+        if (!btn.isConnected) return;
+        await showAppDialog({ title: "Hugging Face", message: `削除に失敗しました: ${e}`, type: "error" });
+      } finally {
+        if (btn.isConnected) btn.disabled = false;
+      }
+    }, { once: true });
+  });
+}
+
+function bindHfTokenVisibility(): void {
+  document.querySelectorAll<HTMLButtonElement>(".hf-token-visibility").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = btn.closest(".api-key-input-wrap")?.querySelector<HTMLInputElement>(".hf-token-input");
+      if (!input) return;
+      const icon = btn.querySelector(".material-symbols-outlined");
+      if (input.type === "password") {
+        input.type = "text";
+        if (icon) icon.textContent = "visibility_off";
+      } else {
+        input.type = "password";
+        if (icon) icon.textContent = "visibility";
+      }
+    });
   });
 }
 

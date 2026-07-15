@@ -1554,3 +1554,184 @@ html, body {
   max-height: 320px;
   overflow-y: auto;
 }
+
+/* ---- Docker Status ---- */
+
+.docker-status-card {
+  padding: 20px 24px;
+  border-radius: 12px;
+  background: var(--surface-container-lowest);
+  border: 1px solid var(--outline-variant);
+}
+
+.docker-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--on-surface);
+}
+
+.docker-status-row .material-symbols-outlined {
+  font-size: 18px;
+  flex: 0 0 18px;
+}
+
+.docker-status-desc {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--on-surface-variant);
+  line-height: 1.5;
+}
+
+.docker-status-details {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.docker-detail-item {
+  font-size: 13px;
+  color: var(--on-surface-variant);
+  margin: 0;
+}
+
+.docker-detail-item strong {
+  color: var(--on-surface);
+  font-weight: 500;
+}
+
+.docker-status-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 8px;
+}
+
+/* Docker action buttons — match .btn-test-send / .btn-google-stt-check-adc patterns */
+
+.btn-docker-download,
+.btn-docker-start {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border: none;
+  border-radius: 6px;
+  background: var(--primary);
+  color: var(--on-primary);
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.btn-docker-download:hover,
+.btn-docker-start:hover {
+  background: var(--primary-container);
+}
+
+.btn-docker-download .material-symbols-outlined,
+.btn-docker-start .material-symbols-outlined {
+  font-size: 14px;
+}
+
+.btn-docker-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 7px 14px;
+  background: transparent;
+  border: 1px solid var(--outline-variant);
+  border-radius: 6px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  color: var(--on-surface);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.btn-docker-refresh:hover {
+  background: var(--surface-container-low);
+}
+
+.btn-docker-refresh .material-symbols-outlined {
+  font-size: 14px;
+}
+
+/* Docker install steps (not-installed state) */
+
+.docker-install-steps {
+  margin: 12px 0 8px 20px;
+  padding: 0;
+  font-size: 13px;
+  color: var(--on-surface-variant);
+  line-height: 1.7;
+}
+
+.docker-install-steps li {
+  margin-bottom: 2px;
+}
+
+.docker-install-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--outline);
+  line-height: 1.5;
+}
+
+/* ---- HuggingFace Token ---- */
+
+.hf-token-section {
+  padding: 0;
+}
+
+.hf-token-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hf-token-input-row .api-key-input-wrap {
+  flex: 1;
+}
+
+.hf-token-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--outline);
+}
+
+.hf-token-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--on-surface);
+}
+
+.hf-token-detail {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hf-token-masked {
+  font-family: var(--font-mono, "JetBrains Mono", monospace);
+  font-size: 13px;
+  color: var(--on-surface-variant);
+  background: var(--surface-container-low);
+  padding: 4px 8px;
+  border-radius: 4px;
+  display: inline-block;
+  width: fit-content;
+}
+
+.hf-token-env-label {
+  font-size: 12px;
+  color: var(--outline);
+}
