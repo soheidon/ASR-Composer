@@ -2354,6 +2354,8 @@ pub struct LocalAsrEngineStatus {
     pub model_name: Option<String>,
     pub docker_available: bool,
     pub docker_running: bool,
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
 }
 
 struct LocalAsrEngineDef {
@@ -2390,14 +2392,49 @@ struct DockerImageInfo {
     labels: HashMap<String, String>,
 }
 
-/// `docker image inspect` のJSON出力をパースする（テスト可能な純粋関数）。
-fn parse_docker_image_inspect(stdout: &str) -> Result<DockerImageInfo, String> {
-    let arr: Vec<DockerImageInspect> =
-        serde_json::from_str(stdout).map_err(|e| format!("JSON解析失敗: {}", e))?;
+/// `docker image inspect` の結果分類。
+#[derive(Debug)]
+enum DockerImageInspectResult {
+    Found(DockerImageInfo),
+    NotFound,
+    DaemonUnavailable,
+    InspectFailed,
+}
 
-    let first = arr
-        .first()
-        .ok_or_else(|| "イメージが見つかりません".to_string())?;
+/// stderrの内容からinspect失敗の原因を分類する（テスト可能な純粋関数）。
+fn classify_docker_inspect_failure(stderr: &str) -> DockerImageInspectResult {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("no such image") {
+        DockerImageInspectResult::NotFound
+    } else if lower.contains("cannot connect to the docker daemon")
+        || lower.contains("error during connect")
+        || (lower.contains("open //./pipe/docker")
+            && lower.contains("the system cannot find the file specified"))
+    {
+        DockerImageInspectResult::DaemonUnavailable
+    } else {
+        DockerImageInspectResult::InspectFailed
+    }
+}
+
+/// `docker image inspect` のJSON出力をパースする（テスト可能な純粋関数）。
+fn parse_docker_image_inspect(stdout: &str) -> Result<DockerImageInfo, DockerImageInspectResult> {
+    if stdout.trim().is_empty() {
+        return Err(DockerImageInspectResult::InspectFailed);
+    }
+
+    let arr: Vec<DockerImageInspect> = match serde_json::from_str(stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("Failed to parse docker image inspect output: {error}");
+            return Err(DockerImageInspectResult::InspectFailed);
+        }
+    };
+
+    let first = match arr.first() {
+        Some(f) => f,
+        None => return Err(DockerImageInspectResult::NotFound),
+    };
 
     let labels = first
         .config
@@ -2415,21 +2452,30 @@ fn parse_docker_image_inspect(stdout: &str) -> Result<DockerImageInfo, String> {
 fn inspect_docker_image(
     docker_path: &std::path::Path,
     image_name: &str,
-) -> Result<Option<DockerImageInfo>, String> {
-    let output = std::process::Command::new(docker_path)
+) -> DockerImageInspectResult {
+    let output = match std::process::Command::new(docker_path)
         .args(["image", "inspect", image_name])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|e| format!("docker実行失敗: {}", e))?;
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("docker image inspect 実行失敗: {e}");
+            return DockerImageInspectResult::InspectFailed;
+        }
+    };
 
     if !output.status.success() {
-        // イメージが存在しない場合（exit code 1）
-        return Ok(None);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return classify_docker_inspect_failure(&stderr);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_docker_image_inspect(&stdout).map(Some)
+    match parse_docker_image_inspect(&stdout) {
+        Ok(info) => DockerImageInspectResult::Found(info),
+        Err(result) => result,
+    }
 }
 
 /// 単一エンジンの状態を取得する（テスト可能、Docker実行を含む）。
@@ -2449,35 +2495,71 @@ fn get_single_engine_status(
             model_name: None,
             docker_available: true,
             docker_running: false,
+            error_kind: None,
+            error_message: None,
         };
     }
 
-    let (installed, image_id, env_version, model_name) =
-        match inspect_docker_image(docker_path, def.image_name) {
-            Ok(Some(info)) => {
-                let env_ver = info
-                    .labels
-                    .get("com.asr-composer.environment-version")
-                    .cloned();
-                let model = info
-                    .labels
-                    .get("com.asr-composer.asr-model")
-                    .cloned();
-                (true, Some(info.image_id), env_ver, model)
+    match inspect_docker_image(docker_path, def.image_name) {
+        DockerImageInspectResult::Found(info) => {
+            let env_ver = info
+                .labels
+                .get("com.asr-composer.environment-version")
+                .cloned();
+            let model = info.labels.get("com.asr-composer.asr-model").cloned();
+            LocalAsrEngineStatus {
+                engine: def.engine.to_string(),
+                display_name: def.display_name.to_string(),
+                installed: true,
+                image_name: def.image_name.to_string(),
+                image_id: Some(info.image_id),
+                environment_version: env_ver,
+                model_name: model,
+                docker_available: true,
+                docker_running: true,
+                error_kind: None,
+                error_message: None,
             }
-            _ => (false, None, None, None),
-        };
-
-    LocalAsrEngineStatus {
-        engine: def.engine.to_string(),
-        display_name: def.display_name.to_string(),
-        installed,
-        image_name: def.image_name.to_string(),
-        image_id,
-        environment_version: env_version,
-        model_name,
-        docker_available: true,
-        docker_running: true,
+        }
+        DockerImageInspectResult::NotFound => LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            model_name: None,
+            docker_available: true,
+            docker_running: true,
+            error_kind: None,
+            error_message: None,
+        },
+        DockerImageInspectResult::DaemonUnavailable => LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            model_name: None,
+            docker_available: true,
+            docker_running: true,
+            error_kind: Some("daemon-unavailable".to_string()),
+            error_message: Some("Docker Engineへ接続できませんでした".to_string()),
+        },
+        DockerImageInspectResult::InspectFailed => LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            model_name: None,
+            docker_available: true,
+            docker_running: true,
+            error_kind: Some("inspect-error".to_string()),
+            error_message: Some("Dockerイメージの状態を確認できませんでした".to_string()),
+        },
     }
 }
 
@@ -2499,6 +2581,8 @@ fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
                 model_name: None,
                 docker_available: false,
                 docker_running: false,
+                error_kind: None,
+                error_message: None,
             })
             .collect();
     }
@@ -2531,6 +2615,8 @@ fn unavailable_local_asr_statuses() -> Vec<LocalAsrEngineStatus> {
             model_name: None,
             docker_available: false,
             docker_running: false,
+            error_kind: None,
+            error_message: None,
         })
         .collect()
 }
@@ -2834,12 +2920,15 @@ async fn local_asr_uninstall(
 
     // イメージ存在確認
     match inspect_docker_image(&docker_path, &def.image_name) {
-        Ok(None) => {
+        DockerImageInspectResult::NotFound => {
             return Err(format!("{}環境はインストールされていません", def.display_name));
         }
-        Ok(Some(_)) => { /* 存在する → 削除へ進む */ }
-        Err(e) => {
-            return Err(format!("イメージの確認に失敗しました: {}", e));
+        DockerImageInspectResult::Found(_) => { /* 存在する → 削除へ進む */ }
+        DockerImageInspectResult::DaemonUnavailable => {
+            return Err("Docker Engineへ接続できませんでした".to_string());
+        }
+        DockerImageInspectResult::InspectFailed => {
+            return Err("イメージの確認に失敗しました".to_string());
         }
     }
 
@@ -2878,11 +2967,12 @@ async fn local_asr_uninstall(
 
     // 削除確認
     match inspect_docker_image(&docker_path, &def.image_name) {
-        Ok(Some(_)) => {
+        DockerImageInspectResult::Found(_) => {
             return Err("削除後もDockerイメージが確認されました".to_string());
         }
-        Ok(None) => { /* 正常に削除された */ }
-        Err(_) => { /* inspect失敗は削除成功とみなす */ }
+        DockerImageInspectResult::NotFound => { /* 正常に削除された */ }
+        DockerImageInspectResult::DaemonUnavailable
+        | DockerImageInspectResult::InspectFailed => { /* inspect失敗は削除成功とみなす */ }
     }
 
     // 最新状態を返す
@@ -5475,6 +5565,8 @@ mod tests {
             model_name: Some("reazon-research/reazonspeech-espnet-v2".to_string()),
             docker_available: true,
             docker_running: true,
+            error_kind: None,
+            error_message: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("displayName"));
@@ -5554,20 +5646,98 @@ mod tests {
         let json = r#"[]"#;
         let result = parse_docker_image_inspect(json);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("見つかりません"));
+        assert!(matches!(result.unwrap_err(), DockerImageInspectResult::NotFound));
     }
 
     #[test]
     fn parse_docker_image_inspect_invalid_json() {
         let result = parse_docker_image_inspect("not json");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("JSON解析失敗"));
+        assert!(matches!(result.unwrap_err(), DockerImageInspectResult::InspectFailed));
     }
 
     #[test]
     fn parse_docker_image_inspect_empty_string() {
         let result = parse_docker_image_inspect("");
         assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), DockerImageInspectResult::InspectFailed));
+    }
+
+    // ---- classify_docker_inspect_failure ----
+
+    #[test]
+    fn classify_no_such_image() {
+        assert!(matches!(
+            classify_docker_inspect_failure("Error: No such image: foo"),
+            DockerImageInspectResult::NotFound
+        ));
+    }
+
+    #[test]
+    fn classify_no_such_image_lowercase() {
+        assert!(matches!(
+            classify_docker_inspect_failure("error: no such image: foo"),
+            DockerImageInspectResult::NotFound
+        ));
+    }
+
+    #[test]
+    fn classify_cannot_connect_daemon() {
+        assert!(matches!(
+            classify_docker_inspect_failure("Cannot connect to the Docker daemon"),
+            DockerImageInspectResult::DaemonUnavailable
+        ));
+    }
+
+    #[test]
+    fn classify_error_during_connect() {
+        assert!(matches!(
+            classify_docker_inspect_failure("error during connect: Get http://%2F.%2Fpipe%2Fdocker_engine/v1.40/version"),
+            DockerImageInspectResult::DaemonUnavailable
+        ));
+    }
+
+    #[test]
+    fn classify_windows_named_pipe_docker_engine() {
+        let stderr = r#"error during connect: open //./pipe/docker_engine: The system cannot find the file specified."#;
+        assert!(matches!(
+            classify_docker_inspect_failure(stderr),
+            DockerImageInspectResult::DaemonUnavailable
+        ));
+    }
+
+    #[test]
+    fn classify_windows_named_pipe_docker_desktop() {
+        let stderr = r#"open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified."#;
+        assert!(matches!(
+            classify_docker_inspect_failure(stderr),
+            DockerImageInspectResult::DaemonUnavailable
+        ));
+    }
+
+    #[test]
+    fn classify_file_specified_without_pipe_is_not_daemon() {
+        assert!(matches!(
+            classify_docker_inspect_failure("The system cannot find the file specified."),
+            DockerImageInspectResult::InspectFailed
+        ));
+    }
+
+    #[test]
+    fn classify_unrelated_pipe_with_file_specified_is_not_daemon() {
+        let stderr = r#"open //./pipe/unrelated: The system cannot find the file specified."#;
+        assert!(matches!(
+            classify_docker_inspect_failure(stderr),
+            DockerImageInspectResult::InspectFailed
+        ));
+    }
+
+    #[test]
+    fn classify_other_error() {
+        assert!(matches!(
+            classify_docker_inspect_failure("some unexpected error"),
+            DockerImageInspectResult::InspectFailed
+        ));
     }
 
     // ---- unavailable_local_asr_statuses ----

@@ -1,5 +1,5 @@
 import "./styles.css";
-import { setStatusBadge, classifyFetchError, populateModelSelect, showAppDialog } from "./status";
+import { setStatusBadge, classifyFetchError, populateModelSelect, showAppDialog, showAppConfirm } from "./status";
 import { asrProviders, llmProviders, cloudLlmProviders } from "./providers";
 import type { ProviderDefinition } from "./providers";
 import {
@@ -610,7 +610,7 @@ const settingsDockerPage = `
               <p class="api-section-desc">Dockerを利用して、音声データを外部へ送信せずに文字起こしします。</p>
             </div>
             <div class="local-asr-container" id="localAsrContainer">
-              ${renderLocalAsrSection(null)}
+              ${renderLocalAsrSection({ kind: "loading" })}
             </div>
           </div>
         </div>
@@ -654,6 +654,7 @@ function renderHeader(activePage: PageName): string {
 
 let currentPage: PageName | null = null;
 let sidebarDelegationBound = false;
+let dockerPageLoadRevision = 0;
 
 // ---- Provider Config: Dirty / Revision / Save Queue ----
 
@@ -767,9 +768,8 @@ async function navigateTo(page: PageName) {
     bindOllamaFetchButton();
     bindOllamaTestButton();
   } else if (page === "settings-docker") {
-    void loadAndRenderDockerStatus();
+    void loadDockerPageStatuses();
     void loadAndRenderHuggingFaceToken();
-    void loadAndRenderLocalAsrStatus();
     bindLocalAsrDelegation();
   }
 }
@@ -2132,22 +2132,23 @@ function bindOllamaTestButton() {
 
 // ---- Docker Event Handlers ----
 
-async function loadAndRenderDockerStatus(): Promise<void> {
+async function loadAndRenderDockerStatus(): Promise<DockerStatus | null> {
   const container = document.getElementById("dockerStatusContainer");
-  if (!container) return;
+  if (!container) return null;
 
   container.innerHTML = renderDockerStatusContent(null);
   bindDockerRefreshBtn();
   try {
     const status = await invokeTauri<DockerStatus>("docker_check_status");
-    if (!container.isConnected) return;
+    if (!container.isConnected) return null;
     container.innerHTML = renderDockerStatusContent(status);
     bindDockerRefreshBtn();
     bindDockerStartBtn();
     bindDockerDownloadBtn();
+    return status;
   } catch (e) {
     console.error("docker_check_status error:", e);
-    if (!container.isConnected) return;
+    if (!container.isConnected) return null;
     const errorStatus: DockerStatus = {
       cliFound: false,
       cliVersion: null,
@@ -2161,6 +2162,7 @@ async function loadAndRenderDockerStatus(): Promise<void> {
     };
     container.innerHTML = renderDockerStatusContent(errorStatus);
     bindDockerRefreshBtn();
+    return null;
   }
 }
 
@@ -2198,13 +2200,13 @@ function bindDockerStartBtn(): void {
           try {
             const status = await invokeTauri<DockerStatus>("docker_check_status");
             if (status.daemonRunning) {
-              await loadAndRenderDockerStatus();
+              await loadDockerPageStatuses();
               return;
             }
           } catch { /* retry */ }
         }
         // タイムアウト: 手動再確認を促す
-        await loadAndRenderDockerStatus();
+        await loadDockerPageStatuses();
       } catch (e) {
         console.error("docker_start_desktop error:", e);
         if (!btn.isConnected) return;
@@ -2374,14 +2376,15 @@ function bindLocalAsrDelegation(): void {
 
     if (target.hasAttribute("data-local-asr-refresh")) {
       target.disabled = true;
-      void loadAndRenderLocalAsrStatus();
+      void loadDockerPageStatuses().finally(() => {
+        if (target.isConnected) target.disabled = false;
+      });
       return;
     }
 
     if (target.hasAttribute("data-uninstall-engine")) {
       const engine = target.dataset.uninstallEngine;
       if (engine) {
-        target.disabled = true;
         void handleLocalAsrUninstall(engine, target);
       }
     }
@@ -2456,20 +2459,25 @@ async function handleLocalAsrInstall(engine: string, btn: HTMLButtonElement): Pr
   }
 }
 
-async function handleLocalAsrUninstall(engine: string, button: HTMLButtonElement): Promise<void> {
-  const { ask } = await import("@tauri-apps/plugin-dialog");
-  const confirmed = await ask(
-    "Dockerイメージを削除します。モデルキャッシュや出力ファイルは削除されません。",
-    { title: "ReazonSpeech環境を削除", kind: "warning" },
-  );
-  if (!confirmed) {
-    if (button.isConnected) button.disabled = false;
-    return;
-  }
-
+async function handleLocalAsrUninstall(
+  engine: string,
+  button: HTMLButtonElement,
+): Promise<void> {
   const originalHtml = button.innerHTML;
+
+  const confirmed = await showAppConfirm({
+    title: "ReazonSpeech環境を削除",
+    message: "Dockerイメージを削除します。モデルキャッシュや出力ファイルは削除されません。",
+    confirmText: "削除する",
+    cancelText: "キャンセル",
+    variant: "danger",
+  });
+
+  if (!confirmed) return;
+
   button.disabled = true;
-  button.innerHTML = '<span class="material-symbols-outlined spin">progress_activity</span> 削除中…';
+  button.innerHTML =
+    '<span class="material-symbols-outlined spin">progress_activity</span> 削除中…';
 
   try {
     await invokeTauri("local_asr_uninstall", { engine });
@@ -2482,43 +2490,69 @@ async function handleLocalAsrUninstall(engine: string, button: HTMLButtonElement
       button.innerHTML = originalHtml;
     }
 
-    const container = document.getElementById("localAsrContainer");
-    if (!container) return;
-    const card = container.querySelector(".local-asr-engine-card");
-    const statusEl = card?.querySelector<HTMLElement>(".local-asr-engine-status");
-    if (!statusEl) return;
-    const msg = typeof e === "string" ? e : String(e);
-    const shortMsg = msg.split("\n")[0];
-    statusEl.innerHTML = `
-      <div class="docker-status-row">
-        <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
-        <span>${escapeHtml(shortMsg)}</span>
-      </div>
-      <div class="docker-status-actions">
-        <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
-          <span class="material-symbols-outlined">refresh</span>
-          状態を再確認
-        </button>
-        <button class="btn-danger-outline" type="button" data-uninstall-engine="${escapeHtml(engine)}">
-          再試行
-        </button>
-      </div>`;
+    const message = e instanceof Error ? e.message : String(e);
+
+    await showAppDialog({
+      title: "ReazonSpeech環境の削除",
+      message: `削除に失敗しました: ${message}`,
+      type: "error",
+    });
   }
 }
 
-async function loadAndRenderLocalAsrStatus(): Promise<void> {
+async function loadDockerPageStatuses(): Promise<void> {
+  const revision = ++dockerPageLoadRevision;
   const container = document.getElementById("localAsrContainer");
   if (!container) return;
 
-  container.innerHTML = renderLocalAsrSection(null);
+  container.innerHTML = renderLocalAsrSection({ kind: "loading" });
+
+  const dockerStatus = await loadAndRenderDockerStatus();
+  if (revision !== dockerPageLoadRevision || currentPage !== "settings-docker") return;
+
+  if (!dockerStatus) {
+    container.innerHTML = renderLocalAsrSection({
+      kind: "load-error",
+      message: "Dockerの状態を取得できませんでした。",
+    });
+    return;
+  }
+
+  if (!dockerStatus.cliFound) {
+    container.innerHTML = renderLocalAsrSection({ kind: "docker-unavailable" });
+    return;
+  }
+
+  if (!dockerStatus.daemonRunning) {
+    container.innerHTML = renderLocalAsrSection({ kind: "docker-stopped" });
+    return;
+  }
+
+  await loadAndRenderLocalAsrStatus(revision);
+}
+
+async function loadAndRenderLocalAsrStatus(revision?: number): Promise<void> {
+  const container = document.getElementById("localAsrContainer");
+  if (!container) return;
+
+  container.innerHTML = renderLocalAsrSection({ kind: "loading" });
   try {
     const engines = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status");
+
+    if (revision !== undefined && (revision !== dockerPageLoadRevision || currentPage !== "settings-docker")) return;
     if (!container.isConnected) return;
-    container.innerHTML = renderLocalAsrSection(engines);
+
+    container.innerHTML = renderLocalAsrSection({ kind: "engines", statuses: engines });
   } catch (e) {
     console.error("local_asr_get_status error:", e);
+
+    if (revision !== undefined && (revision !== dockerPageLoadRevision || currentPage !== "settings-docker")) return;
     if (!container.isConnected) return;
-    container.innerHTML = renderLocalAsrSection([]);
+
+    container.innerHTML = renderLocalAsrSection({
+      kind: "load-error",
+      message: "ローカルASRの状態を取得できませんでした。",
+    });
   }
 }
 

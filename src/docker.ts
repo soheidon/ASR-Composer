@@ -221,9 +221,18 @@ export interface LocalAsrEngineStatus {
   modelName: string | null;
   dockerAvailable: boolean;
   dockerRunning: boolean;
+  errorKind: string | null; // "daemon-unavailable" | "inspect-error" | null
+  errorMessage: string | null;
 }
 
-export type LocalAsrUiState = "loading" | "error" | "no-docker" | "docker-stopped" | "not-installed" | "installed";
+export type LocalAsrUiState =
+  | "loading"
+  | "no-docker"
+  | "docker-stopped"
+  | "daemon-unavailable"
+  | "inspect-error"
+  | "not-installed"
+  | "installed";
 
 export interface LocalAsrProgress {
   engine: string;
@@ -235,6 +244,8 @@ export function getLocalAsrUiState(status: LocalAsrEngineStatus | null): LocalAs
   if (!status) return "loading";
   if (!status.dockerAvailable) return "no-docker";
   if (!status.dockerRunning) return "docker-stopped";
+  if (status.errorKind === "daemon-unavailable") return "daemon-unavailable";
+  if (status.errorKind === "inspect-error") return "inspect-error";
   if (!status.installed) return "not-installed";
   return "installed";
 }
@@ -266,28 +277,79 @@ export function getLocalAsrProgressDisplay(stage: string): LocalAsrProgressDispl
   return LOCAL_ASR_STAGES[stage] ?? { percent: 0, message: "処理を開始しています" };
 }
 
-export function renderLocalAsrSection(engines: LocalAsrEngineStatus[] | null): string {
-  if (engines === null) {
-    return `
-      <div class="local-asr-engine-card">
-        <div class="docker-status-row">
-          <span class="material-symbols-outlined spin" style="font-size: 18px; color: var(--color-text-secondary);">progress_activity</span>
-          <span>状態を確認しています…</span>
-        </div>
-      </div>`;
-  }
+export type LocalAsrSectionState =
+  | { kind: "loading" }
+  | { kind: "docker-unavailable" }
+  | { kind: "docker-stopped" }
+  | { kind: "load-error"; message: string }
+  | { kind: "engines"; statuses: LocalAsrEngineStatus[] };
 
-  if (engines.length === 0) {
-    return `
-      <div class="local-asr-engine-card">
-        <div class="docker-status-row">
-          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
-          <span>状態を取得できませんでした</span>
-        </div>
-      </div>`;
+export function renderLocalAsrSection(state: LocalAsrSectionState): string {
+  switch (state.kind) {
+    case "loading":
+      return `
+        <div class="local-asr-engine-card">
+          <div class="docker-status-row">
+            <span class="material-symbols-outlined spin" style="font-size: 18px; color: var(--color-text-secondary);">progress_activity</span>
+            <span>状態を確認しています…</span>
+          </div>
+        </div>`;
+    case "docker-unavailable":
+      return `
+        <div class="local-asr-engine-card">
+          <div class="docker-status-row">
+            <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
+            <span>Dockerがインストールされていません</span>
+          </div>
+          <p class="docker-status-desc">ローカルASRを使用するには、Docker Desktopのインストールが必要です。上の「Docker Desktop」セクションを確認してください。</p>
+          <div class="docker-status-actions">
+            <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+              <span class="material-symbols-outlined">refresh</span>
+              状態を再確認
+            </button>
+          </div>
+        </div>`;
+    case "docker-stopped":
+      return `
+        <div class="local-asr-engine-card">
+          <div class="docker-status-row">
+            <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-warning, #f59e0b);">warning</span>
+            <span>Docker Desktopが起動していません</span>
+          </div>
+          <p class="docker-status-desc">Docker Desktopを起動してから、状態を再確認してください。</p>
+          <div class="docker-status-actions">
+            <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+              <span class="material-symbols-outlined">refresh</span>
+              状態を再確認
+            </button>
+          </div>
+        </div>`;
+    case "load-error":
+      return `
+        <div class="local-asr-engine-card">
+          <div class="docker-status-row">
+            <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
+            <span>${escapeHtml(state.message)}</span>
+          </div>
+          <div class="docker-status-actions">
+            <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+              <span class="material-symbols-outlined">refresh</span>
+              状態を再確認
+            </button>
+          </div>
+        </div>`;
+    case "engines":
+      if (state.statuses.length === 0) {
+        return `
+          <div class="local-asr-engine-card">
+            <div class="docker-status-row">
+              <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-text-secondary);">info</span>
+              <span>エンジンが定義されていません</span>
+            </div>
+          </div>`;
+      }
+      return state.statuses.map(e => renderLocalAsrEngineCard(e)).join("");
   }
-
-  return engines.map(e => renderLocalAsrEngineCard(e)).join("");
 }
 
 function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
@@ -368,12 +430,27 @@ function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
         </div>`;
       break;
     }
-    case "error":
+    case "daemon-unavailable":
+      statusHtml = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-warning, #f59e0b);">warning</span>
+          <span>Docker Engineへ接続できませんでした</span>
+        </div>
+        <p class="docker-status-desc">Docker Desktopの起動完了後に再確認してください。</p>
+        <div class="docker-status-actions">
+          <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+            <span class="material-symbols-outlined">refresh</span>
+            状態を再確認
+          </button>
+        </div>`;
+      break;
+    case "inspect-error":
       statusHtml = `
         <div class="docker-status-row">
           <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
-          <span>状態を取得できませんでした</span>
+          <span>インストール状態を確認できませんでした</span>
         </div>
+        <p class="docker-status-desc">しばらく待ってから再確認してください。</p>
         <div class="docker-status-actions">
           <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
             <span class="material-symbols-outlined">refresh</span>

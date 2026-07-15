@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { classifyFetchError, populateModelSelect, showAppDialog } from "./status";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { classifyFetchError, populateModelSelect, showAppDialog, showAppConfirm } from "./status";
 
 // ---- classifyFetchError ----
 
@@ -392,5 +392,116 @@ describe("showAppDialog", () => {
     expect(alreadyInertElement.hasAttribute("inert")).toBe(true);
     normalElement.remove();
     alreadyInertElement.remove();
+  });
+});
+
+// ---- showAppConfirm ----
+
+describe("showAppConfirm", () => {
+  afterEach(() => {
+    document.querySelector(".app-dialog-overlay")?.remove();
+    document.body.style.overflow = "";
+  });
+
+  it("renders confirm and cancel buttons", () => {
+    const promise = showAppConfirm({ title: "Title", message: "Body" });
+    expect(document.querySelector(".app-dialog-confirm")).toBeTruthy();
+    expect(document.querySelector(".app-dialog-cancel")).toBeTruthy();
+    document.querySelector<HTMLButtonElement>(".app-dialog-cancel")!.click();
+    return promise;
+  });
+
+  it("confirm button returns true", async () => {
+    const promise = showAppConfirm({ title: "T", message: "M" });
+    document.querySelector<HTMLButtonElement>(".app-dialog-confirm")!.click();
+    expect(await promise).toBe(true);
+  });
+
+  it("cancel button returns false", async () => {
+    const promise = showAppConfirm({ title: "T", message: "M" });
+    document.querySelector<HTMLButtonElement>(".app-dialog-cancel")!.click();
+    expect(await promise).toBe(false);
+  });
+
+  it("Esc returns false", async () => {
+    const promise = showAppConfirm({ title: "T", message: "M" });
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    expect(await promise).toBe(false);
+  });
+
+  it("overlay click returns false", async () => {
+    const promise = showAppConfirm({ title: "T", message: "M" });
+    const overlay = document.querySelector(".app-dialog-overlay")!;
+    overlay.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(await promise).toBe(false);
+  });
+
+  it("dialog click does not close", async () => {
+    const promise = showAppConfirm({ title: "T", message: "M" });
+    const dialog = document.querySelector(".app-dialog")!;
+    dialog.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(document.querySelector(".app-dialog-overlay")).toBeTruthy();
+    document.querySelector<HTMLButtonElement>(".app-dialog-confirm")!.click();
+    expect(await promise).toBe(true);
+  });
+
+  it("danger variant adds danger class", () => {
+    const promise = showAppConfirm({ title: "T", message: "M", variant: "danger" });
+    expect(document.querySelector(".app-dialog-confirm-danger")).toBeTruthy();
+    document.querySelector<HTMLButtonElement>(".app-dialog-cancel")!.click();
+    return promise;
+  });
+
+  it("custom button text", () => {
+    const promise = showAppConfirm({ title: "T", message: "M", confirmText: "削除する", cancelText: "やめる" });
+    expect(document.querySelector<HTMLButtonElement>(".app-dialog-confirm")!.textContent).toBe("削除する");
+    expect(document.querySelector<HTMLButtonElement>(".app-dialog-cancel")!.textContent).toBe("やめる");
+    document.querySelector<HTMLButtonElement>(".app-dialog-cancel")!.click();
+    return promise;
+  });
+
+  it("cancel button has initial focus", () => {
+    const promise = showAppConfirm({ title: "T", message: "M" });
+    expect(document.activeElement).toBe(document.querySelector(".app-dialog-cancel"));
+    document.querySelector<HTMLButtonElement>(".app-dialog-cancel")!.click();
+    return promise;
+  });
+
+  it("sets aria-modal and role", () => {
+    const promise = showAppConfirm({ title: "T", message: "M" });
+    const dialog = document.querySelector(".app-dialog")!;
+    expect(dialog.getAttribute("role")).toBe("dialog");
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(dialog.getAttribute("aria-labelledby")).toBeTruthy();
+    document.querySelector<HTMLButtonElement>(".app-dialog-cancel")!.click();
+    return promise;
+  });
+
+  it("removes overlay after close", async () => {
+    const promise = showAppConfirm({ title: "T", message: "M" });
+    expect(document.querySelector(".app-dialog-overlay")).toBeTruthy();
+    document.querySelector<HTMLButtonElement>(".app-dialog-cancel")!.click();
+    await promise;
+    expect(document.querySelector(".app-dialog-overlay")).toBeNull();
+  });
+
+  it("previous dialog is closed when new one opens", async () => {
+    const promise1 = showAppConfirm({ title: "First", message: "M1" });
+    expect(document.querySelectorAll(".app-dialog-overlay").length).toBe(1);
+    const promise2 = showAppConfirm({ title: "Second", message: "M2" });
+    expect(document.querySelectorAll(".app-dialog-overlay").length).toBe(1);
+    expect(document.querySelector(".app-dialog-title")!.textContent).toBe("Second");
+    document.querySelector<HTMLButtonElement>(".app-dialog-confirm")!.click();
+    expect(await promise1).toBe(false);
+    expect(await promise2).toBe(true);
+  });
+
+  it("does not call native confirm or dialog ask", () => {
+    const confirmSpy = vi.spyOn(window, "confirm");
+    const promise = showAppConfirm({ title: "T", message: "M" });
+    expect(confirmSpy).not.toHaveBeenCalled();
+    confirmSpy.mockRestore();
+    document.querySelector<HTMLButtonElement>(".app-dialog-cancel")!.click();
+    return promise;
   });
 });

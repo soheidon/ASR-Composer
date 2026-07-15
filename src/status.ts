@@ -247,3 +247,129 @@ export function showAppDialog(options: ShowDialogOptions): Promise<void> {
     okBtn.focus();
   });
 }
+
+export interface ShowConfirmOptions {
+  title: string;
+  message: string;
+  confirmText?: string;
+  cancelText?: string;
+  /** "danger" makes the confirm button red. */
+  variant?: "danger";
+}
+
+export function showAppConfirm(options: ShowConfirmOptions): Promise<boolean> {
+  closeCurrentDialog?.();
+
+  const previousFocus =
+    document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const dialogId = ++dialogSequence;
+
+  const overlay = document.createElement("div");
+  overlay.className = "app-dialog-overlay";
+
+  const dialog = document.createElement("div");
+  dialog.className = "app-dialog";
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+
+  const iconSpan = document.createElement("span");
+  iconSpan.className = "material-symbols-outlined app-dialog-icon icon-warning";
+  iconSpan.setAttribute("aria-hidden", "true");
+  iconSpan.textContent = "warning";
+
+  const titleEl = document.createElement("h3");
+  titleEl.className = "app-dialog-title";
+  titleEl.id = `app-dialog-title-${dialogId}`;
+  titleEl.textContent = options.title;
+
+  const messageEl = document.createElement("p");
+  messageEl.className = "app-dialog-message";
+  messageEl.id = `app-dialog-message-${dialogId}`;
+  messageEl.textContent = options.message;
+
+  dialog.setAttribute("aria-labelledby", titleEl.id);
+  dialog.setAttribute("aria-describedby", messageEl.id);
+
+  const buttonRow = document.createElement("div");
+  buttonRow.className = "app-dialog-button-row";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "app-dialog-cancel";
+  cancelBtn.type = "button";
+  cancelBtn.textContent = options.cancelText ?? "キャンセル";
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.className = options.variant === "danger"
+    ? "app-dialog-confirm app-dialog-confirm-danger"
+    : "app-dialog-confirm";
+  confirmBtn.type = "button";
+  confirmBtn.textContent = options.confirmText ?? "OK";
+
+  buttonRow.append(cancelBtn, confirmBtn);
+  dialog.append(iconSpan, titleEl, messageEl, buttonRow);
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+
+  const previousBodyOverflow = document.body.style.overflow;
+  document.body.style.overflow = "hidden";
+
+  const inertStates = Array.from(document.body.children)
+    .filter(el => el !== overlay)
+    .map(el => ({
+      element: el as HTMLElement,
+      wasInert: (el as HTMLElement).inert,
+    }));
+  for (const { element } of inertStates) {
+    element.inert = true;
+  }
+
+  return new Promise<boolean>((resolve) => {
+    let closed = false;
+
+    const onClose = (result: boolean) => {
+      if (closed) return;
+      closed = true;
+
+      cancelBtn.removeEventListener("click", onCancel);
+      confirmBtn.removeEventListener("click", onConfirm);
+      overlay.removeEventListener("click", onOverlayClick);
+      document.removeEventListener("keydown", onKeyDown);
+
+      overlay.remove();
+
+      for (const { element, wasInert } of inertStates) {
+        if (element.isConnected) {
+          element.inert = wasInert;
+        }
+      }
+      document.body.style.overflow = previousBodyOverflow;
+
+      if (closeCurrentDialog === close) closeCurrentDialog = null;
+      if (previousFocus?.isConnected) previousFocus.focus();
+      resolve(result);
+    };
+
+    const onCancel = () => onClose(false);
+    const onConfirm = () => onClose(true);
+    const close = () => onClose(false);
+
+    const onOverlayClick = (event: MouseEvent) => {
+      if (event.target === overlay) onClose(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose(false);
+      }
+    };
+
+    closeCurrentDialog = close;
+
+    cancelBtn.addEventListener("click", onCancel);
+    confirmBtn.addEventListener("click", onConfirm);
+    overlay.addEventListener("click", onOverlayClick);
+    document.addEventListener("keydown", onKeyDown);
+
+    cancelBtn.focus();
+  });
+}

@@ -291,6 +291,8 @@ describe("getLocalAsrUiState", () => {
     modelName: null,
     dockerAvailable: false,
     dockerRunning: false,
+    errorKind: null,
+    errorMessage: null,
   };
 
   it("null status returns 'loading'", () => {
@@ -309,8 +311,27 @@ describe("getLocalAsrUiState", () => {
     expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true })).toBe("not-installed");
   });
 
+  it("errorKind:'daemon-unavailable' → 'daemon-unavailable'", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, errorKind: "daemon-unavailable", errorMessage: "test" })).toBe("daemon-unavailable");
+  });
+
+  it("errorKind:'inspect-error' → 'inspect-error'", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, errorKind: "inspect-error", errorMessage: "test" })).toBe("inspect-error");
+  });
+
   it("dockerRunning:true, installed:true → 'installed'", () => {
     expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: true })).toBe("installed");
+  });
+
+  it("priority: no-docker > docker-stopped > daemon-unavailable > inspect-error > not-installed", () => {
+    // no-docker takes priority over everything
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: false, dockerRunning: false, errorKind: "daemon-unavailable", errorMessage: "x" })).toBe("no-docker");
+    // docker-stopped takes priority over error kinds
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: false, errorKind: "daemon-unavailable", errorMessage: "x" })).toBe("docker-stopped");
+    // daemon-unavailable takes priority over inspect-error
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, errorKind: "daemon-unavailable", errorMessage: "x", installed: false })).toBe("daemon-unavailable");
+    // inspect-error takes priority over not-installed
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, errorKind: "inspect-error", errorMessage: "x", installed: false })).toBe("inspect-error");
   });
 });
 
@@ -327,49 +348,51 @@ describe("renderLocalAsrSection", () => {
     modelName: null,
     dockerAvailable: false,
     dockerRunning: false,
+    errorKind: null,
+    errorMessage: null,
   };
 
   it("null shows loading state", () => {
-    const html = renderLocalAsrSection(null);
+    const html = renderLocalAsrSection({ kind: "loading" });
     document.body.innerHTML = html;
     expect(document.body.textContent).toContain("状態を確認しています…");
     expect(document.querySelector(".spin")).toBeTruthy();
   });
 
-  it("empty array shows error state", () => {
-    const html = renderLocalAsrSection([]);
+  it("load-error shows error message", () => {
+    const html = renderLocalAsrSection({ kind: "load-error", message: "テストエラー" });
     document.body.innerHTML = html;
-    expect(document.body.textContent).toContain("状態を取得できませんでした");
+    expect(document.body.textContent).toContain("テストエラー");
   });
 
   it("no-docker shows Docker not installed message", () => {
-    const html = renderLocalAsrSection([{ ...baseEngine }]);
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine }] });
     document.body.innerHTML = html;
     expect(document.body.textContent).toContain("Dockerがインストールされていません");
     expect(document.body.textContent).toContain("ReazonSpeech");
   });
 
   it("docker-stopped shows Docker not running message", () => {
-    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true }]);
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine, dockerAvailable: true }] });
     document.body.innerHTML = html;
     expect(document.body.textContent).toContain("Docker Desktopが起動していません");
   });
 
   it("not-installed shows info badge", () => {
-    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true, dockerRunning: true }]);
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true }] });
     document.body.innerHTML = html;
     expect(document.body.textContent).toContain("未インストール");
   });
 
   it("installed shows check mark and engine name", () => {
-    const html = renderLocalAsrSection([{
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{
       ...baseEngine,
       dockerAvailable: true,
       dockerRunning: true,
       installed: true,
       environmentVersion: "1.0.0",
       modelName: "reazon-research/reazonspeech-espnet-v2",
-    }]);
+    }] });
     document.body.innerHTML = html;
     expect(document.body.textContent).toContain("インストール済み");
     expect(document.body.textContent).toContain("ReazonSpeech");
@@ -378,12 +401,12 @@ describe("renderLocalAsrSection", () => {
   });
 
   it("installed without optional fields omits details", () => {
-    const html = renderLocalAsrSection([{
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{
       ...baseEngine,
       dockerAvailable: true,
       dockerRunning: true,
       installed: true,
-    }]);
+    }] });
     document.body.innerHTML = html;
     expect(document.body.textContent).toContain("インストール済み");
     expect(document.body.textContent).not.toContain("環境バージョン");
@@ -391,25 +414,25 @@ describe("renderLocalAsrSection", () => {
   });
 
   it("engine displayName is rendered", () => {
-    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true, dockerRunning: true }]);
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true }] });
     document.body.innerHTML = html;
     expect(document.querySelector(".local-asr-engine-name")?.textContent).toContain("ReazonSpeech");
   });
 
   it("installed version info is HTML-escaped", () => {
-    const html = renderLocalAsrSection([{
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{
       ...baseEngine,
       dockerAvailable: true,
       dockerRunning: true,
       installed: true,
       modelName: '<script>alert("xss")</script>',
-    }]);
+    }] });
     expect(html).not.toContain("<script>");
     expect(html).toContain("&lt;script&gt;");
   });
 
   it("not-installed shows install button", () => {
-    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true, dockerRunning: true }]);
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true }] });
     document.body.innerHTML = html;
     const btn = document.querySelector(".btn-local-asr-install");
     expect(btn).toBeTruthy();
@@ -418,24 +441,24 @@ describe("renderLocalAsrSection", () => {
   });
 
   it("installed does not show install button", () => {
-    const html = renderLocalAsrSection([{
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{
       ...baseEngine,
       dockerAvailable: true,
       dockerRunning: true,
       installed: true,
-    }]);
+    }] });
     document.body.innerHTML = html;
     expect(document.querySelector(".btn-local-asr-install")).toBeNull();
   });
 
   it("no-docker does not show install button", () => {
-    const html = renderLocalAsrSection([{ ...baseEngine }]);
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine }] });
     document.body.innerHTML = html;
     expect(document.querySelector(".btn-local-asr-install")).toBeNull();
   });
 
   it("docker-stopped does not show install button", () => {
-    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true }]);
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine, dockerAvailable: true }] });
     document.body.innerHTML = html;
     expect(document.querySelector(".btn-local-asr-install")).toBeNull();
   });
@@ -448,26 +471,26 @@ describe("renderLocalAsrSection", () => {
       { ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: true }, // installed
     ];
     for (const s of states) {
-      const html = renderLocalAsrSection([s]);
+      const html = renderLocalAsrSection({ kind: "engines", statuses: [s] });
       document.body.innerHTML = html;
       expect(document.querySelector("[data-local-asr-refresh]")).toBeTruthy();
     }
   });
 
   it("refresh button has correct text", () => {
-    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true, dockerRunning: true }]);
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true }] });
     document.body.innerHTML = html;
     const btn = document.querySelector("[data-local-asr-refresh]");
     expect(btn?.textContent).toContain("状態を再確認");
   });
 
   it("installed state shows uninstall button", () => {
-    const html = renderLocalAsrSection([{
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{
       ...baseEngine,
       dockerAvailable: true,
       dockerRunning: true,
       installed: true,
-    }]);
+    }] });
     document.body.innerHTML = html;
     const btn = document.querySelector("[data-uninstall-engine]");
     expect(btn).toBeTruthy();
@@ -476,15 +499,65 @@ describe("renderLocalAsrSection", () => {
   });
 
   it("not-installed state does not show uninstall button", () => {
-    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true, dockerRunning: true }]);
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true }] });
     document.body.innerHTML = html;
     expect(document.querySelector("[data-uninstall-engine]")).toBeNull();
   });
 
   it("no-docker state does not show uninstall button", () => {
-    const html = renderLocalAsrSection([{ ...baseEngine }]);
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine }] });
     document.body.innerHTML = html;
     expect(document.querySelector("[data-uninstall-engine]")).toBeNull();
+  });
+
+  it("docker-unavailable section shows Docker not installed message", () => {
+    const html = renderLocalAsrSection({ kind: "docker-unavailable" });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("Dockerがインストールされていません");
+    expect(document.querySelector("[data-local-asr-refresh]")).toBeTruthy();
+  });
+
+  it("docker-stopped section shows Docker not running message", () => {
+    const html = renderLocalAsrSection({ kind: "docker-stopped" });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("Docker Desktopが起動していません");
+    expect(document.querySelector("[data-local-asr-refresh]")).toBeTruthy();
+  });
+
+  it("load-error section shows custom message", () => {
+    const html = renderLocalAsrSection({ kind: "load-error", message: "テストエラーメッセージ" });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("テストエラーメッセージ");
+    expect(document.querySelector("[data-local-asr-refresh]")).toBeTruthy();
+  });
+
+  it("daemon-unavailable engine shows connection error", () => {
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true, errorKind: "daemon-unavailable", errorMessage: "test" }] });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("Docker Engineへ接続できませんでした");
+    expect(document.querySelector("[data-local-asr-refresh]")).toBeTruthy();
+    expect(document.querySelector(".btn-local-asr-install")).toBeNull();
+  });
+
+  it("inspect-error engine shows confirmation error", () => {
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true, errorKind: "inspect-error", errorMessage: "test" }] });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("インストール状態を確認できませんでした");
+    expect(document.querySelector("[data-local-asr-refresh]")).toBeTruthy();
+    expect(document.querySelector(".btn-local-asr-install")).toBeNull();
+  });
+
+  it("daemon-unavailable does not show install or uninstall buttons", () => {
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true, errorKind: "daemon-unavailable", errorMessage: "test" }] });
+    document.body.innerHTML = html;
+    expect(document.querySelector(".btn-local-asr-install")).toBeNull();
+    expect(document.querySelector("[data-uninstall-engine]")).toBeNull();
+  });
+
+  it("empty engines array shows info message", () => {
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [] });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("エンジンが定義されていません");
   });
 });
 

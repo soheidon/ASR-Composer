@@ -1316,6 +1316,51 @@ html, body {
 .app-dialog-ok:hover { opacity: 0.85; }
 .app-dialog-ok:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 
+.app-dialog-button-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.app-dialog-cancel {
+  padding: 8px 24px;
+  border: 1px solid var(--outline);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--on-surface);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.app-dialog-cancel:hover { background: var(--surface-container-high); }
+.app-dialog-cancel:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+.app-dialog-confirm {
+  padding: 8px 24px;
+  border: none;
+  border-radius: 8px;
+  background: var(--primary);
+  color: var(--on-primary);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.app-dialog-confirm:hover { opacity: 0.85; }
+.app-dialog-confirm:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+.app-dialog-confirm-danger {
+  background: var(--color-error, #ef4444);
+  color: #fff;
+}
+
+.app-dialog-confirm-danger:hover { opacity: 0.85; }
+
+.icon-warning { color: var(--color-warning, #f59e0b); }
+
 /* ---- Google STT ---- */
 
 .google-stt-adc-section {
