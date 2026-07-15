@@ -17,8 +17,8 @@ import {
   setButtonLoading,
   restoreButtonLoading,
 } from "./provider-config-save";
-import { renderDockerStatusContent, renderHuggingFaceTokenSection } from "./docker";
-import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult } from "./docker";
+import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection } from "./docker";
+import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus } from "./docker";
 
 const app = document.getElementById("app")!;
 
@@ -604,6 +604,15 @@ const settingsDockerPage = `
               ${renderHuggingFaceTokenSection(null)}
             </div>
           </div>
+          <div class="api-section">
+            <div class="api-section-header">
+              <h4 class="api-section-title">ローカルASR環境</h4>
+              <p class="api-section-desc">Dockerを利用して、音声データを外部へ送信せずに文字起こしします。</p>
+            </div>
+            <div class="local-asr-container" id="localAsrContainer">
+              ${renderLocalAsrSection(null)}
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -760,6 +769,7 @@ async function navigateTo(page: PageName) {
   } else if (page === "settings-docker") {
     void loadAndRenderDockerStatus();
     void loadAndRenderHuggingFaceToken();
+    void loadAndRenderLocalAsrStatus();
   }
 }
 
@@ -2325,6 +2335,24 @@ function bindHfTokenVisibility(): void {
       }
     });
   });
+}
+
+// ---- Local ASR Event Handlers ----
+
+async function loadAndRenderLocalAsrStatus(): Promise<void> {
+  const container = document.getElementById("localAsrContainer");
+  if (!container) return;
+
+  container.innerHTML = renderLocalAsrSection(null);
+  try {
+    const engines = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status");
+    if (!container.isConnected) return;
+    container.innerHTML = renderLocalAsrSection(engines);
+  } catch (e) {
+    console.error("local_asr_get_status error:", e);
+    if (!container.isConnected) return;
+    container.innerHTML = renderLocalAsrSection([]);
+  }
 }
 
 // ---- Init ----

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
-import { getDockerUiState, escapeHtml, renderDockerStatusContent, renderHuggingFaceTokenSection } from "./docker";
-import type { DockerStatus } from "./docker";
+import { getDockerUiState, escapeHtml, renderDockerStatusContent, renderHuggingFaceTokenSection, getLocalAsrUiState, renderLocalAsrSection } from "./docker";
+import type { DockerStatus, LocalAsrEngineStatus } from "./docker";
 
 // ---- getDockerUiState ----
 
@@ -256,5 +256,136 @@ describe("renderHuggingFaceTokenSection", () => {
     const html = renderHuggingFaceTokenSection(null);
     document.body.innerHTML = html;
     expect(document.querySelector(".hf-token-visibility")).toBeTruthy();
+  });
+});
+
+// ---- getLocalAsrUiState ----
+
+describe("getLocalAsrUiState", () => {
+  const baseEngine: LocalAsrEngineStatus = {
+    engine: "reazonspeech",
+    displayName: "ReazonSpeech",
+    installed: false,
+    imageName: "asr-composer-reazonspeech:cu126",
+    imageId: null,
+    environmentVersion: null,
+    modelName: null,
+    dockerAvailable: false,
+    dockerRunning: false,
+  };
+
+  it("null status returns 'loading'", () => {
+    expect(getLocalAsrUiState(null)).toBe("loading");
+  });
+
+  it("dockerAvailable:false → 'no-docker'", () => {
+    expect(getLocalAsrUiState({ ...baseEngine })).toBe("no-docker");
+  });
+
+  it("dockerAvailable:true, dockerRunning:false → 'docker-stopped'", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true })).toBe("docker-stopped");
+  });
+
+  it("dockerRunning:true, installed:false → 'not-installed'", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true })).toBe("not-installed");
+  });
+
+  it("dockerRunning:true, installed:true → 'installed'", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: true })).toBe("installed");
+  });
+});
+
+// ---- renderLocalAsrSection ----
+
+describe("renderLocalAsrSection", () => {
+  const baseEngine: LocalAsrEngineStatus = {
+    engine: "reazonspeech",
+    displayName: "ReazonSpeech",
+    installed: false,
+    imageName: "asr-composer-reazonspeech:cu126",
+    imageId: null,
+    environmentVersion: null,
+    modelName: null,
+    dockerAvailable: false,
+    dockerRunning: false,
+  };
+
+  it("null shows loading state", () => {
+    const html = renderLocalAsrSection(null);
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("状態を確認しています…");
+    expect(document.querySelector(".spin")).toBeTruthy();
+  });
+
+  it("empty array shows error state", () => {
+    const html = renderLocalAsrSection([]);
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("状態を取得できませんでした");
+  });
+
+  it("no-docker shows Docker not installed message", () => {
+    const html = renderLocalAsrSection([{ ...baseEngine }]);
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("Dockerがインストールされていません");
+    expect(document.body.textContent).toContain("ReazonSpeech");
+  });
+
+  it("docker-stopped shows Docker not running message", () => {
+    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true }]);
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("Docker Desktopが起動していません");
+  });
+
+  it("not-installed shows info badge", () => {
+    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true, dockerRunning: true }]);
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("未インストール");
+  });
+
+  it("installed shows check mark and engine name", () => {
+    const html = renderLocalAsrSection([{
+      ...baseEngine,
+      dockerAvailable: true,
+      dockerRunning: true,
+      installed: true,
+      environmentVersion: "1.0.0",
+      modelName: "reazon-research/reazonspeech-espnet-v2",
+    }]);
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("インストール済み");
+    expect(document.body.textContent).toContain("ReazonSpeech");
+    expect(document.body.textContent).toContain("1.0.0");
+    expect(document.body.textContent).toContain("reazon-research/reazonspeech-espnet-v2");
+  });
+
+  it("installed without optional fields omits details", () => {
+    const html = renderLocalAsrSection([{
+      ...baseEngine,
+      dockerAvailable: true,
+      dockerRunning: true,
+      installed: true,
+    }]);
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("インストール済み");
+    expect(document.body.textContent).not.toContain("環境バージョン");
+    expect(document.body.textContent).not.toContain("モデル:");
+  });
+
+  it("engine displayName is rendered", () => {
+    const html = renderLocalAsrSection([{ ...baseEngine, dockerAvailable: true, dockerRunning: true }]);
+    document.body.innerHTML = html;
+    expect(document.querySelector(".local-asr-engine-name")?.textContent).toContain("ReazonSpeech");
+  });
+
+  it("installed version info is HTML-escaped", () => {
+    const html = renderLocalAsrSection([{
+      ...baseEngine,
+      dockerAvailable: true,
+      dockerRunning: true,
+      installed: true,
+      modelName: '<script>alert("xss")</script>',
+    }]);
+    expect(html).not.toContain("<script>");
+    expect(html).toContain("&lt;script&gt;");
   });
 });

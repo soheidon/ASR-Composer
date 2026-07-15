@@ -206,3 +206,119 @@ export function renderHuggingFaceTokenSection(status: HuggingFaceTokenStatus | n
       </div>
     </div>`;
 }
+
+// ---- Local ASR Engine ----
+
+export interface LocalAsrEngineStatus {
+  engine: string;
+  displayName: string;
+  installed: boolean;
+  imageName: string;
+  imageId: string | null;
+  environmentVersion: string | null;
+  modelName: string | null;
+  dockerAvailable: boolean;
+  dockerRunning: boolean;
+}
+
+export type LocalAsrUiState = "loading" | "error" | "no-docker" | "docker-stopped" | "not-installed" | "installed";
+
+export function getLocalAsrUiState(status: LocalAsrEngineStatus | null): LocalAsrUiState {
+  if (!status) return "loading";
+  if (!status.dockerAvailable) return "no-docker";
+  if (!status.dockerRunning) return "docker-stopped";
+  if (!status.installed) return "not-installed";
+  return "installed";
+}
+
+export function renderLocalAsrSection(engines: LocalAsrEngineStatus[] | null): string {
+  if (engines === null) {
+    return `
+      <div class="local-asr-engine-card">
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined spin" style="font-size: 18px; color: var(--color-text-secondary);">progress_activity</span>
+          <span>状態を確認しています…</span>
+        </div>
+      </div>`;
+  }
+
+  if (engines.length === 0) {
+    return `
+      <div class="local-asr-engine-card">
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
+          <span>状態を取得できませんでした</span>
+        </div>
+      </div>`;
+  }
+
+  return engines.map(e => renderLocalAsrEngineCard(e)).join("");
+}
+
+function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
+  const state = getLocalAsrUiState(e);
+
+  let statusHtml: string;
+  switch (state) {
+    case "loading":
+      statusHtml = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined spin" style="font-size: 18px; color: var(--color-text-secondary);">progress_activity</span>
+          <span>状態を確認しています…</span>
+        </div>`;
+      break;
+    case "no-docker":
+      statusHtml = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
+          <span>Dockerがインストールされていません</span>
+        </div>
+        <p class="docker-status-desc">ローカルASRを使用するには、Docker Desktopのインストールが必要です。上の「Docker Desktop」セクションを確認してください。</p>`;
+      break;
+    case "docker-stopped":
+      statusHtml = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-warning, #f59e0b);">warning</span>
+          <span>Docker Desktopが起動していません</span>
+        </div>
+        <p class="docker-status-desc">Docker Desktopを起動してから、ページを再読み込みしてください。</p>`;
+      break;
+    case "not-installed":
+      statusHtml = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--outline);">info</span>
+          <span>未インストール</span>
+        </div>`;
+      break;
+    case "installed": {
+      const details: string[] = [];
+      if (e.environmentVersion) details.push(`環境バージョン: ${escapeHtml(e.environmentVersion)}`);
+      if (e.modelName) details.push(`モデル: ${escapeHtml(e.modelName)}`);
+      statusHtml = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-success, #22c55e);">check_circle</span>
+          <span>インストール済み</span>
+        </div>
+        ${details.length > 0 ? `<div class="local-asr-details">${details.map(d => `<p class="docker-detail-item">${d}</p>`).join("")}</div>` : ""}`;
+      break;
+    }
+    case "error":
+      statusHtml = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
+          <span>状態を取得できませんでした</span>
+        </div>`;
+      break;
+  }
+
+  return `
+    <div class="local-asr-engine-card">
+      <div class="local-asr-engine-header">
+        <span class="local-asr-engine-name">${escapeHtml(e.displayName)}</span>
+        <span class="local-asr-engine-desc">日本語音声認識</span>
+      </div>
+      <div class="local-asr-engine-status">
+        ${statusHtml}
+      </div>
+    </div>`;
+}

@@ -1731,3 +1731,41 @@ html, body {
   font-size: 12px;
   color: var(--outline);
 }
+
+/* ---- Local ASR Engine ---- */
+
+.local-asr-engine-card {
+  padding: 16px 20px;
+  border: 1px solid var(--outline-variant);
+  border-radius: 8px;
+  background: var(--surface-container-lowest);
+}
+
+.local-asr-engine-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.local-asr-engine-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--on-surface);
+}
+
+.local-asr-engine-desc {
+  font-size: 12px;
+  color: var(--outline);
+}
+
+.local-asr-engine-status {
+  /* 子要素は docker-status-row / docker-status-desc を再利用 */
+}
+
+.local-asr-details {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
