@@ -1779,6 +1779,12 @@ html, body {
 
 /* ---- Local ASR Engine ---- */
 
+.local-asr-container {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .local-asr-engine-card {
   padding: 16px 20px;
   border: 1px solid var(--outline-variant);
