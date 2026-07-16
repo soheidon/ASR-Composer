@@ -35,13 +35,36 @@ pub struct ProviderSettings {
     pub options: Option<HashMap<String, String>>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+fn default_speaker_diarization() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct AppSettings {
     pub providers: HashMap<String, ProviderSettings>,
     #[serde(default)]
     pub asr_mode: String, // "cloud" | "local"
     #[serde(default)]
     pub asr_engine: String, // provider ID, local engine ID, or empty
+    #[serde(default)]
+    pub asr_languages: HashMap<String, String>, // engine_id -> language code
+    #[serde(default = "default_speaker_diarization")]
+    pub speaker_diarization: bool,
+    #[serde(default)]
+    pub num_speakers: String, // "auto" or numeric string like "2"
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            providers: HashMap::new(),
+            asr_mode: String::new(),
+            asr_engine: String::new(),
+            asr_languages: HashMap::new(),
+            speaker_diarization: true,
+            num_speakers: "auto".to_string(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -216,6 +239,9 @@ fn save_asr_selection(
     app: tauri::AppHandle,
     mode: String,
     engine: String,
+    language: String,
+    speaker_diarization: bool,
+    num_speakers: String,
 ) -> Result<(), String> {
     if mode != "cloud" && mode != "local" {
         return Err(format!("Invalid ASR mode: {mode}"));
@@ -223,7 +249,12 @@ fn save_asr_selection(
     let path = settings_path(&app);
     let mut settings = load_settings(&app);
     settings.asr_mode = mode;
-    settings.asr_engine = engine;
+    settings.asr_engine = engine.clone();
+    if !engine.is_empty() {
+        settings.asr_languages.insert(engine, language);
+    }
+    settings.speaker_diarization = speaker_diarization;
+    settings.num_speakers = num_speakers;
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     fs::write(&path, json).map_err(|e| e.to_string())
 }
@@ -6053,6 +6084,7 @@ mod tests {
             providers: HashMap::new(),
             asr_mode: String::new(),
             asr_engine: "google_stt".to_string(),
+            ..Default::default()
         };
         migrate_settings(&mut settings);
         assert_eq!(settings.asr_mode, "cloud");
@@ -6064,6 +6096,7 @@ mod tests {
             providers: HashMap::new(),
             asr_mode: String::new(),
             asr_engine: "reazonspeech".to_string(),
+            ..Default::default()
         };
         migrate_settings(&mut settings);
         assert_eq!(settings.asr_mode, "local");
@@ -6075,6 +6108,7 @@ mod tests {
             providers: HashMap::new(),
             asr_mode: String::new(),
             asr_engine: "unknown_engine".to_string(),
+            ..Default::default()
         };
         migrate_settings(&mut settings);
         assert_eq!(settings.asr_mode, "cloud");
@@ -6086,6 +6120,7 @@ mod tests {
             providers: HashMap::new(),
             asr_mode: String::new(),
             asr_engine: String::new(),
+            ..Default::default()
         };
         migrate_settings(&mut settings);
         assert_eq!(settings.asr_mode, "cloud");
@@ -6097,6 +6132,7 @@ mod tests {
             providers: HashMap::new(),
             asr_mode: "local".to_string(),
             asr_engine: "google_stt".to_string(),
+            ..Default::default()
         };
         migrate_settings(&mut settings);
         assert_eq!(settings.asr_mode, "local");
@@ -6110,6 +6146,7 @@ mod tests {
             providers: HashMap::new(),
             asr_mode: "cloud".to_string(),
             asr_engine: "openai_audio".to_string(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"asr_mode\""));
@@ -6139,5 +6176,151 @@ mod tests {
     fn test_save_asr_selection_valid_modes() {
         assert!("cloud" == "cloud" || "cloud" == "local");
         assert!("local" == "cloud" || "local" == "local");
+    }
+
+    // ---- asr_languages ----
+
+    #[test]
+    fn test_asr_languages_serialization() {
+        let mut settings = AppSettings::default();
+        settings.asr_languages.insert("qwen3-asr".to_string(), "en".to_string());
+        settings.asr_languages.insert("reazonspeech".to_string(), "ja".to_string());
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"asr_languages\""));
+        assert!(json.contains("\"qwen3-asr\""));
+        assert!(json.contains("\"en\""));
+    }
+
+    #[test]
+    fn test_asr_languages_deserialization_missing() {
+        let json = r#"{"providers":{}}"#;
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(settings.asr_languages.is_empty());
+    }
+
+    #[test]
+    fn test_asr_languages_roundtrip() {
+        let mut settings = AppSettings::default();
+        settings.asr_languages.insert("qwen3-asr".to_string(), "auto".to_string());
+        settings.asr_languages.insert("kotoba-whisper".to_string(), "ja".to_string());
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.asr_languages.get("qwen3-asr").unwrap(), "auto");
+        assert_eq!(restored.asr_languages.get("kotoba-whisper").unwrap(), "ja");
+    }
+
+    #[test]
+    fn test_asr_languages_engine_specific_save() {
+        // エンジン別言語保存の動作確認
+        let mut settings = AppSettings::default();
+        settings.asr_languages.insert("qwen3-asr".to_string(), "en".to_string());
+        settings.asr_languages.insert("reazonspeech".to_string(), "ja".to_string());
+        // qwen3-asr の言語だけ更新
+        settings.asr_languages.insert("qwen3-asr".to_string(), "zh".to_string());
+        assert_eq!(settings.asr_languages.get("qwen3-asr").unwrap(), "zh");
+        assert_eq!(settings.asr_languages.get("reazonspeech").unwrap(), "ja");
+    }
+
+    // ---- speaker_diarization ----
+
+    #[test]
+    fn app_settings_default_enables_speaker_diarization() {
+        let settings = AppSettings::default();
+        assert!(settings.speaker_diarization);
+    }
+
+    #[test]
+    fn test_speaker_diarization_old_json_defaults_true() {
+        let json = r#"{"providers":{}}"#;
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(settings.speaker_diarization);
+    }
+
+    #[test]
+    fn test_speaker_diarization_false_roundtrip() {
+        let mut settings = AppSettings::default();
+        settings.speaker_diarization = false;
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(!restored.speaker_diarization);
+    }
+
+    #[test]
+    fn test_speaker_diarization_true_roundtrip() {
+        let mut settings = AppSettings::default();
+        settings.speaker_diarization = true;
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(restored.speaker_diarization);
+    }
+
+    #[test]
+    fn test_speaker_diarization_preserves_other_fields() {
+        let mut settings = AppSettings::default();
+        settings.asr_mode = "local".to_string();
+        settings.asr_engine = "qwen3-asr".to_string();
+        settings.asr_languages.insert("qwen3-asr".to_string(), "en".to_string());
+        settings.speaker_diarization = false;
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(!restored.speaker_diarization);
+        assert_eq!(restored.asr_mode, "local");
+        assert_eq!(restored.asr_engine, "qwen3-asr");
+        assert_eq!(restored.asr_languages.get("qwen3-asr").unwrap(), "en");
+    }
+
+    #[test]
+    fn test_speaker_diarization_serialization_key() {
+        let settings = AppSettings::default();
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"speaker_diarization\""));
+        assert!(json.contains("true"));
+    }
+
+    // ---- num_speakers ----
+
+    #[test]
+    fn test_num_speakers_default_is_auto() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.num_speakers, "auto");
+    }
+
+    #[test]
+    fn test_num_speakers_old_json_defaults_empty() {
+        let json = r#"{"providers":{}}"#;
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        // #[serde(default)] で空文字列
+        assert_eq!(settings.num_speakers, "");
+    }
+
+    #[test]
+    fn test_num_speakers_roundtrip() {
+        let mut settings = AppSettings::default();
+        settings.num_speakers = "3".to_string();
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.num_speakers, "3");
+    }
+
+    #[test]
+    fn test_num_speakers_auto_roundtrip() {
+        let mut settings = AppSettings::default();
+        settings.num_speakers = "auto".to_string();
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.num_speakers, "auto");
+    }
+
+    #[test]
+    fn test_num_speakers_preserves_other_fields() {
+        let mut settings = AppSettings::default();
+        settings.asr_mode = "local".to_string();
+        settings.speaker_diarization = false;
+        settings.num_speakers = "4".to_string();
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.num_speakers, "4");
+        assert_eq!(restored.asr_mode, "local");
+        assert!(!restored.speaker_diarization);
     }
 }

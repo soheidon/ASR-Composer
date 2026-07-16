@@ -416,6 +416,87 @@ html, body {
   flex: 0 0 auto;
 }
 
+.engine-select-narrow {
+  max-width: 200px;
+  flex: 0 1 200px;
+}
+
+.engine-select-compact {
+  max-width: 100px;
+  flex: 0 1 100px;
+}
+
+.field-label-inline {
+  font-family: var(--font-body);
+  font-size: 13px;
+  color: var(--on-surface-variant);
+  line-height: 20px;
+  margin-left: 12px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* ---- Toggle Switch ---- */
+
+.toggle-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: var(--outline);
+  border-radius: 24px;
+  transition: background 0.2s;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background: var(--surface);
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background: var(--primary);
+}
+
+.toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(20px);
+}
+
+.toggle-label {
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--on-surface);
+  line-height: 20px;
+  user-select: none;
+}
+
 .btn-icon {
   padding: 10px;
   background: var(--surface-container-low);

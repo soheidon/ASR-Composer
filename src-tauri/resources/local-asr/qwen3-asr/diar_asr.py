@@ -158,7 +158,8 @@ def main() -> None:
 
     model_diar = os.getenv("MODEL_DIAR", "pyannote/speaker-diarization-3.1")
     model_asr = os.getenv("MODEL_ASR", "Qwen/Qwen3-ASR-1.7B")
-    asr_language = os.getenv("ASR_LANGUAGE", "Japanese")
+    asr_language_env = os.getenv("ASR_LANGUAGE", "Japanese").strip()
+    asr_language = None if asr_language_env.lower() in {"auto", ""} else asr_language_env
     asr_max_new_tokens_env = os.getenv("ASR_MAX_NEW_TOKENS", "256")
     try:
         asr_max_new_tokens = int(asr_max_new_tokens_env)

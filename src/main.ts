@@ -376,17 +376,35 @@ const transcribePage = `
         </div>
         <div class="engine-row">
           <label class="field-label">音声の言語</label>
-          <div class="engine-select-wrap">
+          <div class="engine-select-wrap engine-select-narrow">
             <select class="engine-select" id="langSelect">
-              <option value="auto">自動検出</option>
-              <option value="ja" selected>日本語</option>
-              <option value="en">英語</option>
-              <option value="zh">中国語</option>
-              <option value="ko">韓国語</option>
+              <!-- TypeScriptで動的に生成 -->
             </select>
             <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
           </div>
-          <div class="btn-icon-placeholder" aria-hidden="true"></div>
+          <label class="field-label-inline" id="speakerDiarizationLabelWrap">話者分離</label>
+          <div class="toggle-wrap">
+            <label class="toggle-switch">
+              <input type="checkbox" id="speakerDiarizationToggle" checked>
+              <span class="toggle-slider"></span>
+            </label>
+            <span class="toggle-label" id="speakerDiarizationLabel">する</span>
+          </div>
+          <label class="field-label-inline" id="numSpeakersLabel">話者数</label>
+          <div class="engine-select-wrap engine-select-compact" id="numSpeakersRow">
+            <select class="engine-select" id="numSpeakersSelect">
+              <option value="auto">自動</option>
+              <option value="1">1人</option>
+              <option value="2">2人</option>
+              <option value="3">3人</option>
+              <option value="4">4人</option>
+              <option value="5">5人</option>
+              <option value="6">6人</option>
+              <option value="7">7人</option>
+              <option value="8">8人</option>
+            </select>
+            <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+          </div>
         </div>
       </section>
 
@@ -891,6 +909,9 @@ function hasSelectableOption(select: HTMLSelectElement, value: string): boolean 
 async function saveAsrSelection(): Promise<void> {
   const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement | null;
   const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement | null;
+  const languageSelect = document.getElementById("langSelect") as HTMLSelectElement | null;
+  const speakerToggle = document.getElementById("speakerDiarizationToggle") as HTMLInputElement | null;
+  const numSpeakersSelect = document.getElementById("numSpeakersSelect") as HTMLSelectElement | null;
   if (!modeSelect || !engineSelect) {
     return;
   }
@@ -898,6 +919,9 @@ async function saveAsrSelection(): Promise<void> {
     await invokeTauri("save_asr_selection", {
       mode: modeSelect.value,
       engine: engineSelect.value || "",
+      language: languageSelect?.value || "",
+      speaker_diarization: speakerToggle?.checked ?? true,
+      num_speakers: numSpeakersSelect?.value || "auto",
     });
   } catch (error) {
     console.error("save_asr_selection error:", error);
@@ -932,18 +956,54 @@ async function restoreAsrSelection(): Promise<void> {
   }
 
   const restoredEngine = engineSelect.value || "";
+  const savedLanguage = settings.asr_languages?.[restoredEngine] ?? "";
+  populateLanguagesForEngine(restoredEngine, savedLanguage);
+
+  const speakerToggle = document.getElementById("speakerDiarizationToggle") as HTMLInputElement | null;
+  if (speakerToggle) {
+    speakerToggle.checked = settings.speaker_diarization !== false;
+    const speakerLabel = document.getElementById("speakerDiarizationLabel");
+    if (speakerLabel) {
+      speakerLabel.textContent = speakerToggle.checked ? "する" : "しない";
+    }
+  }
+
+  const numSpeakersSelect = document.getElementById("numSpeakersSelect") as HTMLSelectElement | null;
+  const numSpeakersRow = document.getElementById("numSpeakersRow");
+  if (numSpeakersSelect) {
+    const savedNum = settings.num_speakers || "auto";
+    const hasOption = Array.from(numSpeakersSelect.options).some((o) => o.value === savedNum);
+    numSpeakersSelect.value = hasOption ? savedNum : "auto";
+    const isEnabled = speakerToggle?.checked ?? true;
+    numSpeakersSelect.disabled = !isEnabled;
+    if (numSpeakersRow) {
+      numSpeakersRow.style.opacity = isEnabled ? "" : "0.5";
+    }
+  }
+
   if (settings.asr_mode !== savedMode || settings.asr_engine !== restoredEngine) {
     await saveAsrSelection();
+  }
+}
+
+async function loadAsrLanguages(): Promise<Record<string, string>> {
+  try {
+    const settings = await invokeTauri<SavedAppSettings>("load_api_settings");
+    return settings.asr_languages ?? {};
+  } catch {
+    return {};
   }
 }
 
 function bindAsrModeSelect(): void {
   const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement | null;
   const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement | null;
+  const languageSelect = document.getElementById("langSelect") as HTMLSelectElement | null;
   if (!modeSelect || !engineSelect) {
     return;
   }
   modeSelect.addEventListener("change", async () => {
+    const savedLanguages = await loadAsrLanguages();
     if (modeSelect.value === "local") {
       lastCloudEngine = engineSelect.value || "";
       await populateLocalEngines(engineSelect);
@@ -959,16 +1019,52 @@ function bindAsrModeSelect(): void {
       }
       lastCloudEngine = engineSelect.value || "";
     }
+    const currentEngine = engineSelect.value || "";
+    const savedLanguage = savedLanguages[currentEngine] ?? "";
+    populateLanguagesForEngine(currentEngine, savedLanguage);
     await saveAsrSelection();
   });
-  engineSelect.addEventListener("change", () => {
+  engineSelect.addEventListener("change", async () => {
     if (modeSelect.value === "local") {
       lastLocalEngine = engineSelect.value || "";
     } else {
       lastCloudEngine = engineSelect.value || "";
     }
+    const currentEngine = engineSelect.value || "";
+    const savedLanguages = await loadAsrLanguages();
+    const savedLanguage = savedLanguages[currentEngine] ?? "";
+    populateLanguagesForEngine(currentEngine, savedLanguage);
     void saveAsrSelection();
   });
+  if (languageSelect) {
+    languageSelect.addEventListener("change", () => {
+      void saveAsrSelection();
+    });
+  }
+  const speakerToggle = document.getElementById("speakerDiarizationToggle") as HTMLInputElement | null;
+  if (speakerToggle) {
+    speakerToggle.addEventListener("change", () => {
+      const speakerLabel = document.getElementById("speakerDiarizationLabel");
+      if (speakerLabel) {
+        speakerLabel.textContent = speakerToggle.checked ? "する" : "しない";
+      }
+      const numSpeakersSelect = document.getElementById("numSpeakersSelect") as HTMLSelectElement | null;
+      const numSpeakersRow = document.getElementById("numSpeakersRow");
+      if (numSpeakersSelect) {
+        numSpeakersSelect.disabled = !speakerToggle.checked;
+      }
+      if (numSpeakersRow) {
+        numSpeakersRow.style.opacity = speakerToggle.checked ? "" : "0.5";
+      }
+      void saveAsrSelection();
+    });
+  }
+  const numSpeakersSelect = document.getElementById("numSpeakersSelect") as HTMLSelectElement | null;
+  if (numSpeakersSelect) {
+    numSpeakersSelect.addEventListener("change", () => {
+      void saveAsrSelection();
+    });
+  }
 }
 
 function bindAsrEngineSettingsButton(): void {
@@ -981,6 +1077,101 @@ function bindAsrEngineSettingsButton(): void {
       void navigateTo("settings");
     }
   });
+}
+
+// ---- ASR Language Definitions ----
+
+type AsrLanguageDefinition = {
+  code: string;
+  label: string;
+  engineValue: string | null;
+};
+
+const CLOUD_ASR_LANGUAGES: AsrLanguageDefinition[] = [
+  { code: "auto", label: "自動検出", engineValue: null },
+  { code: "ja", label: "日本語", engineValue: "ja" },
+  { code: "en", label: "英語", engineValue: "en" },
+  { code: "zh", label: "中国語", engineValue: "zh" },
+  { code: "ko", label: "韓国語", engineValue: "ko" },
+];
+
+const LOCAL_ASR_LANGUAGES: Record<string, AsrLanguageDefinition[]> = {
+  reazonspeech: [
+    { code: "ja", label: "日本語", engineValue: "ja" },
+  ],
+  "kotoba-whisper": [
+    { code: "ja", label: "日本語", engineValue: "japanese" },
+  ],
+  "qwen3-asr": [
+    { code: "auto", label: "自動判定", engineValue: null },
+    { code: "ja", label: "日本語", engineValue: "Japanese" },
+    { code: "en", label: "英語", engineValue: "English" },
+    { code: "zh", label: "中国語", engineValue: "Chinese" },
+    { code: "yue", label: "広東語", engineValue: "Cantonese" },
+    { code: "ko", label: "韓国語", engineValue: "Korean" },
+    { code: "fr", label: "フランス語", engineValue: "French" },
+    { code: "de", label: "ドイツ語", engineValue: "German" },
+    { code: "es", label: "スペイン語", engineValue: "Spanish" },
+    { code: "pt", label: "ポルトガル語", engineValue: "Portuguese" },
+    { code: "ar", label: "アラビア語", engineValue: "Arabic" },
+    { code: "id", label: "インドネシア語", engineValue: "Indonesian" },
+    { code: "it", label: "イタリア語", engineValue: "Italian" },
+    { code: "ru", label: "ロシア語", engineValue: "Russian" },
+    { code: "th", label: "タイ語", engineValue: "Thai" },
+    { code: "vi", label: "ベトナム語", engineValue: "Vietnamese" },
+    { code: "tr", label: "トルコ語", engineValue: "Turkish" },
+    { code: "hi", label: "ヒンディー語", engineValue: "Hindi" },
+    { code: "ms", label: "マレー語", engineValue: "Malay" },
+    { code: "nl", label: "オランダ語", engineValue: "Dutch" },
+    { code: "sv", label: "スウェーデン語", engineValue: "Swedish" },
+    { code: "da", label: "デンマーク語", engineValue: "Danish" },
+    { code: "fi", label: "フィンランド語", engineValue: "Finnish" },
+    { code: "pl", label: "ポーランド語", engineValue: "Polish" },
+    { code: "cs", label: "チェコ語", engineValue: "Czech" },
+    { code: "fil", label: "フィリピン語", engineValue: "Filipino" },
+    { code: "fa", label: "ペルシャ語", engineValue: "Persian" },
+    { code: "el", label: "ギリシャ語", engineValue: "Greek" },
+    { code: "hu", label: "ハンガリー語", engineValue: "Hungarian" },
+    { code: "mk", label: "マケドニア語", engineValue: "Macedonian" },
+    { code: "ro", label: "ルーマニア語", engineValue: "Romanian" },
+  ],
+};
+
+function populateLanguagesForEngine(engineId: string, savedCode?: string): void {
+  const languageSelect = document.getElementById("langSelect") as HTMLSelectElement | null;
+  if (!languageSelect) {
+    return;
+  }
+  const languages = LOCAL_ASR_LANGUAGES[engineId];
+  if (!languages || languages.length === 0) {
+    // クラウド/APIモードの既定表示
+    languageSelect.innerHTML = CLOUD_ASR_LANGUAGES
+      .map(
+        (lang) =>
+          `<option value="${escapeHtml(lang.code)}">${escapeHtml(lang.label)}</option>`,
+      )
+      .join("");
+    const savedExists = CLOUD_ASR_LANGUAGES.some((lang) => lang.code === savedCode);
+    if (savedExists && savedCode) {
+      languageSelect.value = savedCode;
+    } else {
+      languageSelect.value = "ja";
+    }
+    return;
+  }
+  languageSelect.innerHTML = languages
+    .map(
+      (lang) =>
+        `<option value="${escapeHtml(lang.code)}">${escapeHtml(lang.label)}</option>`,
+    )
+    .join("");
+  const savedExists = languages.some((lang) => lang.code === savedCode);
+  if (savedExists && savedCode) {
+    languageSelect.value = savedCode;
+    return;
+  }
+  const japanese = languages.find((lang) => lang.code === "ja");
+  languageSelect.value = japanese?.code ?? languages[0].code;
 }
 
 async function navigateTo(page: PageName) {
@@ -1025,9 +1216,9 @@ async function navigateTo(page: PageName) {
     void loadAndRenderHuggingFaceToken();
     bindLocalAsrDelegation();
   } else if (page === "transcribe") {
+    await restoreAsrSelection();
     bindAsrModeSelect();
     bindAsrEngineSettingsButton();
-    await restoreAsrSelection();
   }
 }
 
@@ -1174,6 +1365,9 @@ interface SavedAppSettings {
   providers: Record<string, SavedProviderSettings>;
   asr_mode: string;
   asr_engine: string;
+  asr_languages: Record<string, string>;
+  speaker_diarization: boolean;
+  num_speakers: string;
 }
 
 async function loadSavedSettings() {
