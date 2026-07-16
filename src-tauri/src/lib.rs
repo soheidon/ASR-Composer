@@ -2376,6 +2376,11 @@ fn local_asr_engine_defs() -> Vec<LocalAsrEngineDef> {
             display_name: "Kotoba Whisper v2.2",
             image_name: "asr-composer-kotoba-whisper:cu126",
         },
+        LocalAsrEngineDef {
+            engine: "qwen3-asr",
+            display_name: "Qwen3 ASR",
+            image_name: "asr-composer-qwen3-asr:cu126",
+        },
     ]
 }
 
