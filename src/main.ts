@@ -17,7 +17,7 @@ import {
   setButtonLoading,
   restoreButtonLoading,
 } from "./provider-config-save";
-import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection, renderLocalAsrInstallCache, getLocalAsrProgressDisplay } from "./docker";
+import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection, renderLocalAsrInstallCache, renderLocalAsrEngineCard, getLocalAsrProgressDisplay } from "./docker";
 import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus, LocalAsrProgress, LocalAsrInstallState } from "./docker";
 
 const app = document.getElementById("app")!;
@@ -2435,10 +2435,17 @@ function bindLocalAsrDelegation(): void {
     }
 
     if (target.hasAttribute("data-local-asr-refresh")) {
-      target.disabled = true;
-      void loadDockerPageStatuses().finally(() => {
-        if (target.isConnected) target.disabled = false;
-      });
+      const card = target.closest<HTMLElement>("[data-local-asr-engine]");
+      const engine = card?.dataset.localAsrEngine;
+      if (engine) {
+        void refreshLocalAsrEngineStatus(engine);
+      } else {
+        // カード外の再確認ボタン（セクション全体）
+        target.disabled = true;
+        void loadDockerPageStatuses().finally(() => {
+          if (target.isConnected) target.disabled = false;
+        });
+      }
       return;
     }
 
@@ -2618,6 +2625,56 @@ async function fetchLocalAsrStatuses(): Promise<LocalAsrEngineStatus[]> {
   cachedLocalAsrStatuses = statuses;
   reconcileConfirmedInstalls(statuses);
   return statuses;
+}
+
+function updateCachedLocalAsrStatus(nextStatus: LocalAsrEngineStatus): void {
+  const index = cachedLocalAsrStatuses.findIndex(s => s.engine === nextStatus.engine);
+  if (index >= 0) {
+    cachedLocalAsrStatuses[index] = nextStatus;
+  } else {
+    cachedLocalAsrStatuses.push(nextStatus);
+  }
+  reconcileConfirmedInstalls([nextStatus]);
+}
+
+async function fetchLocalAsrEngineStatus(engine: string): Promise<LocalAsrEngineStatus> {
+  const status = await invokeTauri<LocalAsrEngineStatus>("local_asr_get_engine_status", { engine });
+  updateCachedLocalAsrStatus(status);
+  return status;
+}
+
+async function refreshLocalAsrEngineStatus(engine: string): Promise<void> {
+  const container = document.getElementById("localAsrContainer");
+  const card = container?.querySelector<HTMLElement>(`[data-local-asr-engine="${CSS.escape(engine)}"]`);
+  if (!card) return;
+
+  const refreshBtn = card.querySelector<HTMLButtonElement>("[data-local-asr-refresh]");
+  if (refreshBtn) {
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = "確認中…";
+  }
+
+  const previousStatus = cachedLocalAsrStatuses.find(s => s.engine === engine);
+
+  try {
+    const status = await fetchLocalAsrEngineStatus(engine);
+    const latestCard = container?.querySelector<HTMLElement>(`[data-local-asr-engine="${CSS.escape(engine)}"]`);
+    if (!latestCard?.isConnected) return;
+
+    latestCard.outerHTML = renderLocalAsrEngineCard(status, localAsrInstallStates.get(engine));
+  } catch (e) {
+    console.error(`local_asr_get_engine_status error (${engine}):`, e);
+    const latestCard = container?.querySelector<HTMLElement>(`[data-local-asr-engine="${CSS.escape(engine)}"]`);
+    if (!latestCard?.isConnected) return;
+
+    // invoke失敗時は前の状態を保持し、エラーメッセージだけ表示
+    if (previousStatus) {
+      latestCard.outerHTML = renderLocalAsrEngineCard(
+        { ...previousStatus, errorKind: "inspect-error", errorMessage: "状態を確認できませんでした" },
+        localAsrInstallStates.get(engine),
+      );
+    }
+  }
 }
 
 async function confirmLocalAsrInstalled(engine: string): Promise<boolean> {

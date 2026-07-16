@@ -410,7 +410,7 @@ export function renderLocalAsrProgressBar(percent: number, message: string): str
     </div>`;
 }
 
-function renderLocalAsrEngineCard(e: LocalAsrEngineStatus, installState?: LocalAsrInstallState): string {
+export function renderLocalAsrEngineCard(e: LocalAsrEngineStatus, installState?: LocalAsrInstallState): string {
   const state = getLocalAsrUiState(e, installState);
 
   let statusHtml: string;
@@ -550,7 +550,7 @@ function renderLocalAsrEngineCard(e: LocalAsrEngineStatus, installState?: LocalA
   }
 
   return `
-    <div class="local-asr-engine-card">
+    <div class="local-asr-engine-card" data-local-asr-engine="${escapeHtml(e.engine)}">
       <div class="local-asr-engine-header">
         <span class="local-asr-engine-name">${escapeHtml(e.displayName)}</span>
         <span class="local-asr-engine-desc">日本語音声認識</span>

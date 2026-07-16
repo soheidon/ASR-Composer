@@ -2635,6 +2635,49 @@ async fn local_asr_get_status() -> Vec<LocalAsrEngineStatus> {
         .unwrap_or_else(|_| unavailable_local_asr_statuses())
 }
 
+fn local_asr_get_engine_status_sync(engine: &str) -> Result<LocalAsrEngineStatus, String> {
+    let def = local_asr_engine_defs()
+        .into_iter()
+        .find(|d| d.engine == engine)
+        .ok_or_else(|| format!("不明なローカルASRエンジンです: {engine}"))?;
+
+    let docker_path = match find_docker_cli() {
+        Some(path) => path,
+        None => {
+            return Ok(LocalAsrEngineStatus {
+                engine: def.engine.to_string(),
+                display_name: def.display_name.to_string(),
+                installed: false,
+                image_name: def.image_name.to_string(),
+                image_id: None,
+                environment_version: None,
+                model_name: None,
+                docker_available: false,
+                docker_running: false,
+                error_kind: None,
+                error_message: None,
+            });
+        }
+    };
+
+    let docker_running = std::process::Command::new(&docker_path)
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    Ok(get_single_engine_status(&docker_path, docker_running, &def))
+}
+
+#[tauri::command]
+async fn local_asr_get_engine_status(engine: String) -> Result<LocalAsrEngineStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || local_asr_get_engine_status_sync(&engine))
+        .await
+        .map_err(|e| format!("ローカルASR状態確認タスクに失敗しました: {e}"))?
+}
+
 // ---- Local ASR Install ----
 
 #[derive(Debug, Clone, Serialize)]
@@ -3010,6 +3053,7 @@ pub fn run() {
             hf_token_save,
             hf_token_delete,
             local_asr_get_status,
+            local_asr_get_engine_status,
             local_asr_install,
             local_asr_uninstall
         ])
