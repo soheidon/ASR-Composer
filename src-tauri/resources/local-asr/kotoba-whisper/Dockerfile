@@ -13,15 +13,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ---- 単一venv: torch ----
 RUN echo "ASR_PROGRESS:installing-torch" \
     && python3.11 -m venv /opt/venv \
-    && /opt/venv/bin/pip install -U pip setuptools wheel \
+    && /opt/venv/bin/pip install --no-cache-dir -U pip setuptools wheel \
     && /opt/venv/bin/pip install \
+       --no-cache-dir \
        --index-url https://download.pytorch.org/whl/cu126 \
        torch==2.8.0 torchaudio==2.8.0 \
     && /opt/venv/bin/python -c \
        "import torch, torchaudio; \
         assert torch.__version__ == '2.8.0+cu126'; \
         assert torchaudio.__version__ == '2.8.0+cu126'; \
-        print(f'torch={torch.__version__} torchaudio={torchaudio.__version__}')"
+        print(f'torch={torch.__version__} torchaudio={torchaudio.__version__}')" \
+    && rm -rf /root/.cache/pip /tmp/*
 
 # ---- ASR依存（kotoba固有） ----
 COPY kotoba-whisper/requirements.txt /tmp/requirements.txt

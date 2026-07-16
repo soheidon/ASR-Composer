@@ -8,26 +8,28 @@ ARG PIP_VERSION=25.1.1
 ARG SETUPTOOLS_VERSION=80.9.0
 ARG WHEEL_VERSION=0.45.1
 
-# constraints配置（numpy/torch/torchaudioのバージョンを全pipへ固定）
-COPY common/constraints-reazonspeech.txt /tmp/constraints.txt
-
 # ---- 単一venv: torch ----
 RUN echo "ASR_PROGRESS:installing-torch" \
     && python3.11 -m venv /opt/venv \
-    && /opt/venv/bin/pip install \
+    && /opt/venv/bin/pip install --no-cache-dir \
        pip==${PIP_VERSION} \
        setuptools==${SETUPTOOLS_VERSION} \
        wheel==${WHEEL_VERSION} \
     && /opt/venv/bin/pip install \
+       --no-cache-dir \
+       --index-url https://download.pytorch.org/whl/cu126 \
        torch==2.8.0 \
        torchaudio==2.8.0 \
-       --index-url https://download.pytorch.org/whl/cu126 \
     && /opt/venv/bin/python -c \
        "import torch, torchaudio; \
         assert torch.__version__ == '2.8.0+cu126', torch.__version__; \
         assert torchaudio.__version__ == '2.8.0+cu126', torchaudio.__version__; \
         assert torch.version.cuda == '12.6'; \
-        print(f'torch={torch.__version__} torchaudio={torchaudio.__version__}')"
+        print(f'torch={torch.__version__} torchaudio={torchaudio.__version__}')" \
+    && rm -rf /root/.cache/pip /tmp/*
+
+# constraints配置（numpy/torch/torchaudioのバージョンを全pipへ固定）
+COPY common/constraints-reazonspeech.txt /tmp/constraints.txt
 
 # ---- 話者分離依存（pyannote + huggingface_hub） ----
 COPY common/requirements-diar.txt /tmp/requirements-diar.txt
