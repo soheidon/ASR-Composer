@@ -411,6 +411,11 @@ html, body {
   pointer-events: none;
 }
 
+.engine-select-mode {
+  min-width: 120px;
+  flex: 0 0 auto;
+}
+
 .btn-icon {
   padding: 10px;
   background: var(--surface-container-low);

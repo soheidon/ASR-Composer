@@ -17,7 +17,7 @@ import {
   setButtonLoading,
   restoreButtonLoading,
 } from "./provider-config-save";
-import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection, renderLocalAsrInstallCache, renderLocalAsrEngineCard, getLocalAsrProgressDisplay } from "./docker";
+import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection, renderLocalAsrInstallCache, renderLocalAsrEngineCard, getLocalAsrProgressDisplay, escapeHtml } from "./docker";
 import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus, LocalAsrProgress, LocalAsrInstallState } from "./docker";
 
 const app = document.getElementById("app")!;
@@ -358,14 +358,19 @@ const transcribePage = `
         <div class="engine-row">
           <label class="field-label">ASRエンジン</label>
           <div class="engine-select-wrap">
-            <select class="engine-select" id="engineSelect">
-              <option value="whisper_v3">Whisper Large v3</option>
-              <option value="faster_whisper">Faster Whisper</option>
-              <option value="google_speech">Google Speech API</option>
+            <select class="engine-select engine-select-mode" id="asrModeSelect">
+              <option value="cloud">クラウド/API</option>
+              <option value="local">ローカル</option>
             </select>
             <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
           </div>
-          <button class="btn-icon" title="ASRエンジン設定">
+          <div class="engine-select-wrap">
+            <select class="engine-select" id="engineSelect">
+              <!-- TypeScriptで動的に生成 -->
+            </select>
+            <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+          </div>
+          <button class="btn-icon" id="asrEngineSettingsBtn" title="ASRエンジン設定">
             <span class="material-symbols-outlined">tune</span>
           </button>
         </div>
@@ -794,6 +799,190 @@ async function saveProviderConfigFromSection(
   }
 }
 
+// ---- ASR Engine Selection ----
+
+type AvailableAsrProvider = {
+  id: string;
+  displayName: string;
+};
+
+function isAsrProviderConfigured(
+  provider: ProviderDefinition,
+  saved: SavedProviderSettings | undefined,
+): boolean {
+  if (provider.id === "google_stt") {
+    // Google STT: options 内の project_id + location で判定
+    const projectId = saved?.options?.project_id?.trim() ?? "";
+    const location = saved?.options?.location?.trim() ?? "";
+    return Boolean(projectId && location);
+  }
+  return Boolean(saved?.env_name);
+}
+
+async function loadConfiguredAsrProviders(): Promise<AvailableAsrProvider[]> {
+  const settings = await invokeTauri<SavedAppSettings>("load_api_settings");
+  return asrProviders
+    .filter((provider) =>
+      isAsrProviderConfigured(provider, settings.providers[provider.id]),
+    )
+    .map((provider) => ({
+      id: provider.id,
+      displayName: `${provider.company} ${provider.name}`,
+    }));
+}
+
+async function populateCloudEngines(select: HTMLSelectElement): Promise<void> {
+  const providers = await loadConfiguredAsrProviders();
+  if (providers.length === 0) {
+    select.innerHTML = `
+      <option value="" selected disabled>
+        設定済みのASR APIがありません
+      </option>
+    `;
+    select.value = "";
+    return;
+  }
+  select.innerHTML = providers
+    .map(
+      (provider) =>
+        `<option value="${escapeHtml(provider.id)}">` +
+        `${escapeHtml(provider.displayName)}` +
+        `</option>`,
+    )
+    .join("");
+}
+
+async function populateLocalEngines(select: HTMLSelectElement): Promise<void> {
+  const statuses = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status");
+  const installed = statuses.filter((status) => status.installed);
+  if (installed.length === 0) {
+    select.innerHTML = `
+      <option value="" selected disabled>
+        インストール済みのローカルASRがありません
+      </option>
+    `;
+    select.value = "";
+    return;
+  }
+  select.innerHTML = statuses
+    .map((status) => {
+      const label = status.installed
+        ? status.displayName
+        : `${status.displayName}（未インストール）`;
+      const disabled = status.installed ? "" : "disabled";
+      return (
+        `<option value="${escapeHtml(status.engine)}" ${disabled}>` +
+        `${escapeHtml(label)}` +
+        `</option>`
+      );
+    })
+    .join("");
+}
+
+function hasSelectableOption(select: HTMLSelectElement, value: string): boolean {
+  if (!value) {
+    return false;
+  }
+  return Array.from(select.options).some(
+    (option) => option.value === value && !option.disabled,
+  );
+}
+
+async function saveAsrSelection(): Promise<void> {
+  const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement | null;
+  const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement | null;
+  if (!modeSelect || !engineSelect) {
+    return;
+  }
+  try {
+    await invokeTauri("save_asr_selection", {
+      mode: modeSelect.value,
+      engine: engineSelect.value || "",
+    });
+  } catch (error) {
+    console.error("save_asr_selection error:", error);
+  }
+}
+
+let lastCloudEngine = "";
+let lastLocalEngine = "";
+
+async function restoreAsrSelection(): Promise<void> {
+  const settings = await invokeTauri<SavedAppSettings>("load_api_settings");
+  const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement | null;
+  const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement | null;
+  if (!modeSelect || !engineSelect) {
+    return;
+  }
+  const savedMode = settings.asr_mode === "local" ? "local" : "cloud";
+  modeSelect.value = savedMode;
+
+  if (savedMode === "local") {
+    await populateLocalEngines(engineSelect);
+    if (hasSelectableOption(engineSelect, settings.asr_engine)) {
+      engineSelect.value = settings.asr_engine;
+    }
+    lastLocalEngine = engineSelect.value;
+  } else {
+    await populateCloudEngines(engineSelect);
+    if (hasSelectableOption(engineSelect, settings.asr_engine)) {
+      engineSelect.value = settings.asr_engine;
+    }
+    lastCloudEngine = engineSelect.value;
+  }
+
+  const restoredEngine = engineSelect.value || "";
+  if (settings.asr_mode !== savedMode || settings.asr_engine !== restoredEngine) {
+    await saveAsrSelection();
+  }
+}
+
+function bindAsrModeSelect(): void {
+  const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement | null;
+  const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement | null;
+  if (!modeSelect || !engineSelect) {
+    return;
+  }
+  modeSelect.addEventListener("change", async () => {
+    if (modeSelect.value === "local") {
+      lastCloudEngine = engineSelect.value || "";
+      await populateLocalEngines(engineSelect);
+      if (hasSelectableOption(engineSelect, lastLocalEngine)) {
+        engineSelect.value = lastLocalEngine;
+      }
+      lastLocalEngine = engineSelect.value || "";
+    } else {
+      lastLocalEngine = engineSelect.value || "";
+      await populateCloudEngines(engineSelect);
+      if (hasSelectableOption(engineSelect, lastCloudEngine)) {
+        engineSelect.value = lastCloudEngine;
+      }
+      lastCloudEngine = engineSelect.value || "";
+    }
+    await saveAsrSelection();
+  });
+  engineSelect.addEventListener("change", () => {
+    if (modeSelect.value === "local") {
+      lastLocalEngine = engineSelect.value || "";
+    } else {
+      lastCloudEngine = engineSelect.value || "";
+    }
+    void saveAsrSelection();
+  });
+}
+
+function bindAsrEngineSettingsButton(): void {
+  const button = document.getElementById("asrEngineSettingsBtn");
+  button?.addEventListener("click", () => {
+    const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement | null;
+    if (modeSelect?.value === "local") {
+      void navigateTo("settings-docker");
+    } else {
+      void navigateTo("settings");
+    }
+  });
+}
+
 async function navigateTo(page: PageName) {
   if (currentPage === page) return;
   currentPage = page;
@@ -835,6 +1024,10 @@ async function navigateTo(page: PageName) {
     void loadDockerPageStatuses();
     void loadAndRenderHuggingFaceToken();
     bindLocalAsrDelegation();
+  } else if (page === "transcribe") {
+    bindAsrModeSelect();
+    bindAsrEngineSettingsButton();
+    await restoreAsrSelection();
   }
 }
 
@@ -979,6 +1172,8 @@ interface SaveProviderSecretResult {
 
 interface SavedAppSettings {
   providers: Record<string, SavedProviderSettings>;
+  asr_mode: string;
+  asr_engine: string;
 }
 
 async function loadSavedSettings() {

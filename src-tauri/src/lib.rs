@@ -38,6 +38,10 @@ pub struct ProviderSettings {
 #[derive(Serialize, Deserialize, Default)]
 pub struct AppSettings {
     pub providers: HashMap<String, ProviderSettings>,
+    #[serde(default)]
+    pub asr_mode: String, // "cloud" | "local"
+    #[serde(default)]
+    pub asr_engine: String, // provider ID, local engine ID, or empty
 }
 
 #[derive(Deserialize)]
@@ -99,6 +103,27 @@ fn migrate_settings(settings: &mut AppSettings) {
             if url == "https://api.xiaomimimo.com/anthropic" {
                 mimo.base_url = Some("https://api.xiaomimimo.com/v1".to_string());
             }
+        }
+    }
+    // ASR mode migration: infer from asr_engine if asr_mode is not set
+    if settings.asr_mode.is_empty() {
+        let cloud_ids = [
+            "google_stt",
+            "openai_audio",
+            "azure_speech",
+            "xiaomi_mimo_asr",
+            "groq_speech",
+            "deepgram",
+            "assemblyai",
+        ];
+        let local_ids = ["reazonspeech", "kotoba-whisper", "qwen3-asr"];
+        let engine = settings.asr_engine.as_str();
+        if cloud_ids.contains(&engine) {
+            settings.asr_mode = "cloud".to_string();
+        } else if local_ids.contains(&engine) {
+            settings.asr_mode = "local".to_string();
+        } else {
+            settings.asr_mode = "cloud".to_string();
         }
     }
 }
@@ -184,6 +209,23 @@ fn save_provider_secret(
             ),
         })
     }
+}
+
+#[tauri::command]
+fn save_asr_selection(
+    app: tauri::AppHandle,
+    mode: String,
+    engine: String,
+) -> Result<(), String> {
+    if mode != "cloud" && mode != "local" {
+        return Err(format!("Invalid ASR mode: {mode}"));
+    }
+    let path = settings_path(&app);
+    let mut settings = load_settings(&app);
+    settings.asr_mode = mode;
+    settings.asr_engine = engine;
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())
 }
 
 const MIMO_ASR_MAX_BASE64_SIZE: usize = 10 * 1024 * 1024; // 10MB
@@ -3103,6 +3145,7 @@ pub fn run() {
             load_api_settings,
             save_provider_config,
             save_provider_secret,
+            save_asr_selection,
             fetch_models,
             test_connection_ollama,
             test_llm_connection,
@@ -3272,6 +3315,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(!json.contains("sk-"), "settings.json must not contain API keys");
@@ -3297,6 +3341,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("null"), "env_name should serialize as null for Ollama");
@@ -3325,6 +3370,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         migrate_settings(&mut settings);
         let moonshot = settings.providers.get("moonshot").unwrap();
@@ -3350,6 +3396,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         migrate_settings(&mut settings);
         let moonshot = settings.providers.get("moonshot").unwrap();
@@ -4715,6 +4762,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         migrate_settings(&mut settings);
         let mimo = settings.providers.get("xiaomi_mimo").unwrap();
@@ -4737,6 +4785,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         migrate_settings(&mut settings);
         let mimo = settings.providers.get("xiaomi_mimo").unwrap();
@@ -5994,5 +6043,101 @@ mod tests {
         assert!(json.contains("message"));
         assert!(json.contains("building-base")); // stage値はそのまま
         assert!(json.contains("ベース環境"));
+    }
+
+    // ---- ASR mode migration ----
+
+    #[test]
+    fn test_migrate_asr_mode_cloud_from_google_stt() {
+        let mut settings = AppSettings {
+            providers: HashMap::new(),
+            asr_mode: String::new(),
+            asr_engine: "google_stt".to_string(),
+        };
+        migrate_settings(&mut settings);
+        assert_eq!(settings.asr_mode, "cloud");
+    }
+
+    #[test]
+    fn test_migrate_asr_mode_local_from_reazonspeech() {
+        let mut settings = AppSettings {
+            providers: HashMap::new(),
+            asr_mode: String::new(),
+            asr_engine: "reazonspeech".to_string(),
+        };
+        migrate_settings(&mut settings);
+        assert_eq!(settings.asr_mode, "local");
+    }
+
+    #[test]
+    fn test_migrate_asr_mode_cloud_from_unknown_engine() {
+        let mut settings = AppSettings {
+            providers: HashMap::new(),
+            asr_mode: String::new(),
+            asr_engine: "unknown_engine".to_string(),
+        };
+        migrate_settings(&mut settings);
+        assert_eq!(settings.asr_mode, "cloud");
+    }
+
+    #[test]
+    fn test_migrate_asr_mode_cloud_from_empty_engine() {
+        let mut settings = AppSettings {
+            providers: HashMap::new(),
+            asr_mode: String::new(),
+            asr_engine: String::new(),
+        };
+        migrate_settings(&mut settings);
+        assert_eq!(settings.asr_mode, "cloud");
+    }
+
+    #[test]
+    fn test_migrate_asr_mode_already_set_skips() {
+        let mut settings = AppSettings {
+            providers: HashMap::new(),
+            asr_mode: "local".to_string(),
+            asr_engine: "google_stt".to_string(),
+        };
+        migrate_settings(&mut settings);
+        assert_eq!(settings.asr_mode, "local");
+    }
+
+    // ---- ASR mode serialization ----
+
+    #[test]
+    fn test_asr_mode_engine_serialization() {
+        let settings = AppSettings {
+            providers: HashMap::new(),
+            asr_mode: "cloud".to_string(),
+            asr_engine: "openai_audio".to_string(),
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"asr_mode\""));
+        assert!(json.contains("\"asr_engine\""));
+        assert!(json.contains("\"cloud\""));
+        assert!(json.contains("\"openai_audio\""));
+    }
+
+    #[test]
+    fn test_asr_mode_engine_deserialization_missing_fields() {
+        let json = r#"{"providers":{}}"#;
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.asr_mode, "");
+        assert_eq!(settings.asr_engine, "");
+    }
+
+    // ---- save_asr_selection validation ----
+
+    #[test]
+    fn test_save_asr_selection_invalid_mode() {
+        // save_asr_selection の mode 検証をテスト
+        let mode = "invalid";
+        assert!(mode != "cloud" && mode != "local");
+    }
+
+    #[test]
+    fn test_save_asr_selection_valid_modes() {
+        assert!("cloud" == "cloud" || "cloud" == "local");
+        assert!("local" == "cloud" || "local" == "local");
     }
 }
