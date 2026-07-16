@@ -601,7 +601,7 @@ const settingsDockerPage = `
           <div class="api-section">
             <div class="api-section-header">
               <h4 class="api-section-title">Hugging Face認証</h4>
-              <p class="api-section-desc">話者分離モデルを取得するためのHugging Faceアクセストークンを設定します。トークンは環境変数に保存されます。</p>
+              <p class="api-section-desc">話者分離モデルなど、Hugging Face上のモデルを取得するためのアクセストークンを設定します。pyannoteの話者分離モデルを利用するには、利用条件に同意したアカウントのトークンが必要です。トークンは環境変数に保存されます。</p>
             </div>
             <div class="hf-token-container" id="hfTokenContainer">
               ${renderHuggingFaceTokenSection(null)}
@@ -685,7 +685,7 @@ function renderHeader(activePage: PageName): string {
       <nav class="header-nav">
         <a class="nav-link ${transcribeActive}" href="#" data-page="transcribe">文字起こし</a>
         <a class="nav-link" href="#">統合</a>
-        <a class="nav-link ${settingsActive}" href="#" data-page="settings">設定</a>
+        <a class="nav-link ${settingsActive}" href="#" data-page="settings-general">設定</a>
       </nav>
     </div>
     <div class="header-drag-area" id="headerDragArea" aria-hidden="true"></div>

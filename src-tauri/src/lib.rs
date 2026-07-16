@@ -2365,11 +2365,18 @@ struct LocalAsrEngineDef {
 }
 
 fn local_asr_engine_defs() -> Vec<LocalAsrEngineDef> {
-    vec![LocalAsrEngineDef {
-        engine: "reazonspeech",
-        display_name: "ReazonSpeech",
-        image_name: "asr-composer-reazonspeech:cu126",
-    }]
+    vec![
+        LocalAsrEngineDef {
+            engine: "reazonspeech",
+            display_name: "ReazonSpeech",
+            image_name: "asr-composer-reazonspeech:cu126",
+        },
+        LocalAsrEngineDef {
+            engine: "kotoba-whisper",
+            display_name: "Kotoba Whisper v2.2",
+            image_name: "asr-composer-kotoba-whisper:cu126",
+        },
+    ]
 }
 
 #[derive(Debug, Deserialize)]

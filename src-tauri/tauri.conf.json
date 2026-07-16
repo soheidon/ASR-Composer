@@ -20,6 +20,9 @@
       "resources/local-asr/common/orchestrator.py",
       "resources/local-asr/common/output_writer.py",
       "resources/local-asr/common/smoke_test.py",
+      "resources/local-asr/kotoba-whisper/Dockerfile",
+      "resources/local-asr/kotoba-whisper/diar_asr.py",
+      "resources/local-asr/kotoba-whisper/requirements.txt",
       "resources/local-asr/reazonspeech/Dockerfile",
       "resources/local-asr/reazonspeech/requirements-asr.txt",
       "resources/local-asr/reazonspeech/transcribe.py"
