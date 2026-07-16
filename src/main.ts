@@ -354,7 +354,7 @@ const transcribePage = `
       </section>
 
       <section class="section-card">
-        <h3 class="section-header"><span class="section-title">AIモデルと出力言語の選択</span></h3>
+        <h3 class="section-header"><span class="section-title">音声認識設定</span></h3>
         <div class="engine-row">
           <label class="field-label">ASRエンジン</label>
           <div class="engine-select-wrap">
@@ -366,21 +366,6 @@ const transcribePage = `
             <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
           </div>
           <button class="btn-icon" title="ASRエンジン設定">
-            <span class="material-symbols-outlined">tune</span>
-          </button>
-        </div>
-        <div class="engine-row">
-          <label class="field-label">補完LLM</label>
-          <div class="engine-select-wrap">
-            <select class="engine-select" id="llmSelect">
-              <option value="none">なし</option>
-              <option value="gpt4">GPT-4</option>
-              <option value="claude">Claude</option>
-              <option value="gemini">Gemini</option>
-            </select>
-            <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
-          </div>
-          <button class="btn-icon" title="補完LLM設定">
             <span class="material-symbols-outlined">tune</span>
           </button>
         </div>
@@ -397,6 +382,25 @@ const transcribePage = `
             <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
           </div>
           <div class="btn-icon-placeholder" aria-hidden="true"></div>
+        </div>
+      </section>
+
+      <section class="section-card">
+        <h3 class="section-header"><span class="section-title">補完LLM</span></h3>
+        <div class="engine-row">
+          <label class="field-label">補完LLM</label>
+          <div class="engine-select-wrap">
+            <select class="engine-select" id="llmSelect">
+              <option value="none">なし</option>
+              <option value="gpt4">GPT-4</option>
+              <option value="claude">Claude</option>
+              <option value="gemini">Gemini</option>
+            </select>
+            <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+          </div>
+          <button class="btn-icon" title="補完LLM設定">
+            <span class="material-symbols-outlined">tune</span>
+          </button>
         </div>
       </section>
 
