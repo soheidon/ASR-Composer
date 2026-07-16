@@ -1,0 +1,7 @@
+huggingface_hub==0.36.2
+transformers==4.57.6
+pyannote-audio==3.3.2
+matplotlib==3.10.8
+pydub==0.25.1
+tqdm==4.67.3
+qwen-asr==0.0.6
