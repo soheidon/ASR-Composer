@@ -592,7 +592,7 @@ const settingsDockerPage = `
           <div class="api-section">
             <div class="api-section-header">
               <h4 class="api-section-title">Docker Desktop</h4>
-              <p class="api-section-desc">ローカルASRエンジンの実行にDockerが必要です。</p>
+              <p class="api-section-desc">話者分離を行う場合、pyannote.audio、PyTorch、TorchAudio、CUDAなどの依存関係を特定の組み合わせに固定する必要があるため、Docker環境を使用します。</p>
             </div>
             <div class="docker-status-container" id="dockerStatusContainer">
               ${renderDockerStatusContent(null)}
@@ -601,7 +601,7 @@ const settingsDockerPage = `
           <div class="api-section">
             <div class="api-section-header">
               <h4 class="api-section-title">Hugging Face認証</h4>
-              <p class="api-section-desc">pyannoteモデルの取得に使用するアクセストークンを設定します。トークンはDockerイメージには保存されません。</p>
+              <p class="api-section-desc">話者分離モデルを取得するためのHugging Faceアクセストークンを設定します。トークンは環境変数に保存されます。</p>
             </div>
             <div class="hf-token-container" id="hfTokenContainer">
               ${renderHuggingFaceTokenSection(null)}
@@ -610,7 +610,7 @@ const settingsDockerPage = `
           <div class="api-section">
             <div class="api-section-header">
               <h4 class="api-section-title">ローカルASR環境</h4>
-              <p class="api-section-desc">Dockerを利用して、音声データを外部へ送信せずに文字起こしします。</p>
+              <p class="api-section-desc">ローカル音声認識モデルを使用して文字起こしを行うための環境を設定します。</p>
             </div>
             <div class="local-asr-container" id="localAsrContainer">
               ${renderLocalAsrSection({ kind: "loading" })}
