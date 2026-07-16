@@ -2729,7 +2729,6 @@ fn local_asr_get_engine_status_sync(engine: &str) -> Result<LocalAsrEngineStatus
         }
     };
 
-    // docker version を省略し、inspect 1回だけ実行
     Ok(get_single_engine_status_fast(&docker_path, &def))
 }
 
