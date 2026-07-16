@@ -231,8 +231,18 @@ export type LocalAsrUiState =
   | "docker-stopped"
   | "daemon-unavailable"
   | "inspect-error"
+  | "installing"
+  | "install-succeeded"
+  | "install-failed"
   | "not-installed"
   | "installed";
+
+export interface LocalAsrInstallState {
+  engine: string;
+  status: "installing" | "succeeded" | "failed";
+  progress: number;
+  message: string;
+}
 
 export interface LocalAsrProgress {
   engine: string;
@@ -240,12 +250,25 @@ export interface LocalAsrProgress {
   message: string;
 }
 
-export function getLocalAsrUiState(status: LocalAsrEngineStatus | null): LocalAsrUiState {
+export function getLocalAsrUiState(
+  status: LocalAsrEngineStatus | null,
+  installState?: LocalAsrInstallState,
+): LocalAsrUiState {
+  // Docker異常は常に最優先
+  if (status && !status.dockerAvailable) return "no-docker";
+  if (status && !status.dockerRunning) return "docker-stopped";
+  if (status?.errorKind === "daemon-unavailable") return "daemon-unavailable";
+  if (status?.errorKind === "inspect-error") return "inspect-error";
+
+  // インストール状態（loading より優先）
+  if (installState?.status === "installing") return "installing";
+  if (installState?.status === "succeeded") {
+    return status?.installed ? "installed" : "install-succeeded";
+  }
+  if (installState?.status === "failed") return "install-failed";
+
+  // 通常判定
   if (!status) return "loading";
-  if (!status.dockerAvailable) return "no-docker";
-  if (!status.dockerRunning) return "docker-stopped";
-  if (status.errorKind === "daemon-unavailable") return "daemon-unavailable";
-  if (status.errorKind === "inspect-error") return "inspect-error";
   if (!status.installed) return "not-installed";
   return "installed";
 }
@@ -282,7 +305,7 @@ export type LocalAsrSectionState =
   | { kind: "docker-unavailable" }
   | { kind: "docker-stopped" }
   | { kind: "load-error"; message: string }
-  | { kind: "engines"; statuses: LocalAsrEngineStatus[] };
+  | { kind: "engines"; statuses: LocalAsrEngineStatus[]; installStates?: ReadonlyMap<string, LocalAsrInstallState> };
 
 export function renderLocalAsrSection(state: LocalAsrSectionState): string {
   switch (state.kind) {
@@ -338,8 +361,12 @@ export function renderLocalAsrSection(state: LocalAsrSectionState): string {
             </button>
           </div>
         </div>`;
-    case "engines":
+    case "engines": {
       if (state.statuses.length === 0) {
+        // ステータスが空でもactiveなinstall状態があれば描画
+        if (state.installStates && state.installStates.size > 0) {
+          return renderLocalAsrInstallCache([...state.installStates.values()]);
+        }
         return `
           <div class="local-asr-engine-card">
             <div class="docker-status-row">
@@ -348,12 +375,43 @@ export function renderLocalAsrSection(state: LocalAsrSectionState): string {
             </div>
           </div>`;
       }
-      return state.statuses.map(e => renderLocalAsrEngineCard(e)).join("");
+      return state.statuses.map(e =>
+        renderLocalAsrEngineCard(e, state.installStates?.get(e.engine))
+      ).join("");
+    }
   }
 }
 
-function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
-  const state = getLocalAsrUiState(e);
+/** キャッシュされたinstall状態だけから最低限のカードを描画するフォールバック */
+export function renderLocalAsrInstallCache(installStates: LocalAsrInstallState[]): string {
+  return installStates
+    .filter(s => s.status === "installing" || s.status === "succeeded")
+    .map(s => `
+      <div class="local-asr-engine-card">
+        <div class="local-asr-engine-header">
+          <span class="local-asr-engine-name">${escapeHtml(s.engine)}</span>
+          <span class="local-asr-engine-desc">日本語音声認識</span>
+        </div>
+        <div class="local-asr-engine-status" data-install-engine-status="${escapeHtml(s.engine)}">
+          ${renderLocalAsrProgressBar(s.progress, s.message)}
+        </div>
+      </div>`)
+    .join("");
+}
+
+export function renderLocalAsrProgressBar(percent: number, message: string): string {
+  return `
+    <div class="local-asr-install-progress">
+      <div class="local-asr-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}">
+        <div class="local-asr-progress-fill" style="width: ${percent}%"></div>
+      </div>
+      <div class="local-asr-progress-percent">${percent}%</div>
+      <div class="local-asr-progress-message">${escapeHtml(message)}</div>
+    </div>`;
+}
+
+function renderLocalAsrEngineCard(e: LocalAsrEngineStatus, installState?: LocalAsrInstallState): string {
+  const state = getLocalAsrUiState(e, installState);
 
   let statusHtml: string;
   switch (state) {
@@ -389,6 +447,37 @@ function renderLocalAsrEngineCard(e: LocalAsrEngineStatus): string {
           <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
             <span class="material-symbols-outlined">refresh</span>
             状態を再確認
+          </button>
+        </div>`;
+      break;
+    case "installing":
+      statusHtml = `
+        <div class="local-asr-engine-status" data-install-engine-status="${escapeHtml(e.engine)}">
+          ${renderLocalAsrProgressBar(installState?.progress ?? 0, installState?.message ?? "インストールを準備しています…")}
+        </div>`;
+      break;
+    case "install-succeeded":
+      statusHtml = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-success, #22c55e);">check_circle</span>
+          <span>インストール完了。状態を確認しています…</span>
+        </div>
+        <div class="docker-status-actions">
+          <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+            <span class="material-symbols-outlined">refresh</span>
+            状態を再確認
+          </button>
+        </div>`;
+      break;
+    case "install-failed":
+      statusHtml = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
+          <span>${escapeHtml(installState?.message ?? "インストールに失敗しました")}</span>
+        </div>
+        <div class="docker-status-actions">
+          <button class="btn-docker-start btn-local-asr-install" type="button" data-install-engine="${escapeHtml(e.engine)}">
+            再試行
           </button>
         </div>`;
       break;

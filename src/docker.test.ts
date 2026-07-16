@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
 import { getDockerUiState, escapeHtml, renderDockerStatusContent, renderHuggingFaceTokenSection, getLocalAsrUiState, renderLocalAsrSection, getLocalAsrProgressDisplay } from "./docker";
-import type { DockerStatus, LocalAsrEngineStatus } from "./docker";
+import type { DockerStatus, LocalAsrEngineStatus, LocalAsrInstallState } from "./docker";
 
 // ---- getDockerUiState ----
 
@@ -333,6 +333,38 @@ describe("getLocalAsrUiState", () => {
     // inspect-error takes priority over not-installed
     expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, errorKind: "inspect-error", errorMessage: "x", installed: false })).toBe("inspect-error");
   });
+
+  const installing: LocalAsrInstallState = { engine: "reazonspeech", status: "installing", progress: 50, message: "テスト中" };
+  const succeeded: LocalAsrInstallState = { engine: "reazonspeech", status: "succeeded", progress: 100, message: "完了" };
+  const failed: LocalAsrInstallState = { engine: "reazonspeech", status: "failed", progress: 30, message: "失敗" };
+
+  it("status=null + installing → installing (loading より優先)", () => {
+    expect(getLocalAsrUiState(null, installing)).toBe("installing");
+  });
+
+  it("status=null + succeeded → install-succeeded", () => {
+    expect(getLocalAsrUiState(null, succeeded)).toBe("install-succeeded");
+  });
+
+  it("docker stopped + installing → docker-stopped (Docker異常優先)", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: false }, installing)).toBe("docker-stopped");
+  });
+
+  it("daemon-unavailable + installing → daemon-unavailable", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, errorKind: "daemon-unavailable", errorMessage: "x" }, installing)).toBe("daemon-unavailable");
+  });
+
+  it("installed=true + succeeded → installed", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: true }, succeeded)).toBe("installed");
+  });
+
+  it("installed=false + succeeded → install-succeeded", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: false }, succeeded)).toBe("install-succeeded");
+  });
+
+  it("failed → install-failed", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: false }, failed)).toBe("install-failed");
+  });
 });
 
 // ---- renderLocalAsrSection ----
@@ -558,6 +590,55 @@ describe("renderLocalAsrSection", () => {
     const html = renderLocalAsrSection({ kind: "engines", statuses: [] });
     document.body.innerHTML = html;
     expect(document.body.textContent).toContain("エンジンが定義されていません");
+  });
+
+  it("installing state shows progress bar with data-install-engine-status", () => {
+    const installStates = new Map<string, LocalAsrInstallState>();
+    installStates.set("reazonspeech", { engine: "reazonspeech", status: "installing", progress: 63, message: "インストール中" });
+    const html = renderLocalAsrSection({
+      kind: "engines",
+      statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: false }],
+      installStates,
+    });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("63%");
+    expect(document.querySelector("[data-install-engine-status]")).toBeTruthy();
+    expect(document.querySelector(".btn-local-asr-install")).toBeNull();
+  });
+
+  it("install-succeeded shows confirmation message", () => {
+    const installStates = new Map<string, LocalAsrInstallState>();
+    installStates.set("reazonspeech", { engine: "reazonspeech", status: "succeeded", progress: 100, message: "完了" });
+    const html = renderLocalAsrSection({
+      kind: "engines",
+      statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: false }],
+      installStates,
+    });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("インストール完了");
+    expect(document.body.textContent).toContain("状態を確認しています");
+  });
+
+  it("install-failed shows retry button", () => {
+    const installStates = new Map<string, LocalAsrInstallState>();
+    installStates.set("reazonspeech", { engine: "reazonspeech", status: "failed", progress: 30, message: "失敗" });
+    const html = renderLocalAsrSection({
+      kind: "engines",
+      statuses: [{ ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: false }],
+      installStates,
+    });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("失敗");
+    expect(document.querySelector(".btn-local-asr-install")).toBeTruthy();
+  });
+
+  it("empty statuses with active installStates renders progress card", () => {
+    const installStates = new Map<string, LocalAsrInstallState>();
+    installStates.set("reazonspeech", { engine: "reazonspeech", status: "installing", progress: 42, message: "テスト中" });
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [], installStates });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("42%");
+    expect(document.body.textContent).toContain("テスト中");
   });
 });
 

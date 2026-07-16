@@ -2,8 +2,7 @@
 """全体制御: diarize → transcribe → 出力"""
 import subprocess, sys, os, json
 
-VENV_DIAR = os.environ["VENV_DIAR"]
-VENV_ASR = os.environ["VENV_ASR"]
+VENV = os.environ["VENV"]
 WORK_SOURCE = os.environ.get("WORK_SOURCE", "/work/source")
 WORK_OUTPUT = os.environ.get("WORK_OUTPUT", "/work/output")
 WORK_TMP = os.environ.get("WORK_TMP", "/work/tmp")
@@ -23,19 +22,19 @@ def main():
     os.makedirs(WORK_OUTPUT, exist_ok=True)
     os.makedirs(WORK_TMP, exist_ok=True)
 
-    # 1. 話者分離（venv-diar）
+    # 1. 話者分離
     print("[1/4] 話者分離中...", flush=True)
     subprocess.run([
-        f"{VENV_DIAR}/bin/python", "/app/diarize.py",
+        f"{VENV}/bin/python", "/app/diarize.py",
         "--input", input_path,
         "--output", segments_json,
         "--tmp", WORK_TMP,
     ], check=True)
 
-    # 2. 音声認識（venv-asr）
+    # 2. 音声認識
     print("[2/4] 音声認識中...", flush=True)
     subprocess.run([
-        f"{VENV_ASR}/bin/python", "/app/transcribe.py",
+        f"{VENV}/bin/python", "/app/transcribe.py",
         "--segments", segments_json,
         "--output", transcript_json,
         "--tmp", WORK_TMP,

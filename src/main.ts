@@ -17,8 +17,8 @@ import {
   setButtonLoading,
   restoreButtonLoading,
 } from "./provider-config-save";
-import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection, escapeHtml, getLocalAsrProgressDisplay } from "./docker";
-import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus, LocalAsrProgress } from "./docker";
+import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection, renderLocalAsrInstallCache, getLocalAsrProgressDisplay } from "./docker";
+import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus, LocalAsrProgress, LocalAsrInstallState } from "./docker";
 
 const app = document.getElementById("app")!;
 
@@ -440,10 +440,13 @@ const transcribePage = `
   </main>
 `;
 
-type SettingsPageId = "api" | "ollama" | "docker";
+type SettingsPageId = "general" | "dictionary" | "background" | "api" | "ollama" | "docker";
 
 function settingsPageToRoute(page: SettingsPageId): PageName {
   switch (page) {
+    case "general": return "settings-general";
+    case "dictionary": return "settings-dictionary";
+    case "background": return "settings-background";
     case "api": return "settings";
     case "ollama": return "settings-ollama";
     case "docker": return "settings-docker";
@@ -451,28 +454,28 @@ function settingsPageToRoute(page: SettingsPageId): PageName {
 }
 
 function buildSettingsSidebar(activePage: SettingsPageId): string {
+  const generalActive = activePage === "general" ? " settings-nav-active" : "";
+  const dictionaryActive = activePage === "dictionary" ? " settings-nav-active" : "";
+  const backgroundActive = activePage === "background" ? " settings-nav-active" : "";
   const apiActive = activePage === "api" ? " settings-nav-active" : "";
   const ollamaActive = activePage === "ollama" ? " settings-nav-active" : "";
   const dockerActive = activePage === "docker" ? " settings-nav-active" : "";
   return `
     <aside class="settings-sidebar">
       <h2 class="settings-sidebar-title">設定</h2>
-      <span class="settings-sidebar-label">一般設定</span>
       <nav class="settings-nav">
-        <button class="settings-nav-item" type="button">
+        <button class="settings-nav-item${generalActive}" type="button" data-settings-page="general">
           <span class="material-symbols-outlined">tune</span>
           <span>基本設定</span>
         </button>
-        <button class="settings-nav-item" type="button">
-          <span class="material-symbols-outlined">hearing</span>
-          <span>ASRエンジン</span>
+        <button class="settings-nav-item${dictionaryActive}" type="button" data-settings-page="dictionary">
+          <span class="material-symbols-outlined">dictionary</span>
+          <span>辞書</span>
         </button>
-        <button class="settings-nav-item" type="button">
-          <span class="material-symbols-outlined">psychology</span>
-          <span>LLM設定</span>
+        <button class="settings-nav-item${backgroundActive}" type="button" data-settings-page="background">
+          <span class="material-symbols-outlined">info</span>
+          <span>背景情報</span>
         </button>
-        <div class="settings-nav-divider"></div>
-        <span class="settings-sidebar-label">システム</span>
         <button class="settings-nav-item${apiActive}" type="button" data-settings-page="api">
           <span class="material-symbols-outlined" style="font-variation-settings: 'FILL' ${activePage === "api" ? "1" : "0"};">key</span>
           <span>API設定</span>
@@ -483,7 +486,7 @@ function buildSettingsSidebar(activePage: SettingsPageId): string {
         </button>
         <button class="settings-nav-item${dockerActive}" type="button" data-settings-page="docker">
           <span class="material-symbols-outlined" style="font-variation-settings: 'FILL' ${activePage === "docker" ? "1" : "0"};">terminal</span>
-          <span>Docker設定</span>
+          <span>ローカルASR環境</span>
         </button>
       </nav>
     </aside>`;
@@ -620,11 +623,59 @@ const settingsDockerPage = `
 
 // ---- Render ----
 
-type PageName = "transcribe" | "settings" | "settings-ollama" | "settings-docker";
+const settingsGeneralPage = `
+  <div class="settings-layout">
+    ${buildSettingsSidebar("general")}
+    <div class="settings-content">
+      <div class="settings-content-header">
+        <h2 class="settings-content-title">基本設定</h2>
+      </div>
+      <div class="settings-content-body">
+        <div class="settings-content-inner">
+          <p>基本設定は今後追加予定です。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+`;
+
+const settingsDictionaryPage = `
+  <div class="settings-layout">
+    ${buildSettingsSidebar("dictionary")}
+    <div class="settings-content">
+      <div class="settings-content-header">
+        <h2 class="settings-content-title">辞書</h2>
+      </div>
+      <div class="settings-content-body">
+        <div class="settings-content-inner">
+          <p>辞書設定は今後追加予定です。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+`;
+
+const settingsBackgroundPage = `
+  <div class="settings-layout">
+    ${buildSettingsSidebar("background")}
+    <div class="settings-content">
+      <div class="settings-content-header">
+        <h2 class="settings-content-title">背景情報</h2>
+      </div>
+      <div class="settings-content-body">
+        <div class="settings-content-inner">
+          <p>背景情報は今後追加予定です。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+`;
+
+type PageName = "transcribe" | "settings" | "settings-ollama" | "settings-docker" | "settings-dictionary" | "settings-background" | "settings-general";
 
 function renderHeader(activePage: PageName): string {
   const transcribeActive = activePage === "transcribe" ? "active" : "";
-  const settingsActive = (activePage === "settings" || activePage === "settings-ollama" || activePage === "settings-docker") ? "active" : "";
+  const settingsActive = (activePage === "settings" || activePage === "settings-ollama" || activePage === "settings-docker" || activePage === "settings-dictionary" || activePage === "settings-background" || activePage === "settings-general") ? "active" : "";
   return `
   <header class="app-header">
     <div class="header-left">
@@ -655,6 +706,12 @@ function renderHeader(activePage: PageName): string {
 let currentPage: PageName | null = null;
 let sidebarDelegationBound = false;
 let dockerPageLoadRevision = 0;
+
+// ---- Local ASR Install State ----
+const localAsrInstallStates = new Map<string, LocalAsrInstallState>();
+const localAsrInstallPromises = new Map<string, Promise<void>>();
+let localAsrProgressListenerPromise: Promise<void> | null = null;
+let cachedLocalAsrStatuses: LocalAsrEngineStatus[] = [];
 
 // ---- Provider Config: Dirty / Revision / Save Queue ----
 
@@ -740,6 +797,9 @@ async function navigateTo(page: PageName) {
   const body = page === "transcribe" ? transcribePage
     : page === "settings-ollama" ? settingsOllamaPage
     : page === "settings-docker" ? settingsDockerPage
+    : page === "settings-dictionary" ? settingsDictionaryPage
+    : page === "settings-background" ? settingsBackgroundPage
+    : page === "settings-general" ? settingsGeneralPage
     : settingsApiPage;
   app.innerHTML = renderHeader(page) + body;
 
@@ -2391,71 +2451,68 @@ function bindLocalAsrDelegation(): void {
   });
 }
 
-function renderLocalAsrProgressBar(percent: number, message: string): string {
-  return `
-    <div class="local-asr-install-progress">
-      <div class="local-asr-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}">
-        <div class="local-asr-progress-fill" style="width: ${percent}%"></div>
-      </div>
-      <div class="local-asr-progress-percent">${percent}%</div>
-      <div class="local-asr-progress-message">${escapeHtml(message)}</div>
-    </div>`;
+async function handleLocalAsrInstall(engine: string, _btn: HTMLButtonElement): Promise<void> {
+  // 二重実行防止
+  if (localAsrInstallPromises.has(engine)) return;
+  if (localAsrInstallStates.get(engine)?.status === "installing") return;
+
+  const promise = doLocalAsrInstall(engine);
+  localAsrInstallPromises.set(engine, promise);
+  try {
+    await promise;
+  } finally {
+    localAsrInstallPromises.delete(engine);
+  }
 }
 
-function updateLocalAsrProgress(container: HTMLElement, progress: LocalAsrProgress): void {
-  const display = getLocalAsrProgressDisplay(progress.stage);
-  const bar = container.querySelector<HTMLElement>(".local-asr-progress-fill");
-  const track = container.querySelector<HTMLElement>(".local-asr-progress-track");
-  const percentEl = container.querySelector<HTMLElement>(".local-asr-progress-percent");
-  const messageEl = container.querySelector<HTMLElement>(".local-asr-progress-message");
+async function doLocalAsrInstall(engine: string): Promise<void> {
+  await ensureLocalAsrProgressListener();
 
-  const current = Number(track?.getAttribute("aria-valuenow") ?? "0");
-  const next = Math.max(current, display.percent);
-
-  if (bar) bar.style.width = `${next}%`;
-  if (track) track.setAttribute("aria-valuenow", String(next));
-  if (percentEl) percentEl.textContent = `${next}%`;
-  if (messageEl) messageEl.textContent = display.message;
-}
-
-async function handleLocalAsrInstall(engine: string, btn: HTMLButtonElement): Promise<void> {
-  const card = btn.closest(".local-asr-engine-card");
-  if (!card) return;
-  const statusEl = card.querySelector<HTMLElement>(".local-asr-engine-status");
-  if (!statusEl) return;
-
-  // listen登録 → invoke → finally unlisten
-  const { listen } = await import("@tauri-apps/api/event");
-  const unlisten = await listen<LocalAsrProgress>("local-asr-progress", ({ payload }) => {
-    if (payload.engine === engine && statusEl.isConnected) {
-      updateLocalAsrProgress(statusEl, payload);
-    }
+  localAsrInstallStates.set(engine, {
+    engine,
+    status: "installing",
+    progress: 0,
+    message: "インストールを準備しています…",
   });
 
-  btn.disabled = true;
-  statusEl.innerHTML = renderLocalAsrProgressBar(0, "インストールを準備しています…");
+  // ページが表示中なら再描画
+  if (currentPage === "settings-docker") {
+    await loadAndRenderLocalAsrStatus();
+  }
 
   try {
     await invokeTauri<LocalAsrEngineStatus>("local_asr_install", { engine });
-    await loadAndRenderLocalAsrStatus();
+
+    // succeeded を保持（installed 確認前）
+    localAsrInstallStates.set(engine, {
+      engine,
+      status: "succeeded",
+      progress: 100,
+      message: "インストールを完了しました",
+    });
+
+    // installed=true を短時間ポーリングで確認
+    const confirmed = await confirmLocalAsrInstalled(engine);
+    if (confirmed) {
+      localAsrInstallStates.delete(engine);
+    }
+
+    if (currentPage === "settings-docker") {
+      await loadAndRenderLocalAsrStatus();
+    }
   } catch (e) {
-    console.error("local_asr_install error:", e);
-    if (!statusEl.isConnected) return;
-    const msg = typeof e === "string" ? e : String(e);
-    const shortMsg = msg.split("\n")[0];
-    statusEl.innerHTML = `
-      <div class="docker-status-row">
-        <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
-        <span>${escapeHtml(shortMsg)}</span>
-      </div>
-      <div class="docker-status-actions">
-        <button class="btn-docker-start btn-local-asr-install" type="button" data-install-engine="${escapeHtml(engine)}">
-          <span class="material-symbols-outlined">refresh</span>
-          再試行
-        </button>
-      </div>`;
-  } finally {
-    unlisten();
+    console.error("Local ASR installation failed:", e);
+
+    localAsrInstallStates.set(engine, {
+      engine,
+      status: "failed",
+      progress: localAsrInstallStates.get(engine)?.progress ?? 0,
+      message: "インストールに失敗しました",
+    });
+
+    if (currentPage === "settings-docker") {
+      await loadAndRenderLocalAsrStatus();
+    }
   }
 }
 
@@ -2500,13 +2557,104 @@ async function handleLocalAsrUninstall(
   }
 }
 
+// ---- Local ASR Install Helpers ----
+
+function ensureLocalAsrProgressListener(): Promise<void> {
+  if (localAsrProgressListenerPromise) return localAsrProgressListenerPromise;
+
+  localAsrProgressListenerPromise = (async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    await listen<LocalAsrProgress>(
+      "local-asr-progress",
+      ({ payload }) => {
+        const state = localAsrInstallStates.get(payload.engine);
+        if (!state || state.status !== "installing") return;
+        const display = getLocalAsrProgressDisplay(payload.stage);
+        state.progress = display.percent;
+        state.message = display.message;
+        updateVisibleLocalAsrProgress(payload.engine, display.percent, display.message);
+      },
+    );
+  })().catch((error) => {
+    localAsrProgressListenerPromise = null;
+    console.error("Failed to install local-asr-progress listener:", error);
+  });
+
+  return localAsrProgressListenerPromise;
+}
+
+function updateVisibleLocalAsrProgress(engine: string, percent: number, message: string): void {
+  if (currentPage !== "settings-docker") return;
+  const container = document.getElementById("localAsrContainer");
+  const statusEl = container?.querySelector<HTMLElement>(
+    `[data-install-engine-status="${CSS.escape(engine)}"]`,
+  );
+  if (!statusEl?.isConnected) return;
+
+  const fill = statusEl.querySelector<HTMLElement>(".local-asr-progress-fill");
+  const track = statusEl.querySelector<HTMLElement>(".local-asr-progress-track");
+  const percentEl = statusEl.querySelector<HTMLElement>(".local-asr-progress-percent");
+  const messageEl = statusEl.querySelector<HTMLElement>(".local-asr-progress-message");
+
+  const current = Number(track?.getAttribute("aria-valuenow") ?? "0");
+  const next = Math.max(current, percent);
+
+  if (fill) fill.style.width = `${next}%`;
+  if (track) track.setAttribute("aria-valuenow", String(next));
+  if (percentEl) percentEl.textContent = `${next}%`;
+  if (messageEl) messageEl.textContent = message;
+}
+
+function reconcileConfirmedInstalls(statuses: LocalAsrEngineStatus[]): void {
+  for (const status of statuses) {
+    if (status.installed && localAsrInstallStates.get(status.engine)?.status === "succeeded") {
+      localAsrInstallStates.delete(status.engine);
+    }
+  }
+}
+
+async function fetchLocalAsrStatuses(): Promise<LocalAsrEngineStatus[]> {
+  const statuses = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status");
+  cachedLocalAsrStatuses = statuses;
+  reconcileConfirmedInstalls(statuses);
+  return statuses;
+}
+
+async function confirmLocalAsrInstalled(engine: string): Promise<boolean> {
+  for (let i = 0; i < 5; i++) {
+    try {
+      const statuses = await fetchLocalAsrStatuses();
+      if (statuses.some(s => s.engine === engine && s.installed)) return true;
+    } catch { /* retry */ }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return false;
+}
+
+// ---- Docker Page Status Loading ----
+
 async function loadDockerPageStatuses(): Promise<void> {
   const revision = ++dockerPageLoadRevision;
   const container = document.getElementById("localAsrContainer");
   if (!container) return;
 
-  container.innerHTML = renderLocalAsrSection({ kind: "loading" });
+  // 1. 保存済みのキャッシュで即時描画
+  const hasActiveInstall = [...localAsrInstallStates.values()]
+    .some(s => s.status === "installing" || s.status === "succeeded");
 
+  if (hasActiveInstall && cachedLocalAsrStatuses.length > 0) {
+    container.innerHTML = renderLocalAsrSection({
+      kind: "engines",
+      statuses: cachedLocalAsrStatuses,
+      installStates: localAsrInstallStates,
+    });
+  } else if (hasActiveInstall) {
+    container.innerHTML = renderLocalAsrInstallCache([...localAsrInstallStates.values()]);
+  } else {
+    container.innerHTML = renderLocalAsrSection({ kind: "loading" });
+  }
+
+  // 2. Docker状態を取得
   const dockerStatus = await loadAndRenderDockerStatus();
   if (revision !== dockerPageLoadRevision || currentPage !== "settings-docker") return;
 
@@ -2528,26 +2676,29 @@ async function loadDockerPageStatuses(): Promise<void> {
     return;
   }
 
+  // 3. Local ASR状態を取得し、キャッシュ更新 + ストアと統合
   await loadAndRenderLocalAsrStatus(revision);
 }
 
 async function loadAndRenderLocalAsrStatus(revision?: number): Promise<void> {
-  const container = document.getElementById("localAsrContainer");
-  if (!container) return;
-
-  container.innerHTML = renderLocalAsrSection({ kind: "loading" });
   try {
-    const engines = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status");
+    const engines = await fetchLocalAsrStatuses();
 
     if (revision !== undefined && (revision !== dockerPageLoadRevision || currentPage !== "settings-docker")) return;
-    if (!container.isConnected) return;
+    const container = document.getElementById("localAsrContainer");
+    if (!container?.isConnected) return;
 
-    container.innerHTML = renderLocalAsrSection({ kind: "engines", statuses: engines });
+    container.innerHTML = renderLocalAsrSection({
+      kind: "engines",
+      statuses: engines,
+      installStates: localAsrInstallStates,
+    });
   } catch (e) {
     console.error("local_asr_get_status error:", e);
 
     if (revision !== undefined && (revision !== dockerPageLoadRevision || currentPage !== "settings-docker")) return;
-    if (!container.isConnected) return;
+    const container = document.getElementById("localAsrContainer");
+    if (!container?.isConnected) return;
 
     container.innerHTML = renderLocalAsrSection({
       kind: "load-error",
