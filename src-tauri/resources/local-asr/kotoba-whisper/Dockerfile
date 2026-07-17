@@ -67,6 +67,7 @@ ENV TMPDIR=/work/tmp
 ENV TEMP=/work/tmp
 ENV TMP=/work/tmp
 
+COPY common/output_writer.py /app/output_writer.py
 COPY kotoba-whisper/diar_asr.py /app/diar_asr.py
 
 CMD ["/opt/venv/bin/python", "/app/diar_asr.py"]

@@ -52,6 +52,8 @@ pub struct AppSettings {
     pub speaker_diarization: bool,
     #[serde(default)]
     pub num_speakers: String, // "auto" or numeric string like "2"
+    #[serde(default)]
+    pub output_path: String, // last selected output folder path
 }
 
 impl Default for AppSettings {
@@ -63,6 +65,7 @@ impl Default for AppSettings {
             asr_languages: HashMap::new(),
             speaker_diarization: true,
             num_speakers: "auto".to_string(),
+            output_path: String::new(),
         }
     }
 }
@@ -259,6 +262,15 @@ fn save_asr_selection(
     fs::write(&path, json).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn save_output_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let settings_path = settings_path(&app);
+    let mut settings = load_settings(&app);
+    settings.output_path = path;
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    fs::write(&settings_path, json).map_err(|e| e.to_string())
+}
+
 // ---- Local ASR Transcription ----
 
 #[derive(Serialize, Clone)]
@@ -272,11 +284,20 @@ struct LocalAsrTranscriptionProgress {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct SavedOutputFile {
+    format: String,
+    path: String,
+    file_name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TranscriptionResult {
     txt_content: String,
-    vtt_content: String,
+    vtt_content: Option<String>,
     engine: String,
     language: String,
+    saved_files: Vec<SavedOutputFile>,
 }
 
 fn validate_job_id(job_id: &str) -> Result<(), String> {
@@ -429,6 +450,7 @@ fn build_transcribe_env_vars(
     engine: &str,
     settings: &AppSettings,
     input_filename: &str,
+    output_formats: &[String],
 ) -> Result<Vec<(String, String)>, String> {
     let language_code = settings.asr_languages.get(engine).map(|s| s.as_str()).unwrap_or("ja");
     let mut vars = vec![
@@ -436,6 +458,7 @@ fn build_transcribe_env_vars(
         ("WORK_SOURCE".to_string(), "/work/source".to_string()),
         ("WORK_OUTPUT".to_string(), "/work/output".to_string()),
         ("WORK_TMP".to_string(), "/work/tmp".to_string()),
+        ("OUTPUT_FORMATS".to_string(), output_formats.join(",")),
     ];
     // 話者数（auto時は渡さない）
     let num = &settings.num_speakers;
@@ -541,6 +564,10 @@ async fn read_stderr_lines(
     lines
 }
 
+fn container_name(job_id: &str) -> String {
+    format!("asr-composer-job-{job_id}")
+}
+
 async fn run_docker_transcribe(
     app: &tauri::AppHandle,
     job_id: &str,
@@ -568,8 +595,11 @@ async fn run_docker_transcribe(
     let output_mount = format!("{output_str}:/work/output");
     let tmp_mount = format!("{tmp_str}:/work/tmp");
 
+    let cname = container_name(job_id);
+
     let mut cmd = Command::new("docker");
     cmd.arg("run").arg("--rm").arg("--gpus").arg("all");
+    cmd.arg("--name").arg(&cname);
     cmd.arg("-v").arg(&source_mount);
     cmd.arg("-v").arg(&output_mount);
     cmd.arg("-v").arg(&tmp_mount);
@@ -630,11 +660,36 @@ async fn run_docker_transcribe(
     Ok(())
 }
 
+const ALLOWED_OUTPUT_FORMATS: &[&str] = &["txt", "json", "md", "srt", "csv", "vtt"];
+
+fn resolve_output_dir(output_path: &str) -> Result<std::path::PathBuf, String> {
+    if output_path.is_empty() {
+        // Downloadsフォルダを取得
+        let dirs = directories::UserDirs::new()
+            .ok_or("ユーザーのホームディレクトリを取得できませんでした")?;
+        let downloads = dirs
+            .download_dir()
+            .ok_or("Downloadsフォルダを取得できませんでした")?;
+        Ok(downloads.to_path_buf())
+    } else {
+        let path = std::path::Path::new(output_path);
+        if !path.exists() {
+            return Err(format!("指定された保存先が存在しません: {}", output_path));
+        }
+        if !path.is_dir() {
+            return Err(format!("保存先はディレクトリを指定してください: {}", output_path));
+        }
+        Ok(path.to_path_buf())
+    }
+}
+
 #[tauri::command]
 async fn local_asr_transcribe(
     app: tauri::AppHandle,
     job_id: String,
     audio_path: String,
+    output_path: String,
+    output_formats: Vec<String>,
 ) -> Result<TranscriptionResult, String> {
     // jobId検証
     validate_job_id(&job_id)?;
@@ -642,8 +697,21 @@ async fn local_asr_transcribe(
     // 入力バリデーション
     validate_transcribe_input(&app, &audio_path)?;
 
+    // 出力形式検証
+    for fmt in &output_formats {
+        if !ALLOWED_OUTPUT_FORMATS.contains(&fmt.as_str()) {
+            return Err(format!("未対応の出力形式です: {}", fmt));
+        }
+    }
+    if output_formats.is_empty() {
+        return Err("出力を1形式以上選択してください".to_string());
+    }
+
     let settings = load_settings(&app);
     let engine = settings.asr_engine.clone();
+
+    // 保存先ディレクトリ解決
+    let save_dir = resolve_output_dir(&output_path)?;
 
     // ワークディレクトリ作成
     let app_data = app
@@ -677,7 +745,7 @@ async fn local_asr_transcribe(
     emit_transcribe_progress(&app, &job_id, "preparing", "準備中...");
 
     // 環境変数構築
-    let env_vars = build_transcribe_env_vars(&engine, &settings, &input_filename)?;
+    let env_vars = build_transcribe_env_vars(&engine, &settings, &input_filename, &output_formats)?;
 
     // HF_TOKEN取得（話者分離ON前提、Phase A）
     let hf_token = get_hf_token_value()?;
@@ -702,13 +770,57 @@ async fn local_asr_transcribe(
     let result = match run_result {
         Ok(()) => {
             emit_transcribe_progress(&app, &job_id, "reading_output", "出力を読み込み中...");
+
+            // GUI表示用TXTは常に読み込む
             let txt_path = output_dir.join(format!("{output_stem}.txt"));
-            let vtt_path = output_dir.join(format!("{output_stem}.vtt"));
             let txt = fs::read_to_string(&txt_path)
                 .map_err(|e| format!("TXT読み込みエラー ({}): {e}", txt_path.display()))?;
-            let vtt = fs::read_to_string(&vtt_path)
-                .map_err(|e| format!("VTT読み込みエラー ({}): {e}", vtt_path.display()))?;
+
+            // VTTはvtt選択時のみ読み込む
+            let vtt = if output_formats.contains(&"vtt".to_string()) {
+                let vtt_path = output_dir.join(format!("{output_stem}.vtt"));
+                Some(fs::read_to_string(&vtt_path)
+                    .map_err(|e| format!("VTT読み込みエラー ({}): {e}", vtt_path.display()))?)
+            } else {
+                None
+            };
+
+            // ユーザー保存先へコピー
+            let mut saved_files: Vec<SavedOutputFile> = Vec::new();
+            let mut copy_errors: Vec<String> = Vec::new();
+
+            for fmt in &output_formats {
+                let ext = fmt.as_str();
+                let src_name = format!("{output_stem}.{ext}");
+                let src_path = output_dir.join(&src_name);
+                if !src_path.exists() {
+                    copy_errors.push(format!("{}: 一時ファイルが見つかりません", src_name));
+                    continue;
+                }
+                let dest_path = save_dir.join(&src_name);
+                match fs::copy(&src_path, &dest_path) {
+                    Ok(_) => {
+                        saved_files.push(SavedOutputFile {
+                            format: ext.to_string(),
+                            path: dest_path.to_string_lossy().to_string(),
+                            file_name: src_name,
+                        });
+                    }
+                    Err(e) => {
+                        copy_errors.push(format!("{}: コピーエラー: {}", src_name, e));
+                    }
+                }
+            }
+
             emit_transcribe_progress(&app, &job_id, "completed", "完了");
+
+            if !copy_errors.is_empty() {
+                return Err(format!(
+                    "一部のファイル保存に失敗しました:\n{}",
+                    copy_errors.join("\n")
+                ));
+            }
+
             Ok(TranscriptionResult {
                 txt_content: txt,
                 vtt_content: vtt,
@@ -718,6 +830,7 @@ async fn local_asr_transcribe(
                     .get(&settings.asr_engine)
                     .cloned()
                     .unwrap_or_else(|| "ja".to_string()),
+                saved_files,
             })
         }
         Err(e) => Err(e),
@@ -729,6 +842,73 @@ async fn local_asr_transcribe(
     }
 
     result
+}
+
+#[tauri::command]
+async fn cancel_transcription(
+    _app: tauri::AppHandle,
+    job_id: String,
+) -> Result<String, String> {
+    validate_job_id(&job_id)?;
+
+    let cname = container_name(&job_id);
+
+    // docker path を取得
+    let docker_path = find_docker_cli().ok_or("Dockerがインストールされていません")?;
+
+    // docker context を取得
+    let docker_context = resolve_docker_context(&docker_path)
+        .await
+        .unwrap_or_default();
+
+    // docker stop --timeout 3 <container_name>
+    let mut stop_cmd = tokio::process::Command::new(&docker_path);
+    if !docker_context.is_empty() {
+        stop_cmd.arg("--context").arg(&docker_context);
+    }
+    stop_cmd.arg("stop").arg("--timeout").arg("3").arg(&cname);
+
+    let stop_output = stop_cmd
+        .output()
+        .await
+        .map_err(|e| format!("docker stop実行エラー: {e}"))?;
+
+    if stop_output.status.success() {
+        return Ok("stopped".to_string());
+    }
+
+    let stderr = String::from_utf8_lossy(&stop_output.stderr);
+
+    // No such container → すでに終了済み
+    if stderr.contains("No such container") {
+        return Ok("already-finished".to_string());
+    }
+
+    // stopが失敗した場合はkillを試行
+    let mut kill_cmd = tokio::process::Command::new(&docker_path);
+    if !docker_context.is_empty() {
+        kill_cmd.arg("--context").arg(&docker_context);
+    }
+    kill_cmd.arg("kill").arg(&cname);
+
+    let kill_output = kill_cmd
+        .output()
+        .await
+        .map_err(|e| format!("docker kill実行エラー: {e}"))?;
+
+    if kill_output.status.success() {
+        return Ok("stopped".to_string());
+    }
+
+    let kill_stderr = String::from_utf8_lossy(&kill_output.stderr);
+    if kill_stderr.contains("No such container") {
+        return Ok("already-finished".to_string());
+    }
+
+    Err(format!(
+        "コンテナの停止に失敗しました: {}",
+        stderr.trim()
+    ))
 }
 
 #[tauri::command]
@@ -4031,6 +4211,7 @@ pub fn run() {
             save_provider_config,
             save_provider_secret,
             save_asr_selection,
+            save_output_path,
             fetch_models,
             test_connection_ollama,
             test_llm_connection,
@@ -4052,6 +4233,7 @@ pub fn run() {
             local_asr_install,
             local_asr_uninstall,
             local_asr_transcribe,
+            cancel_transcription,
             save_text_file
         ])
         .run(tauri::generate_context!())

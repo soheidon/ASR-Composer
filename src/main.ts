@@ -357,14 +357,14 @@ const transcribePage = `
         <h3 class="section-header"><span class="section-title">音声認識設定</span></h3>
         <div class="engine-row">
           <label class="field-label">ASRエンジン</label>
-          <div class="engine-select-wrap">
-            <select class="engine-select asr-mode-select" id="asrModeSelect">
-              <option value="cloud">クラウド/API</option>
+          <div class="engine-select-wrap engine-select-wrap-mode">
+            <select class="engine-select" id="asrModeSelect">
+              <option value="cloud">API</option>
               <option value="local">ローカル</option>
             </select>
             <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
           </div>
-          <div class="engine-select-wrap">
+          <div class="engine-select-wrap engine-select-wrap-engine">
             <select class="engine-select" id="engineSelect">
               <!-- TypeScriptで動的に生成 -->
             </select>
@@ -376,22 +376,22 @@ const transcribePage = `
         </div>
         <div class="engine-row">
           <label class="field-label">音声の言語</label>
-          <div class="engine-select-wrap engine-select-narrow">
+          <div class="engine-select-wrap engine-select-wrap-fixed">
             <select class="engine-select" id="langSelect">
               <!-- TypeScriptで動的に生成 -->
             </select>
             <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
           </div>
-          <label class="field-label-inline" id="speakerDiarizationLabelWrap">話者分離</label>
-          <div class="toggle-wrap">
-            <label class="toggle-switch">
-              <input type="checkbox" id="speakerDiarizationToggle" checked>
-              <span class="toggle-slider"></span>
-            </label>
-            <span class="toggle-label" id="speakerDiarizationLabel">する</span>
+          <label class="field-label-inline">話者分離</label>
+          <div class="engine-select-wrap engine-select-wrap-compact">
+            <select class="engine-select" id="speakerDiarizationSelect">
+              <option value="true">する</option>
+              <option value="false">しない</option>
+            </select>
+            <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
           </div>
           <label class="field-label-inline" id="numSpeakersLabel">話者数</label>
-          <div class="engine-select-wrap engine-select-compact" id="numSpeakersRow">
+          <div class="engine-select-wrap engine-select-wrap-compact" id="numSpeakersRow">
             <select class="engine-select" id="numSpeakersSelect">
               <option value="auto">自動</option>
               <option value="1">1人</option>
@@ -436,8 +436,8 @@ const transcribePage = `
               <p class="path-hint">指定しない場合はデフォルトのダウンロードフォルダに保存されます</p>
             </div>
             <div class="path-row">
-              <input type="text" class="path-input" placeholder="/Users/username/Documents/Transcripts" />
-              <button class="btn-icon" title="フォルダを参照">
+              <input type="text" class="path-input" id="outputPathInput" placeholder="/Users/username/Documents/Transcripts" />
+              <button class="btn-icon" id="browseOutputPathBtn" title="フォルダを参照" type="button">
                 <span class="material-symbols-outlined">folder_open</span>
               </button>
             </div>
@@ -445,12 +445,12 @@ const transcribePage = `
           <div>
             <label class="field-label">出力形式</label>
             <div class="format-options">
-              <label class="format-option"><input type="checkbox" checked /><span>テキスト</span></label>
-              <label class="format-option"><input type="checkbox" /><span>JSON</span></label>
-              <label class="format-option"><input type="checkbox" /><span>Markdown</span></label>
-              <label class="format-option"><input type="checkbox" /><span>SRT</span></label>
-              <label class="format-option"><input type="checkbox" /><span>CSV</span></label>
-              <label class="format-option"><input type="checkbox" /><span>VTT</span></label>
+              <label class="format-option"><input type="checkbox" class="output-format-checkbox" value="txt" checked /><span>テキスト</span></label>
+              <label class="format-option"><input type="checkbox" class="output-format-checkbox" value="json" /><span>JSON</span></label>
+              <label class="format-option"><input type="checkbox" class="output-format-checkbox" value="md" /><span>Markdown</span></label>
+              <label class="format-option"><input type="checkbox" class="output-format-checkbox" value="srt" /><span>SRT</span></label>
+              <label class="format-option"><input type="checkbox" class="output-format-checkbox" value="csv" /><span>CSV</span></label>
+              <label class="format-option"><input type="checkbox" class="output-format-checkbox" value="vtt" /><span>VTT</span></label>
             </div>
           </div>
         </div>
@@ -460,6 +460,10 @@ const transcribePage = `
         <button class="btn-primary" id="startBtn">
           <span class="material-symbols-outlined">play_circle</span>
           <span class="btn-primary-text">文字起こしを開始</span>
+        </button>
+        <button class="btn-danger" id="cancelBtn" style="display:none">
+          <span class="material-symbols-outlined">cancel</span>
+          <span>中止</span>
         </button>
       </div>
 
@@ -471,6 +475,7 @@ const transcribePage = `
       <section class="section-card" id="resultSection" style="display:none">
         <h3 class="section-header"><span class="section-title">文字起こし結果</span></h3>
         <textarea class="result-textarea" id="resultText" readonly rows="15"></textarea>
+        <div class="saved-files-info" id="savedFilesInfo" style="display:none"></div>
         <div class="result-actions">
           <button class="btn-ghost" id="copyResultBtn">コピー</button>
           <button class="btn-ghost" id="saveResultBtn">保存</button>
@@ -749,6 +754,12 @@ let sidebarDelegationBound = false;
 let dockerPageLoadRevision = 0;
 
 // ---- Local ASR Install State ----
+const LOCAL_ASR_DISPLAY_NAMES: Record<string, string> = {
+  "reazonspeech": "ReazonSpeech",
+  "kotoba-whisper": "Kotoba Whisper",
+  "qwen3-asr": "Qwen3 ASR",
+};
+
 const localAsrInstallStates = new Map<string, LocalAsrInstallState>();
 const localAsrInstallPromises = new Map<string, Promise<void>>();
 let localAsrProgressListenerPromise: Promise<void> | null = null;
@@ -924,7 +935,7 @@ async function saveAsrSelection(): Promise<void> {
   const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement | null;
   const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement | null;
   const languageSelect = document.getElementById("langSelect") as HTMLSelectElement | null;
-  const speakerToggle = document.getElementById("speakerDiarizationToggle") as HTMLInputElement | null;
+  const speakerSelect = document.getElementById("speakerDiarizationSelect") as HTMLSelectElement | null;
   const numSpeakersSelect = document.getElementById("numSpeakersSelect") as HTMLSelectElement | null;
   if (!modeSelect || !engineSelect) {
     return;
@@ -934,7 +945,7 @@ async function saveAsrSelection(): Promise<void> {
       mode: modeSelect.value,
       engine: engineSelect.value || "",
       language: languageSelect?.value || "",
-      speakerDiarization: speakerToggle?.checked ?? true,
+      speakerDiarization: speakerSelect?.value !== "false",
       numSpeakers: numSpeakersSelect?.value || "auto",
     });
   } catch (error) {
@@ -973,13 +984,9 @@ async function restoreAsrSelection(): Promise<void> {
   const savedLanguage = settings.asr_languages?.[restoredEngine] ?? "";
   populateLanguagesForEngine(restoredEngine, savedLanguage);
 
-  const speakerToggle = document.getElementById("speakerDiarizationToggle") as HTMLInputElement | null;
-  if (speakerToggle) {
-    speakerToggle.checked = settings.speaker_diarization !== false;
-    const speakerLabel = document.getElementById("speakerDiarizationLabel");
-    if (speakerLabel) {
-      speakerLabel.textContent = speakerToggle.checked ? "する" : "しない";
-    }
+  const speakerSelect = document.getElementById("speakerDiarizationSelect") as HTMLSelectElement | null;
+  if (speakerSelect) {
+    speakerSelect.value = settings.speaker_diarization !== false ? "true" : "false";
   }
 
   const numSpeakersSelect = document.getElementById("numSpeakersSelect") as HTMLSelectElement | null;
@@ -988,7 +995,7 @@ async function restoreAsrSelection(): Promise<void> {
     const savedNum = settings.num_speakers || "auto";
     const hasOption = Array.from(numSpeakersSelect.options).some((o) => o.value === savedNum);
     numSpeakersSelect.value = hasOption ? savedNum : "auto";
-    const isEnabled = speakerToggle?.checked ?? true;
+    const isEnabled = speakerSelect?.value !== "false";
     numSpeakersSelect.disabled = !isEnabled;
     if (numSpeakersRow) {
       numSpeakersRow.style.opacity = isEnabled ? "" : "0.5";
@@ -997,6 +1004,11 @@ async function restoreAsrSelection(): Promise<void> {
 
   if (settings.asr_mode !== savedMode || settings.asr_engine !== restoredEngine) {
     await saveAsrSelection();
+  }
+
+  if (settings.output_path) {
+    const outputInput = document.querySelector<HTMLInputElement>(".path-input");
+    if (outputInput) outputInput.value = settings.output_path;
   }
 }
 
@@ -1017,26 +1029,30 @@ function bindAsrModeSelect(): void {
     return;
   }
   modeSelect.addEventListener("change", async () => {
-    const savedLanguages = await loadAsrLanguages();
-    if (modeSelect.value === "local") {
-      lastCloudEngine = engineSelect.value || "";
-      await populateLocalEngines(engineSelect);
-      if (hasSelectableOption(engineSelect, lastLocalEngine)) {
-        engineSelect.value = lastLocalEngine;
+    try {
+      const savedLanguages = await loadAsrLanguages();
+      if (modeSelect.value === "local") {
+        lastCloudEngine = engineSelect.value || "";
+        await populateLocalEngines(engineSelect);
+        if (hasSelectableOption(engineSelect, lastLocalEngine)) {
+          engineSelect.value = lastLocalEngine;
+        }
+        lastLocalEngine = engineSelect.value || "";
+      } else {
+        lastLocalEngine = engineSelect.value || "";
+        await populateCloudEngines(engineSelect);
+        if (hasSelectableOption(engineSelect, lastCloudEngine)) {
+          engineSelect.value = lastCloudEngine;
+        }
+        lastCloudEngine = engineSelect.value || "";
       }
-      lastLocalEngine = engineSelect.value || "";
-    } else {
-      lastLocalEngine = engineSelect.value || "";
-      await populateCloudEngines(engineSelect);
-      if (hasSelectableOption(engineSelect, lastCloudEngine)) {
-        engineSelect.value = lastCloudEngine;
-      }
-      lastCloudEngine = engineSelect.value || "";
+      const currentEngine = engineSelect.value || "";
+      const savedLanguage = savedLanguages[currentEngine] ?? "";
+      populateLanguagesForEngine(currentEngine, savedLanguage);
+      await saveAsrSelection();
+    } catch (e) {
+      console.error("bindAsrModeSelect change handler error:", e);
     }
-    const currentEngine = engineSelect.value || "";
-    const savedLanguage = savedLanguages[currentEngine] ?? "";
-    populateLanguagesForEngine(currentEngine, savedLanguage);
-    await saveAsrSelection();
   });
   engineSelect.addEventListener("change", async () => {
     if (modeSelect.value === "local") {
@@ -1055,20 +1071,17 @@ function bindAsrModeSelect(): void {
       void saveAsrSelection();
     });
   }
-  const speakerToggle = document.getElementById("speakerDiarizationToggle") as HTMLInputElement | null;
-  if (speakerToggle) {
-    speakerToggle.addEventListener("change", () => {
-      const speakerLabel = document.getElementById("speakerDiarizationLabel");
-      if (speakerLabel) {
-        speakerLabel.textContent = speakerToggle.checked ? "する" : "しない";
-      }
+  const speakerSelectEl = document.getElementById("speakerDiarizationSelect") as HTMLSelectElement | null;
+  if (speakerSelectEl) {
+    speakerSelectEl.addEventListener("change", () => {
       const numSpeakersSelect = document.getElementById("numSpeakersSelect") as HTMLSelectElement | null;
       const numSpeakersRow = document.getElementById("numSpeakersRow");
+      const enabled = speakerSelectEl.value !== "false";
       if (numSpeakersSelect) {
-        numSpeakersSelect.disabled = !speakerToggle.checked;
+        numSpeakersSelect.disabled = !enabled;
       }
       if (numSpeakersRow) {
-        numSpeakersRow.style.opacity = speakerToggle.checked ? "" : "0.5";
+        numSpeakersRow.style.opacity = enabled ? "" : "0.5";
       }
       void saveAsrSelection();
     });
@@ -1230,13 +1243,27 @@ async function navigateTo(page: PageName) {
     void loadAndRenderHuggingFaceToken();
     bindLocalAsrDelegation();
   } else if (page === "transcribe") {
-    await restoreAsrSelection();
+    try {
+      await restoreAsrSelection();
+    } catch (e) {
+      console.error("restoreAsrSelection failed:", e);
+      // restoreに失敗してもbindは実行する（ブラウザプレビュー等）
+      bindAsrModeSelect();
+      bindAsrEngineSettingsButton();
+      bindFileSelection();
+      bindStartButton();
+      await bindTranscribeProgress();
+      bindResultButtons();
+      bindBrowseOutputPath();
+      return;
+    }
     bindAsrModeSelect();
     bindAsrEngineSettingsButton();
     bindFileSelection();
     bindStartButton();
     await bindTranscribeProgress();
     bindResultButtons();
+    bindBrowseOutputPath();
   }
 }
 
@@ -1367,11 +1394,18 @@ function bindAccordions() {
 
 // ---- Transcription Pipeline ----
 
+type SavedOutputFile = {
+  format: string;
+  path: string;
+  fileName: string;
+};
+
 type TranscriptionResult = {
-  txt_content: string;
-  vtt_content: string;
+  txtContent: string;
+  vttContent: string | null;
   engine: string;
   language: string;
+  savedFiles: SavedOutputFile[];
 };
 
 type TranscriptionProgress = {
@@ -1383,7 +1417,9 @@ type TranscriptionProgress = {
 
 let selectedFilePath: string | null = null;
 let activeJobId: string | null = null;
+let cancelRequested = false;
 let unlistenTranscriptionProgress: (() => void) | null = null;
+let unlistenFileDragDrop: (() => void) | null = null;
 
 async function chooseAudioFile(): Promise<void> {
   const { open } = await import("@tauri-apps/plugin-dialog");
@@ -1411,6 +1447,8 @@ function updateFileDisplay(filePath: string): void {
   }
 }
 
+const ALLOWED_AUDIO_EXTENSIONS = new Set(["mp3", "wav", "mp4", "m4a", "flac"]);
+
 function bindFileSelection(): void {
   const dropZone = document.getElementById("dropZone");
   const selectFileBtn = document.getElementById("selectFileBtn");
@@ -1421,6 +1459,58 @@ function bindFileSelection(): void {
   dropZone?.addEventListener("click", () => {
     void chooseAudioFile();
   });
+
+  void bindTauriFileDragDrop();
+}
+
+async function bindTauriFileDragDrop(): Promise<void> {
+  try {
+    unlistenFileDragDrop?.();
+    unlistenFileDragDrop = null;
+
+    const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+    const webview = getCurrentWebview();
+
+    unlistenFileDragDrop = await webview.onDragDropEvent((event) => {
+      const dz = document.getElementById("dropZone");
+      if (!dz) return;
+
+      if (event.payload.type === "leave") {
+        dz.classList.remove("is-drag-over");
+        return;
+      }
+
+      if (event.payload.type === "enter" || event.payload.type === "over") {
+        dz.classList.add("is-drag-over");
+        return;
+      }
+
+      if (event.payload.type !== "drop") return;
+
+      dz.classList.remove("is-drag-over");
+
+      const paths = event.payload.paths;
+      if (!paths || paths.length === 0) return;
+
+      const filePath = paths[0];
+      const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
+
+      if (!ALLOWED_AUDIO_EXTENSIONS.has(ext)) {
+        void showAppDialog({
+          title: "対応していないファイル形式",
+          message: "対応フォーマット: MP3, WAV, MP4, M4A, FLAC",
+          type: "error",
+        });
+        return;
+      }
+
+      selectedFilePath = filePath;
+      updateFileDisplay(filePath);
+    });
+
+  } catch (error) {
+    console.error("[drag-drop] listener registration failed", error);
+  }
 }
 
 function showProgressSection(stage: string): void {
@@ -1465,34 +1555,94 @@ async function bindTranscribeProgress(): Promise<void> {
   );
 }
 
+function setTranscriptionRunning(running: boolean): void {
+  const startBtn = document.getElementById("startBtn") as HTMLButtonElement | null;
+  const cancelBtn = document.getElementById("cancelBtn") as HTMLButtonElement | null;
+  if (!startBtn || !cancelBtn) return;
+
+  startBtn.disabled = running;
+  startBtn.innerHTML = running
+    ? `<span class="material-symbols-outlined transcription-hourglass">hourglass_top</span>
+       <span class="btn-primary-text">文字起こし中...</span>`
+    : `<span class="material-symbols-outlined">play_circle</span>
+       <span class="btn-primary-text">文字起こしを開始</span>`;
+
+  cancelBtn.style.display = running ? "inline-flex" : "none";
+  cancelBtn.disabled = false;
+  const cancelLabel = cancelBtn.querySelector("span:last-child");
+  if (cancelLabel) cancelLabel.textContent = "中止";
+}
+
 function bindStartButton(): void {
   const startBtn = document.getElementById("startBtn");
+  const cancelBtn = document.getElementById("cancelBtn") as HTMLButtonElement | null;
+
   startBtn?.addEventListener("click", async () => {
     if (!selectedFilePath) {
       const { showAppDialog } = await import("./status");
       showAppDialog({ title: "エラー", message: "音声ファイルを選択してください", type: "error" });
       return;
     }
+
+    const outputPath =
+      (document.getElementById("outputPathInput") as HTMLInputElement | null)
+        ?.value.trim() ?? "";
+    const outputFormats = Array.from(
+      document.querySelectorAll<HTMLInputElement>(".output-format-checkbox:checked"),
+    ).map((el) => el.value);
+
+    if (outputFormats.length === 0) {
+      const { showAppDialog } = await import("./status");
+      showAppDialog({ title: "エラー", message: "出力を1形式以上選択してください", type: "error" });
+      return;
+    }
+
     const jobId = crypto.randomUUID();
     activeJobId = jobId;
-    (startBtn as HTMLButtonElement).disabled = true;
+    cancelRequested = false;
+    setTranscriptionRunning(true);
     showProgressSection("準備中...");
     hideResultSection();
+
     try {
       const result = await invokeTauri<TranscriptionResult>("local_asr_transcribe", {
         jobId,
         audioPath: selectedFilePath,
+        outputPath,
+        outputFormats,
       });
-      displayTranscriptionResult(result);
+      if (!cancelRequested) {
+        displayTranscriptionResult(result);
+      }
     } catch (error) {
-      const { showAppDialog } = await import("./status");
-      showAppDialog({ title: "文字起こしエラー", message: String(error), type: "error" });
+      if (!cancelRequested) {
+        const { showAppDialog } = await import("./status");
+        showAppDialog({ title: "文字起こしエラー", message: String(error), type: "error" });
+      }
     } finally {
-      (startBtn as HTMLButtonElement).disabled = false;
+      setTranscriptionRunning(false);
       hideProgressSection();
+      if (cancelRequested) {
+        const stageEl = document.getElementById("progressStage");
+        if (stageEl) stageEl.textContent = "中止済み";
+        hideProgressSection();
+      }
       if (activeJobId === jobId) {
         activeJobId = null;
       }
+    }
+  });
+
+  cancelBtn?.addEventListener("click", async () => {
+    if (!activeJobId) return;
+    cancelRequested = true;
+    cancelBtn.disabled = true;
+    const cancelLabel = cancelBtn.querySelector("span:last-child");
+    if (cancelLabel) cancelLabel.textContent = "中止中...";
+    try {
+      await invokeTauri("cancel_transcription", { jobId: activeJobId });
+    } catch (e) {
+      console.error("cancel_transcription error:", e);
     }
   });
 }
@@ -1501,8 +1651,37 @@ function displayTranscriptionResult(result: TranscriptionResult): void {
   showResultSection();
   const textArea = document.getElementById("resultText") as HTMLTextAreaElement | null;
   if (textArea) {
-    textArea.value = result.txt_content;
+    textArea.value = result.txtContent;
   }
+  const savedFilesEl = document.getElementById("savedFilesInfo");
+  if (savedFilesEl && result.savedFiles.length > 0) {
+    const dir = result.savedFiles[0].path.replace(/[\\/][^\\/]+$/, "");
+    const list = result.savedFiles.map((f) => `・${f.fileName}`).join("\n");
+    savedFilesEl.textContent = `保存済み:\n${list}\n保存先: ${dir}`;
+    savedFilesEl.style.display = "";
+  } else if (savedFilesEl) {
+    savedFilesEl.style.display = "none";
+  }
+}
+
+function bindBrowseOutputPath(): void {
+  const btn = document.getElementById("browseOutputPathBtn");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const folder = await open({ directory: true, multiple: false });
+      if (folder) {
+        const input = document.querySelector<HTMLInputElement>(".path-input");
+        if (input) input.value = folder;
+        void invokeTauri("save_output_path", { path: folder }).catch((e: unknown) => {
+          console.error("save_output_path error:", e);
+        });
+      }
+    } catch (e) {
+      console.error("browseOutputPath error:", e);
+    }
+  });
 }
 
 function bindResultButtons(): void {
@@ -1547,6 +1726,7 @@ interface SavedAppSettings {
   asr_languages: Record<string, string>;
   speaker_diarization: boolean;
   num_speakers: string;
+  output_path: string;
 }
 
 async function loadSavedSettings() {
@@ -3100,9 +3280,10 @@ async function handleLocalAsrUninstall(
   button: HTMLButtonElement,
 ): Promise<void> {
   const originalHtml = button.innerHTML;
+  const displayName = LOCAL_ASR_DISPLAY_NAMES[engine] ?? engine;
 
   const confirmed = await showAppConfirm({
-    title: "ReazonSpeech環境を削除",
+    title: `${displayName}環境を削除`,
     message: "Dockerイメージを削除します。モデルキャッシュや出力ファイルは削除されません。",
     confirmText: "削除する",
     cancelText: "キャンセル",
@@ -3129,7 +3310,7 @@ async function handleLocalAsrUninstall(
     const message = e instanceof Error ? e.message : String(e);
 
     await showAppDialog({
-      title: "ReazonSpeech環境の削除",
+      title: `${displayName}環境の削除`,
       message: `削除に失敗しました: ${message}`,
       type: "error",
     });

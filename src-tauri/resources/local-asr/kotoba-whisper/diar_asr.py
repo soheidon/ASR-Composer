@@ -569,27 +569,16 @@ except Exception as e:
     raise
 
 # ================================
-# Write outputs
+# Write outputs (共通output_writer使用)
 # ================================
+import sys
+sys.path.insert(0, "/app")
+from output_writer import parse_output_formats, write_outputs
 
-def fmt_vtt(t):
-    td = datetime.timedelta(seconds=float(t))
-    m, s = divmod(td.seconds, 60)
-    h, m = divmod(m, 60)
-    ms = td.microseconds // 1000
-    return f"{h:02}:{m:02}:{s:02}.{ms:03}"
-
-vtt_lines = ["WEBVTT\n"]
-for i, r in enumerate(results, 1):
-    vtt_lines.append(
-        f"{i}\n{fmt_vtt(r['start'])} --> {fmt_vtt(r['end'])}\n<v {r['speaker']}>{r['text']}</v>\n"
-    )
-
-(WORK_OUTPUT / f"{base}.vtt").write_text("\n".join(vtt_lines), encoding="utf-8")
-
-with (WORK_OUTPUT / f"{base}.txt").open("w", encoding="utf-8") as f:
-    for r in results:
-        f.write(f"[{r['speaker']}] {r['text']}\n")
+raw_formats = os.environ.get("OUTPUT_FORMATS", "txt,vtt")
+formats = parse_output_formats(raw_formats)
+generated = write_outputs(results, WORK_OUTPUT, base, formats, always_write_txt=True)
+log(f"[OK] 出力ファイル: {[str(p.name) for p in generated]}")
 
 # ================================
 # Cleanup

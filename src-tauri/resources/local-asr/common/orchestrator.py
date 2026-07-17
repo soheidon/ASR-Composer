@@ -42,14 +42,15 @@ def main():
 
     # 3. 出力生成
     print("[3/4] 結果を出力中...", flush=True)
-    sys.path.insert(0, "/app")
-    from output_writer import write_txt, write_vtt
+    from output_writer import parse_output_formats, write_outputs
     with open(transcript_json, encoding="utf-8") as f:
         results = json.load(f)
 
-    write_txt(results, os.path.join(WORK_OUTPUT, f"{stem}.txt"))
-    write_vtt(results, os.path.join(WORK_OUTPUT, f"{stem}.vtt"))
+    formats = parse_output_formats(os.environ.get("OUTPUT_FORMATS", "txt,vtt"))
+    generated = write_outputs(results, WORK_OUTPUT, stem, formats, always_write_txt=True)
+
     print(f"[4/4] 完了。{len(results)}セグメントを出力しました。", flush=True)
+    print(f"[OK] 出力ファイル: {[str(p.name) for p in generated]}", flush=True)
 
 
 if __name__ == "__main__":

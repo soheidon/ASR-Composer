@@ -81,6 +81,7 @@ ENV TMPDIR=/work/tmp
 ENV TEMP=/work/tmp
 ENV TMP=/work/tmp
 
+COPY common/output_writer.py /app/output_writer.py
 COPY qwen3-asr/diar_asr.py /app/diar_asr.py
 
 ENV ASR_ENGINE=qwen3-asr
