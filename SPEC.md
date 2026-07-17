@@ -1546,3 +1546,84 @@ Stitchでは、まず以下の6画面を作成する。
 | `crop_square` | 最大化ボタン |
 | `filter_none` | 最大化解除ボタン |
 | `close` | 閉じるボタン |
+
+---
+
+# 19. 実装状態
+
+## 19.1 実装済み機能
+
+### 文字起こしページ
+
+- ドラッグ＆ドロップ（Tauri v2 `onDragDropEvent`）
+- ファイル選択ダイアログ
+- ASRモード切替（API / ローカル）
+- ASRエンジン選択（動的リスト生成）
+- 音声言語選択（エンジンごとの候補表示）
+- 話者分離ON/OFF（セレクトボックス）
+- 話者数指定（自動 / 1〜8人）
+- 出力形式チェックボックス（TXT, JSON, MD, SRT, CSV, VTT）
+- 保存先フォルダ指定（フォルダ参照ダイアログ + パス記憶）
+- 文字起こし実行（Docker経由）
+- 文字起こし中止（名前付きDockerコンテナ + `docker stop`）
+- 実行中ボタン状態管理（「文字起こし中...」/ 砂時計アイコン回転）
+- 中止ボタン（赤色、二重押下防止）
+- 進捗表示
+- 結果表示（TXT本文）
+- 保存結果表示（ファイル名 + 保存先）
+- 結果のコピー・手動保存
+
+### 出力パイプライン
+
+- 6形式のwriter（TXT, JSON, MD, SRT, CSV, VTT）
+- 共通 `output_writer.py`（3エンジン共通利用）
+- `parse_output_formats` / `write_outputs` 統合関数
+- OUTPUT_FORMATS環境変数による形式指定
+- GUI用TXTの常時生成（ユーザー保存先へのコピーは選択形式のみ）
+- Rust側の保存先コピー（Docker一時出力 → ユーザー指定フォルダ）
+- Downloadsフォルダの自動解決（保存先未指定時）
+- `SavedOutputFile` 構造体による保存結果の返却
+
+### ローカルASRエンジン
+
+- ReazonSpeech（orchestrator.py → output_writer.py方式）
+- Kotoba Whisper（diar_asr.py → output_writer.py方式）
+- Qwen3 ASR（diar_asr.py → output_writer.py方式）
+- Dockerイメージの状態検出（image ls + ID inspect方式）
+- Docker context対応
+- インストール / アンインストール
+- 進捗バー表示
+- エンジン削除確認モーダル（エンジン名動的表示）
+
+### 設定ページ
+
+- APIプロバイダー設定（アコーディオン形式）
+- 環境変数保存 / Base URL設定 / 接続テスト
+- Google STT設定（プロジェクト選択、ADC確認）
+- Xiaomi MiMo ASR設定
+- Ollama設定
+- Docker設定（Docker Desktop状態、HF_TOKEN管理）
+- サイドバーナビゲーション
+
+### アプリ基盤
+
+- カスタムタイトルバー（ウィンドウドラッグ、最小化/最大化/閉じる）
+- ページ遷移（文字起こし / 統合 / 設定）
+- 設定の永続化（settings.json）
+- ダークテーマ対応（CSS Custom Properties）
+
+## 19.2 未実装機能
+
+以下はSPEC.mdに記載されているが、まだ実装されていない機能です。
+
+- 文字起こし統合ページ（複数ASR比較・統合）
+- 辞書機能（固有名詞辞書、専門用語辞書）
+- LLM修正機能（辞書・背景情報・LLMによる修正）
+- 正本編集（エディター、音声同期再生）
+- プロジェクト管理
+- 実行履歴
+- 初回起動ウィザード
+- 設定画面の一般・保存・プライバシー設定
+- 音声プレイヤーとの連携
+- 差分表示
+- ステップインジケーター
