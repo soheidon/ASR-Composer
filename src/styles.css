@@ -411,9 +411,10 @@ html, body {
   pointer-events: none;
 }
 
-.engine-select-mode {
-  min-width: 120px;
-  flex: 0 0 auto;
+.asr-mode-select {
+  width: 200px;
+  min-width: 200px;
+  flex: 0 0 200px;
 }
 
 .engine-select-narrow {
@@ -1959,4 +1960,39 @@ html, body {
 
 .btn-danger-outline:hover {
   background: rgba(239, 68, 68, 0.08);
+}
+
+/* ---- Transcription Progress & Result ---- */
+
+.progress-stage {
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--on-surface-variant);
+  padding: 12px 0;
+}
+
+.result-textarea {
+  width: 100%;
+  min-height: 200px;
+  padding: 12px;
+  font-family: var(--font-mono, "JetBrains Mono", monospace);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--on-surface);
+  background: var(--surface-container-lowest);
+  border: 1px solid var(--outline-variant);
+  border-radius: 4px;
+  resize: vertical;
+  outline: none;
+}
+
+.result-textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary);
+}
+
+.result-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
 }

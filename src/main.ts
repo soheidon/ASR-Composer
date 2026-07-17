@@ -358,7 +358,7 @@ const transcribePage = `
         <div class="engine-row">
           <label class="field-label">ASRエンジン</label>
           <div class="engine-select-wrap">
-            <select class="engine-select engine-select-mode" id="asrModeSelect">
+            <select class="engine-select asr-mode-select" id="asrModeSelect">
               <option value="cloud">クラウド/API</option>
               <option value="local">ローカル</option>
             </select>
@@ -462,6 +462,20 @@ const transcribePage = `
           <span class="btn-primary-text">文字起こしを開始</span>
         </button>
       </div>
+
+      <section class="section-card" id="transcribeProgressSection" style="display:none">
+        <h3 class="section-header"><span class="section-title">文字起こし中</span></h3>
+        <div class="progress-stage" id="progressStage">準備中...</div>
+      </section>
+
+      <section class="section-card" id="resultSection" style="display:none">
+        <h3 class="section-header"><span class="section-title">文字起こし結果</span></h3>
+        <textarea class="result-textarea" id="resultText" readonly rows="15"></textarea>
+        <div class="result-actions">
+          <button class="btn-ghost" id="copyResultBtn">コピー</button>
+          <button class="btn-ghost" id="saveResultBtn">保存</button>
+        </div>
+      </section>
 
     </div>
   </main>
@@ -920,8 +934,8 @@ async function saveAsrSelection(): Promise<void> {
       mode: modeSelect.value,
       engine: engineSelect.value || "",
       language: languageSelect?.value || "",
-      speaker_diarization: speakerToggle?.checked ?? true,
-      num_speakers: numSpeakersSelect?.value || "auto",
+      speakerDiarization: speakerToggle?.checked ?? true,
+      numSpeakers: numSpeakersSelect?.value || "auto",
     });
   } catch (error) {
     console.error("save_asr_selection error:", error);
@@ -1219,6 +1233,10 @@ async function navigateTo(page: PageName) {
     await restoreAsrSelection();
     bindAsrModeSelect();
     bindAsrEngineSettingsButton();
+    bindFileSelection();
+    bindStartButton();
+    await bindTranscribeProgress();
+    bindResultButtons();
   }
 }
 
@@ -1344,6 +1362,167 @@ function bindAccordions() {
         header.setAttribute("aria-expanded", "true");
       }
     });
+  });
+}
+
+// ---- Transcription Pipeline ----
+
+type TranscriptionResult = {
+  txt_content: string;
+  vtt_content: string;
+  engine: string;
+  language: string;
+};
+
+type TranscriptionProgress = {
+  jobId: string;
+  stage: string;
+  message: string;
+  logLine?: string;
+};
+
+let selectedFilePath: string | null = null;
+let activeJobId: string | null = null;
+let unlistenTranscriptionProgress: (() => void) | null = null;
+
+async function chooseAudioFile(): Promise<void> {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const file = await open({
+    multiple: false,
+    filters: [{ name: "Audio", extensions: ["mp3", "wav", "mp4", "m4a", "flac"] }],
+  });
+  if (file) {
+    selectedFilePath = file;
+    updateFileDisplay(file);
+  }
+}
+
+function updateFileDisplay(filePath: string): void {
+  const dropZone = document.getElementById("dropZone");
+  if (!dropZone) return;
+  const name = filePath.split(/[\\/]/).pop() ?? filePath;
+  const textEl = dropZone.querySelector(".drop-zone-text");
+  if (textEl) {
+    textEl.textContent = name;
+  }
+  const hintEl = dropZone.querySelector(".drop-zone-hint");
+  if (hintEl) {
+    hintEl.textContent = filePath;
+  }
+}
+
+function bindFileSelection(): void {
+  const dropZone = document.getElementById("dropZone");
+  const selectFileBtn = document.getElementById("selectFileBtn");
+  selectFileBtn?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    void chooseAudioFile();
+  });
+  dropZone?.addEventListener("click", () => {
+    void chooseAudioFile();
+  });
+}
+
+function showProgressSection(stage: string): void {
+  const section = document.getElementById("transcribeProgressSection");
+  const stageEl = document.getElementById("progressStage");
+  if (section) section.style.display = "";
+  if (stageEl) stageEl.textContent = stage;
+}
+
+function hideProgressSection(): void {
+  const section = document.getElementById("transcribeProgressSection");
+  if (section) section.style.display = "none";
+}
+
+function showResultSection(): void {
+  const section = document.getElementById("resultSection");
+  if (section) section.style.display = "";
+}
+
+function hideResultSection(): void {
+  const section = document.getElementById("resultSection");
+  if (section) section.style.display = "none";
+}
+
+async function bindTranscribeProgress(): Promise<void> {
+  unlistenTranscriptionProgress?.();
+  const { listen } = await import("@tauri-apps/api/event");
+  unlistenTranscriptionProgress = await listen<TranscriptionProgress>(
+    "local-asr-transcription-progress",
+    (event) => {
+      const { jobId, stage, message } = event.payload;
+      if (jobId !== activeJobId) return;
+      const stageEl = document.getElementById("progressStage");
+      if (stageEl) {
+        if (stage === "completed") {
+          stageEl.textContent = "完了";
+        } else if (message) {
+          stageEl.textContent = message;
+        }
+      }
+    },
+  );
+}
+
+function bindStartButton(): void {
+  const startBtn = document.getElementById("startBtn");
+  startBtn?.addEventListener("click", async () => {
+    if (!selectedFilePath) {
+      const { showAppDialog } = await import("./status");
+      showAppDialog({ title: "エラー", message: "音声ファイルを選択してください", type: "error" });
+      return;
+    }
+    const jobId = crypto.randomUUID();
+    activeJobId = jobId;
+    (startBtn as HTMLButtonElement).disabled = true;
+    showProgressSection("準備中...");
+    hideResultSection();
+    try {
+      const result = await invokeTauri<TranscriptionResult>("local_asr_transcribe", {
+        jobId,
+        audioPath: selectedFilePath,
+      });
+      displayTranscriptionResult(result);
+    } catch (error) {
+      const { showAppDialog } = await import("./status");
+      showAppDialog({ title: "文字起こしエラー", message: String(error), type: "error" });
+    } finally {
+      (startBtn as HTMLButtonElement).disabled = false;
+      hideProgressSection();
+      if (activeJobId === jobId) {
+        activeJobId = null;
+      }
+    }
+  });
+}
+
+function displayTranscriptionResult(result: TranscriptionResult): void {
+  showResultSection();
+  const textArea = document.getElementById("resultText") as HTMLTextAreaElement | null;
+  if (textArea) {
+    textArea.value = result.txt_content;
+  }
+}
+
+function bindResultButtons(): void {
+  document.getElementById("copyResultBtn")?.addEventListener("click", async () => {
+    const textArea = document.getElementById("resultText") as HTMLTextAreaElement | null;
+    if (textArea) {
+      await navigator.clipboard.writeText(textArea.value);
+    }
+  });
+  document.getElementById("saveResultBtn")?.addEventListener("click", async () => {
+    const textArea = document.getElementById("resultText") as HTMLTextAreaElement | null;
+    if (!textArea) return;
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const path = await save({
+      filters: [{ name: "Text", extensions: ["txt"] }],
+      defaultPath: "transcript.txt",
+    });
+    if (path) {
+      await invokeTauri("save_text_file", { path, content: textArea.value });
+    }
   });
 }
 
@@ -3020,6 +3199,13 @@ async function fetchLocalAsrStatuses(): Promise<LocalAsrEngineStatus[]> {
   return statuses;
 }
 
+async function fetchLocalAsrStatusesFast(): Promise<LocalAsrEngineStatus[]> {
+  const statuses = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status_fast");
+  cachedLocalAsrStatuses = statuses;
+  reconcileConfirmedInstalls(statuses);
+  return statuses;
+}
+
 function updateCachedLocalAsrStatus(nextStatus: LocalAsrEngineStatus): void {
   const index = cachedLocalAsrStatuses.findIndex(s => s.engine === nextStatus.engine);
   if (index >= 0) {
@@ -3073,10 +3259,12 @@ async function refreshLocalAsrEngineStatus(engine: string): Promise<void> {
 async function confirmLocalAsrInstalled(engine: string): Promise<boolean> {
   for (let i = 0; i < 5; i++) {
     try {
-      const statuses = await fetchLocalAsrStatuses();
-      if (statuses.some(s => s.engine === engine && s.installed)) return true;
+      const status = await fetchLocalAsrEngineStatus(engine);
+      if (status.installed) return true;
+      // daemon-unavailableやinspect-errorは即時終了
+      if (status.errorKind && status.errorKind !== "timeout") return false;
     } catch { /* retry */ }
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 1000));
   }
   return false;
 }
@@ -3126,16 +3314,21 @@ async function loadDockerPageStatuses(): Promise<void> {
     return;
   }
 
-  // 3. Local ASR状態を取得し、キャッシュ更新 + ストアと統合
-  await loadAndRenderLocalAsrStatus(revision);
+  // 3. Local ASR状態を取得し、キャッシュ更新 + ストアと統合（daemon確認済みなのでfast使用）
+  await loadAndRenderLocalAsrStatus(revision, true);
 }
 
-async function loadAndRenderLocalAsrStatus(revision?: number): Promise<void> {
+async function loadAndRenderLocalAsrStatus(revision?: number, useFast: boolean = false): Promise<void> {
+  const container = document.getElementById("localAsrContainer");
+  if (!container?.isConnected) return;
+
+  // 1. checking状態を表示
+  container.innerHTML = renderLocalAsrSection({ kind: "loading" });
+
   try {
-    const engines = await fetchLocalAsrStatuses();
+    const engines = useFast ? await fetchLocalAsrStatusesFast() : await fetchLocalAsrStatuses();
 
     if (revision !== undefined && (revision !== dockerPageLoadRevision || currentPage !== "settings-docker")) return;
-    const container = document.getElementById("localAsrContainer");
     if (!container?.isConnected) return;
 
     container.innerHTML = renderLocalAsrSection({
@@ -3147,7 +3340,6 @@ async function loadAndRenderLocalAsrStatus(revision?: number): Promise<void> {
     console.error("local_asr_get_status error:", e);
 
     if (revision !== undefined && (revision !== dockerPageLoadRevision || currentPage !== "settings-docker")) return;
-    const container = document.getElementById("localAsrContainer");
     if (!container?.isConnected) return;
 
     container.innerHTML = renderLocalAsrSection({

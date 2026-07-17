@@ -259,6 +259,483 @@ fn save_asr_selection(
     fs::write(&path, json).map_err(|e| e.to_string())
 }
 
+// ---- Local ASR Transcription ----
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LocalAsrTranscriptionProgress {
+    job_id: String,
+    stage: String,
+    message: String,
+    log_line: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptionResult {
+    txt_content: String,
+    vtt_content: String,
+    engine: String,
+    language: String,
+}
+
+fn validate_job_id(job_id: &str) -> Result<(), String> {
+    uuid::Uuid::parse_str(job_id)
+        .map(|_| ())
+        .map_err(|_| "不正なジョブIDです".to_string())
+}
+
+fn qwen3_language_name(code: &str) -> Result<Option<&'static str>, String> {
+    match code {
+        "auto" => Ok(None),
+        "ja" => Ok(Some("Japanese")),
+        "en" => Ok(Some("English")),
+        "zh" => Ok(Some("Chinese")),
+        "yue" => Ok(Some("Cantonese")),
+        "ko" => Ok(Some("Korean")),
+        "fr" => Ok(Some("French")),
+        "de" => Ok(Some("German")),
+        "es" => Ok(Some("Spanish")),
+        "pt" => Ok(Some("Portuguese")),
+        "ar" => Ok(Some("Arabic")),
+        "id" => Ok(Some("Indonesian")),
+        "it" => Ok(Some("Italian")),
+        "ru" => Ok(Some("Russian")),
+        "th" => Ok(Some("Thai")),
+        "vi" => Ok(Some("Vietnamese")),
+        "tr" => Ok(Some("Turkish")),
+        "hi" => Ok(Some("Hindi")),
+        "ms" => Ok(Some("Malay")),
+        "nl" => Ok(Some("Dutch")),
+        "sv" => Ok(Some("Swedish")),
+        "da" => Ok(Some("Danish")),
+        "fi" => Ok(Some("Finnish")),
+        "pl" => Ok(Some("Polish")),
+        "cs" => Ok(Some("Czech")),
+        "fil" => Ok(Some("Filipino")),
+        "fa" => Ok(Some("Persian")),
+        "el" => Ok(Some("Greek")),
+        "hu" => Ok(Some("Hungarian")),
+        "mk" => Ok(Some("Macedonian")),
+        "ro" => Ok(Some("Romanian")),
+        _ => Err(format!("未対応のQwen3言語コード: {code}")),
+    }
+}
+
+fn resolve_asr_image_name(engine: &str) -> Result<&'static str, String> {
+    match engine {
+        "reazonspeech" => Ok("asr-composer-reazonspeech:cu126"),
+        "kotoba-whisper" => Ok("asr-composer-kotoba-whisper:cu126"),
+        "qwen3-asr" => Ok("asr-composer-qwen3-asr:cu126"),
+        _ => Err(format!("未対応のASRエンジン: {engine}")),
+    }
+}
+
+fn get_hf_token_value() -> Result<String, String> {
+    std::env::var("HF_TOKEN")
+        .map(|t| t.trim().to_string())
+        .map_err(|_| "HF_TOKENが設定されていません。設定画面からHuggingFaceトークンを保存してください。".to_string())
+        .and_then(|t| {
+            if t.is_empty() {
+                Err("HF_TOKENが空です。設定画面からHuggingFaceトークンを保存してください。".to_string())
+            } else {
+                Ok(t)
+            }
+        })
+}
+
+fn validate_audio_file(audio_path: &str) -> Result<(), String> {
+    let path = std::path::Path::new(audio_path);
+    if !path.exists() {
+        return Err("入力ファイルが存在しません".to_string());
+    }
+    if !path.is_file() {
+        return Err("入力パスが通常ファイルではありません".to_string());
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !["mp3", "wav", "mp4", "m4a", "flac"].contains(&ext.as_str()) {
+        return Err(format!("未対応の拡張子です: .{ext}"));
+    }
+    Ok(())
+}
+
+fn validate_asr_engine(engine: &str) -> Result<(), String> {
+    if !["reazonspeech", "kotoba-whisper", "qwen3-asr"].contains(&engine) {
+        return Err(format!("未対応のASRエンジンです: {engine}"));
+    }
+    Ok(())
+}
+
+fn validate_num_speakers(num: &str) -> Result<(), String> {
+    if num == "auto" || num.is_empty() {
+        return Ok(());
+    }
+    let n: u32 = num
+        .parse()
+        .map_err(|_| format!("話者数が不正です: {num}"))?;
+    if n == 0 || n > 8 {
+        return Err(format!("話者数は1〜8です: {n}"));
+    }
+    Ok(())
+}
+
+fn validate_language_for_engine(engine: &str, language_code: &str) -> Result<(), String> {
+    match engine {
+        "qwen3-asr" => {
+            qwen3_language_name(language_code)?;
+        }
+        "kotoba-whisper" => {
+            if language_code != "ja" {
+                return Err("Kotoba Whisperは日本語のみ対応です".to_string());
+            }
+        }
+        "reazonspeech" => {
+            if language_code != "ja" {
+                return Err("ReazonSpeechは日本語のみ対応です".to_string());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_transcribe_settings(settings: &AppSettings) -> Result<(), String> {
+    if settings.asr_mode != "local" {
+        return Err("ASRモードがローカルに設定されていません".to_string());
+    }
+    let engine = settings.asr_engine.as_str();
+    validate_asr_engine(engine)?;
+    if !settings.speaker_diarization {
+        return Err("話者分離「しない」は現在実装中です。今しばらくお待ちください。".to_string());
+    }
+    validate_num_speakers(&settings.num_speakers)?;
+    let language_code = settings.asr_languages.get(engine).map(|s| s.as_str()).unwrap_or("ja");
+    validate_language_for_engine(engine, language_code)?;
+    Ok(())
+}
+
+fn validate_transcribe_input(app: &tauri::AppHandle, audio_path: &str) -> Result<(), String> {
+    validate_audio_file(audio_path)?;
+    let settings = load_settings(app);
+    validate_transcribe_settings(&settings)?;
+    Ok(())
+}
+
+fn build_transcribe_env_vars(
+    engine: &str,
+    settings: &AppSettings,
+    input_filename: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let language_code = settings.asr_languages.get(engine).map(|s| s.as_str()).unwrap_or("ja");
+    let mut vars = vec![
+        ("INPUT_FILENAME".to_string(), input_filename.to_string()),
+        ("WORK_SOURCE".to_string(), "/work/source".to_string()),
+        ("WORK_OUTPUT".to_string(), "/work/output".to_string()),
+        ("WORK_TMP".to_string(), "/work/tmp".to_string()),
+    ];
+    // 話者数（auto時は渡さない）
+    let num = &settings.num_speakers;
+    if num != "auto" && !num.is_empty() {
+        vars.push(("NUM_SPEAKERS".to_string(), num.clone()));
+    }
+    // エンジン固有
+    match engine {
+        "qwen3-asr" => {
+            let engine_lang = qwen3_language_name(language_code)?;
+            let lang_str = engine_lang.unwrap_or("auto").to_string();
+            vars.push(("ASR_LANGUAGE".to_string(), lang_str));
+        }
+        "kotoba-whisper" => {
+            vars.push(("ASR_LANGUAGE".to_string(), "japanese".to_string()));
+        }
+        "reazonspeech" => {
+            // 言語パラメータ不要
+        }
+        _ => {}
+    }
+    Ok(vars)
+}
+
+fn emit_transcribe_progress(app: &tauri::AppHandle, job_id: &str, stage: &str, message: &str) {
+    use tauri::Emitter;
+    let _ = app.emit(
+        "local-asr-transcription-progress",
+        LocalAsrTranscriptionProgress {
+            job_id: job_id.to_string(),
+            stage: stage.to_string(),
+            message: message.to_string(),
+            log_line: None,
+        },
+    );
+}
+
+async fn read_output_lines(
+    mut reader: tokio::io::BufReader<tokio::process::ChildStdout>,
+    app: tauri::AppHandle,
+    job_id: String,
+) -> Vec<String> {
+    use tauri::Emitter;
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    lines.push(trimmed.clone());
+                    let _ = app.emit(
+                        "local-asr-transcription-progress",
+                        LocalAsrTranscriptionProgress {
+                            job_id: job_id.clone(),
+                            stage: "processing".to_string(),
+                            message: String::new(),
+                            log_line: Some(trimmed),
+                        },
+                    );
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    lines
+}
+
+async fn read_stderr_lines(
+    mut reader: tokio::io::BufReader<tokio::process::ChildStderr>,
+    app: tauri::AppHandle,
+    job_id: String,
+) -> Vec<String> {
+    use tauri::Emitter;
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    lines.push(trimmed.clone());
+                    let _ = app.emit(
+                        "local-asr-transcription-progress",
+                        LocalAsrTranscriptionProgress {
+                            job_id: job_id.clone(),
+                            stage: "processing".to_string(),
+                            message: String::new(),
+                            log_line: Some(trimmed),
+                        },
+                    );
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    lines
+}
+
+async fn run_docker_transcribe(
+    app: &tauri::AppHandle,
+    job_id: &str,
+    image_name: &str,
+    work_dir: &std::path::Path,
+    env_vars: Vec<(String, String)>,
+    hf_token: Option<&str>,
+) -> Result<(), String> {
+    use tokio::process::Command;
+
+    let source_dir = work_dir.join("source");
+    let output_dir = work_dir.join("output");
+    let tmp_dir = work_dir.join("tmp");
+
+    let source_abs = fs::canonicalize(&source_dir).unwrap_or(source_dir.clone());
+    let output_abs = fs::canonicalize(&output_dir).unwrap_or(output_dir.clone());
+    let tmp_abs = fs::canonicalize(&tmp_dir).unwrap_or(tmp_dir.clone());
+
+    // Windowsの\\?\プレフィックスを除去（Docker Desktop対応）
+    let source_str = source_abs.to_string_lossy().replace("\\\\?\\", "");
+    let output_str = output_abs.to_string_lossy().replace("\\\\?\\", "");
+    let tmp_str = tmp_abs.to_string_lossy().replace("\\\\?\\", "");
+
+    let source_mount = format!("{source_str}:/work/source:ro");
+    let output_mount = format!("{output_str}:/work/output");
+    let tmp_mount = format!("{tmp_str}:/work/tmp");
+
+    let mut cmd = Command::new("docker");
+    cmd.arg("run").arg("--rm").arg("--gpus").arg("all");
+    cmd.arg("-v").arg(&source_mount);
+    cmd.arg("-v").arg(&output_mount);
+    cmd.arg("-v").arg(&tmp_mount);
+    cmd.arg("-e").arg("WORK_SOURCE=/work/source");
+    cmd.arg("-e").arg("WORK_OUTPUT=/work/output");
+    cmd.arg("-e").arg("WORK_TMP=/work/tmp");
+
+    // HF_TOKEN: プロセス環境にだけ設定
+    if let Some(token) = hf_token {
+        cmd.env("HF_TOKEN", token);
+        cmd.arg("-e").arg("HF_TOKEN");
+    }
+
+    // その他の環境変数
+    for (key, value) in &env_vars {
+        cmd.arg("-e").arg(format!("{key}={value}"));
+    }
+
+    cmd.arg(image_name);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Docker起動エラー: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("stdout取得エラー")?;
+    let stderr = child.stderr.take().ok_or("stderr取得エラー")?;
+
+    let stdout_reader = tokio::io::BufReader::new(stdout);
+    let stderr_reader = tokio::io::BufReader::new(stderr);
+
+    let app_clone = app.clone();
+    let jid = job_id.to_string();
+    let stdout_task = tokio::spawn(read_output_lines(stdout_reader, app_clone, jid.clone()));
+    let stderr_task = tokio::spawn(read_stderr_lines(stderr_reader, app.clone(), jid));
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Docker待機エラー: {e}"))?;
+
+    let _ = stdout_task.await;
+    let stderr_lines = stderr_task.await.unwrap_or_default();
+
+    if !status.success() {
+        let code = status.code().unwrap_or(-1);
+        let last_logs: Vec<&str> = stderr_lines.iter().rev().take(10).map(|s| s.as_str()).collect();
+        let log_str = if last_logs.is_empty() {
+            "(ログなし)".to_string()
+        } else {
+            last_logs.join("\n")
+        };
+        return Err(format!(
+            "Dockerコンテナがエラー終了しました。終了コード: {code}\n最後のログ:\n{log_str}"
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn local_asr_transcribe(
+    app: tauri::AppHandle,
+    job_id: String,
+    audio_path: String,
+) -> Result<TranscriptionResult, String> {
+    // jobId検証
+    validate_job_id(&job_id)?;
+
+    // 入力バリデーション
+    validate_transcribe_input(&app, &audio_path)?;
+
+    let settings = load_settings(&app);
+    let engine = settings.asr_engine.clone();
+
+    // ワークディレクトリ作成
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("アプリデータディレクトリの取得に失敗: {e}"))?;
+    let work_dir = app_data.join("local-asr").join("jobs").join(&job_id);
+    let source_dir = work_dir.join("source");
+    let output_dir = work_dir.join("output");
+    let tmp_dir = work_dir.join("tmp");
+    fs::create_dir_all(&source_dir).map_err(|e| format!("sourceディレクトリ作成エラー: {e}"))?;
+    fs::create_dir_all(&output_dir).map_err(|e| format!("outputディレクトリ作成エラー: {e}"))?;
+    fs::create_dir_all(&tmp_dir).map_err(|e| format!("tmpディレクトリ作成エラー: {e}"))?;
+
+    // 入力ファイルコピー
+    let audio_path_obj = std::path::Path::new(&audio_path);
+    let input_filename = audio_path_obj
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("入力ファイル名を取得できません")?
+        .to_string();
+    let output_stem = audio_path_obj
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("出力ファイル名を生成できません")?
+        .to_string();
+    fs::copy(&audio_path, source_dir.join(&input_filename))
+        .map_err(|e| format!("ファイルコピーエラー: {e}"))?;
+
+    // 進捗通知
+    emit_transcribe_progress(&app, &job_id, "preparing", "準備中...");
+
+    // 環境変数構築
+    let env_vars = build_transcribe_env_vars(&engine, &settings, &input_filename)?;
+
+    // HF_TOKEN取得（話者分離ON前提、Phase A）
+    let hf_token = get_hf_token_value()?;
+
+    // Docker image名解決
+    let image_name = resolve_asr_image_name(&engine)?;
+
+    emit_transcribe_progress(&app, &job_id, "starting_container", "Dockerコンテナを起動中...");
+
+    // Docker実行
+    let run_result = run_docker_transcribe(
+        &app,
+        &job_id,
+        image_name,
+        &work_dir,
+        env_vars,
+        Some(&hf_token),
+    )
+    .await;
+
+    // 結果を処理（成功・失敗に関わらずクリーンアップ）
+    let result = match run_result {
+        Ok(()) => {
+            emit_transcribe_progress(&app, &job_id, "reading_output", "出力を読み込み中...");
+            let txt_path = output_dir.join(format!("{output_stem}.txt"));
+            let vtt_path = output_dir.join(format!("{output_stem}.vtt"));
+            let txt = fs::read_to_string(&txt_path)
+                .map_err(|e| format!("TXT読み込みエラー ({}): {e}", txt_path.display()))?;
+            let vtt = fs::read_to_string(&vtt_path)
+                .map_err(|e| format!("VTT読み込みエラー ({}): {e}", vtt_path.display()))?;
+            emit_transcribe_progress(&app, &job_id, "completed", "完了");
+            Ok(TranscriptionResult {
+                txt_content: txt,
+                vtt_content: vtt,
+                engine,
+                language: settings
+                    .asr_languages
+                    .get(&settings.asr_engine)
+                    .cloned()
+                    .unwrap_or_else(|| "ja".to_string()),
+            })
+        }
+        Err(e) => Err(e),
+    };
+
+    // クリーンアップ（成功・失敗とも）
+    if let Err(e) = fs::remove_dir_all(&work_dir) {
+        eprintln!("ジョブディレクトリの削除に失敗: {e}");
+    }
+
+    result
+}
+
+#[tauri::command]
+fn save_text_file(path: String, content: String) -> Result<(), String> {
+    fs::write(&path, content).map_err(|e| format!("ファイル保存エラー: {e}"))
+}
+
 const MIMO_ASR_MAX_BASE64_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
 #[derive(Deserialize)]
@@ -1925,6 +2402,7 @@ pub struct DockerStartResult {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum DockerCheckError {
     CliNotFound,
     DaemonNotRunning(String),
@@ -2537,6 +3015,42 @@ fn parse_docker_image_inspect(stdout: &str) -> Result<DockerImageInfo, DockerIma
     })
 }
 
+/// `docker --context <ctx> image inspect <image_name>` を実行し、イメージ情報を取得する。
+/// contextが空の場合は--contextを付けない（後方互換）。
+fn inspect_docker_image_with_context(
+    docker_path: &std::path::Path,
+    docker_context: &str,
+    image_name: &str,
+) -> DockerImageInspectResult {
+    let mut cmd = std::process::Command::new(docker_path);
+    if !docker_context.is_empty() {
+        cmd.arg("--context").arg(docker_context);
+    }
+    let output = match cmd
+        .args(["image", "inspect", image_name])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("docker image inspect 実行失敗: {e}");
+            return DockerImageInspectResult::InspectFailed;
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return classify_docker_inspect_failure(&stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match parse_docker_image_inspect(&stdout) {
+        Ok(info) => DockerImageInspectResult::Found(info),
+        Err(result) => result,
+    }
+}
+
 /// `docker image inspect <image_name>` を実行し、イメージ情報を取得する。
 fn inspect_docker_image(
     docker_path: &std::path::Path,
@@ -2678,6 +3192,7 @@ fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
 
     let docker_path_ref = docker_path.as_ref().unwrap();
 
+    let t0 = std::time::Instant::now();
     let docker_running = std::process::Command::new(docker_path_ref)
         .args(["version", "--format", "{{.Server.Version}}"])
         .stdout(std::process::Stdio::null())
@@ -2685,10 +3200,22 @@ fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
+    let version_ms = t0.elapsed().as_millis();
+    if version_ms > 1000 {
+        eprintln!("[status] docker version slow: {version_ms}ms");
+    }
 
-    defs.iter()
-        .map(|d| get_single_engine_status(docker_path_ref, docker_running, d))
-        .collect()
+    let mut results = Vec::with_capacity(defs.len());
+    for d in &defs {
+        let t1 = std::time::Instant::now();
+        let status = get_single_engine_status(docker_path_ref, docker_running, d);
+        let elapsed = t1.elapsed().as_millis();
+        if elapsed > 1000 {
+            eprintln!("[status] inspect {} slow: {elapsed}ms", d.engine);
+        }
+        results.push(status);
+    }
+    results
 }
 
 fn unavailable_local_asr_statuses() -> Vec<LocalAsrEngineStatus> {
@@ -2717,12 +3244,338 @@ async fn local_asr_get_status() -> Vec<LocalAsrEngineStatus> {
         .unwrap_or_else(|_| unavailable_local_asr_statuses())
 }
 
+/// 現在のDocker contextを取得する。
+async fn resolve_docker_context(docker_path: &std::path::Path) -> Result<String, String> {
+    use tokio::process::Command;
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        Command::new(docker_path)
+            .args(["context", "show"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "docker context showがタイムアウトしました".to_string())?
+    .map_err(|e| format!("docker context showの実行に失敗しました: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("docker context showが失敗しました: {stderr}"));
+    }
+
+    let context = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if context.is_empty() {
+        return Err("docker context showが空の結果を返しました".to_string());
+    }
+    Ok(context)
+}
+
+/// `docker image ls --no-trunc --format "{{.Repository}}\t{{.Tag}}\t{{.ID}}"` を実行し、
+/// (repository, tag, image_id) の一覧を返す。
+async fn list_docker_images(
+    docker_path: &std::path::Path,
+    docker_context: &str,
+) -> Result<Vec<(String, String, String)>, String> {
+    use tokio::process::Command;
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        {
+            let mut cmd = Command::new(docker_path);
+            if !docker_context.is_empty() {
+                cmd.arg("--context").arg(docker_context);
+            }
+            cmd.args(["image", "ls", "--no-trunc", "--format", "{{.Repository}}\t{{.Tag}}\t{{.ID}}"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output()
+        },
+    )
+    .await
+    .map_err(|_| "docker image lsがタイムアウトしました".to_string())?
+    .map_err(|e| format!("docker image lsの実行に失敗しました: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("docker image lsが失敗しました: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut images = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            images.push((
+                parts[0].trim().to_string(),
+                parts[1].trim().to_string(),
+                parts[2].trim().to_string(),
+            ));
+        }
+    }
+    Ok(images)
+}
+
+/// 単一エンジンのinspectをtokio::process::Commandで実行し、タイムアウト時にプロセスを確実に終了する。
+async fn inspect_docker_image_by_id_async(
+    docker_path: std::path::PathBuf,
+    docker_context: &str,
+    image_id: String,
+    image_name: String,
+    engine: String,
+    display_name: String,
+) -> LocalAsrEngineStatus {
+    use tokio::process::Command;
+
+    let mut cmd = Command::new(&docker_path);
+    if !docker_context.is_empty() {
+        cmd.arg("--context").arg(docker_context);
+    }
+    let child = match cmd
+        .args(["image", "inspect", &image_id])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return LocalAsrEngineStatus {
+                engine,
+                display_name,
+                installed: false,
+                image_name,
+                image_id: None,
+                environment_version: None,
+                model_name: None,
+                docker_available: true,
+                docker_running: true,
+                error_kind: Some("inspect-error".to_string()),
+                error_message: Some(format!("Docker起動エラー: {e}")),
+            };
+        }
+    };
+
+    let timeout_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        child.wait_with_output(),
+    )
+    .await;
+
+    match timeout_result {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let inspect_result = classify_docker_inspect_failure(&stderr);
+                match inspect_result {
+                    DockerImageInspectResult::NotFound => LocalAsrEngineStatus {
+                        engine,
+                        display_name,
+                        installed: false,
+                        image_name,
+                        image_id: None,
+                        environment_version: None,
+                        model_name: None,
+                        docker_available: true,
+                        docker_running: true,
+                        error_kind: None,
+                        error_message: None,
+                    },
+                    DockerImageInspectResult::DaemonUnavailable => LocalAsrEngineStatus {
+                        engine,
+                        display_name,
+                        installed: false,
+                        image_name,
+                        image_id: None,
+                        environment_version: None,
+                        model_name: None,
+                        docker_available: true,
+                        docker_running: false,
+                        error_kind: Some("daemon-unavailable".to_string()),
+                        error_message: Some("Docker Engineへ接続できませんでした".to_string()),
+                    },
+                    _ => LocalAsrEngineStatus {
+                        engine,
+                        display_name,
+                        installed: false,
+                        image_name,
+                        image_id: None,
+                        environment_version: None,
+                        model_name: None,
+                        docker_available: true,
+                        docker_running: true,
+                        error_kind: Some("inspect-error".to_string()),
+                        error_message: Some("Dockerイメージの状態を確認できませんでした".to_string()),
+                    },
+                }
+            } else {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                match parse_docker_image_inspect(&stdout) {
+                    Ok(info) => {
+                        let env_ver = info.labels.get("com.asr-composer.environment-version").cloned();
+                        let model = info.labels.get("com.asr-composer.asr-model").cloned();
+                        LocalAsrEngineStatus {
+                            engine,
+                            display_name,
+                            installed: true,
+                            image_name,
+                            image_id: Some(info.image_id),
+                            environment_version: env_ver,
+                            model_name: model,
+                            docker_available: true,
+                            docker_running: true,
+                            error_kind: None,
+                            error_message: None,
+                        }
+                    }
+                    Err(_) => LocalAsrEngineStatus {
+                        engine,
+                        display_name,
+                        installed: false,
+                        image_name,
+                        image_id: None,
+                        environment_version: None,
+                        model_name: None,
+                        docker_available: true,
+                        docker_running: true,
+                        error_kind: Some("inspect-error".to_string()),
+                        error_message: Some("Dockerイメージの状態を確認できませんでした".to_string()),
+                    },
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            // wait_with_output失敗
+            LocalAsrEngineStatus {
+                engine,
+                display_name,
+                installed: false,
+                image_name,
+                image_id: None,
+                environment_version: None,
+                model_name: None,
+                docker_available: true,
+                docker_running: true,
+                error_kind: Some("inspect-error".to_string()),
+                error_message: Some(format!("Docker実行エラー: {e}")),
+            }
+        }
+        Err(_) => {
+            // タイムアウト — kill_on_drop(true)で子プロセスは自動終了
+            LocalAsrEngineStatus {
+                engine,
+                display_name,
+                installed: false,
+                image_name,
+                image_id: None,
+                environment_version: None,
+                model_name: None,
+                docker_available: true,
+                docker_running: true,
+                error_kind: Some("timeout".to_string()),
+                error_message: Some("Docker応答がタイムアウトしました（5秒）".to_string()),
+            }
+        }
+    }
+}
+
+/// Docker daemon確認済みを前提に、3エンジンの状態を取得する。
+/// 最初に`docker image ls`で一覧を取得し、repository:tagの完全一致で存在判定する。
+/// 存在する場合はimage IDで`docker image inspect`を実行しラベルを取得する。
+#[tauri::command]
+async fn local_asr_get_status_fast() -> Vec<LocalAsrEngineStatus> {
+    let defs = local_asr_engine_defs();
+    let docker_path = match find_docker_cli() {
+        Some(p) => p,
+        None => return unavailable_local_asr_statuses(),
+    };
+
+    // 現在のDocker contextを1回だけ取得
+    let docker_context = match resolve_docker_context(&docker_path).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            return error_statuses(&defs, &format!("Docker contextの取得に失敗しました: {e}"));
+        }
+    };
+
+    // image ls 一覧を1回だけ取得
+    let images = match list_docker_images(&docker_path, &docker_context).await {
+        Ok(list) => list,
+        Err(e) => return error_statuses(&defs, &e),
+    };
+
+    let mut results = Vec::with_capacity(defs.len());
+    for def in defs {
+        // repository:tag の完全一致で検索
+        let repo = format!("asr-composer-{}", def.engine);
+        let tag = "cu126".to_string();
+        let matched = images.iter().find(|(r, t, _)| r == &repo && t == &tag);
+
+        match matched {
+            Some((_, _, image_id)) => {
+                // IDでinspectしてラベル取得
+                let status = inspect_docker_image_by_id_async(
+                    docker_path.clone(),
+                    &docker_context,
+                    image_id.clone(),
+                    def.image_name.to_string(),
+                    def.engine.to_string(),
+                    def.display_name.to_string(),
+                )
+                .await;
+                results.push(status);
+            }
+            None => {
+                results.push(LocalAsrEngineStatus {
+                    engine: def.engine.to_string(),
+                    display_name: def.display_name.to_string(),
+                    installed: false,
+                    image_name: def.image_name.to_string(),
+                    image_id: None,
+                    environment_version: None,
+                    model_name: None,
+                    docker_available: true,
+                    docker_running: true,
+                    error_kind: None,
+                    error_message: None,
+                });
+            }
+        }
+    }
+    results
+}
+
+fn error_statuses(
+    defs: &[LocalAsrEngineDef],
+    message: &str,
+) -> Vec<LocalAsrEngineStatus> {
+    defs.iter()
+        .map(|d| LocalAsrEngineStatus {
+            engine: d.engine.to_string(),
+            display_name: d.display_name.to_string(),
+            installed: false,
+            image_name: d.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            model_name: None,
+            docker_available: true,
+            docker_running: false,
+            error_kind: Some("inspect-error".to_string()),
+            error_message: Some(message.to_string()),
+        })
+        .collect()
+}
+
 /// 個別確認用: docker version を省略し、inspect 1回だけ実行する。
 fn get_single_engine_status_fast(
     docker_path: &std::path::Path,
+    docker_context: &str,
     def: &LocalAsrEngineDef,
 ) -> LocalAsrEngineStatus {
-    match inspect_docker_image(docker_path, def.image_name) {
+    match inspect_docker_image_with_context(docker_path, docker_context, def.image_name) {
         DockerImageInspectResult::Found(info) => {
             let env_ver = info.labels.get("com.asr-composer.environment-version").cloned();
             let model = info.labels.get("com.asr-composer.asr-model").cloned();
@@ -2807,7 +3660,8 @@ fn local_asr_get_engine_status_sync(engine: &str) -> Result<LocalAsrEngineStatus
         }
     };
 
-    Ok(get_single_engine_status_fast(&docker_path, &def))
+    // 同期版ではcontextを明示しない（互換性維持）
+    Ok(get_single_engine_status_fast(&docker_path, "", &def))
 }
 
 #[tauri::command]
@@ -3078,7 +3932,7 @@ async fn local_asr_install(
 
 #[tauri::command]
 async fn local_asr_uninstall(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     engine: String,
 ) -> Result<LocalAsrEngineStatus, String> {
     // 排他制御
@@ -3193,9 +4047,12 @@ pub fn run() {
             hf_token_save,
             hf_token_delete,
             local_asr_get_status,
+            local_asr_get_status_fast,
             local_asr_get_engine_status,
             local_asr_install,
-            local_asr_uninstall
+            local_asr_uninstall,
+            local_asr_transcribe,
+            save_text_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -6322,5 +7179,224 @@ mod tests {
         assert_eq!(restored.num_speakers, "4");
         assert_eq!(restored.asr_mode, "local");
         assert!(!restored.speaker_diarization);
+    }
+
+    // ---- Transcription Pipeline ----
+
+    #[test]
+    fn test_validate_job_id_valid() {
+        assert!(validate_job_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
+    }
+
+    #[test]
+    fn test_validate_job_id_invalid() {
+        assert!(validate_job_id("not-a-uuid").is_err());
+        assert!(validate_job_id("../etc/passwd").is_err());
+        assert!(validate_job_id("").is_err());
+    }
+
+    #[test]
+    fn test_qwen3_language_name_known_codes() {
+        assert_eq!(qwen3_language_name("ja").unwrap(), Some("Japanese"));
+        assert_eq!(qwen3_language_name("en").unwrap(), Some("English"));
+        assert_eq!(qwen3_language_name("zh").unwrap(), Some("Chinese"));
+        assert_eq!(qwen3_language_name("yue").unwrap(), Some("Cantonese"));
+        assert_eq!(qwen3_language_name("auto").unwrap(), None);
+    }
+
+    #[test]
+    fn test_qwen3_language_name_all_30() {
+        let codes = [
+            "ja", "en", "zh", "yue", "ko", "fr", "de", "es", "pt", "ar",
+            "id", "it", "ru", "th", "vi", "tr", "hi", "ms", "nl", "sv",
+            "da", "fi", "pl", "cs", "fil", "fa", "el", "hu", "mk", "ro",
+        ];
+        for code in codes {
+            assert!(qwen3_language_name(code).is_ok(), "Failed for {code}");
+        }
+    }
+
+    #[test]
+    fn test_qwen3_language_name_unknown() {
+        assert!(qwen3_language_name("xx").is_err());
+        assert!(qwen3_language_name("ja_JP").is_err());
+    }
+
+    #[test]
+    fn test_resolve_asr_image_name() {
+        assert_eq!(resolve_asr_image_name("reazonspeech").unwrap(), "asr-composer-reazonspeech:cu126");
+        assert_eq!(resolve_asr_image_name("kotoba-whisper").unwrap(), "asr-composer-kotoba-whisper:cu126");
+        assert_eq!(resolve_asr_image_name("qwen3-asr").unwrap(), "asr-composer-qwen3-asr:cu126");
+        assert!(resolve_asr_image_name("unknown").is_err());
+    }
+
+    #[test]
+    fn test_build_transcribe_env_vars_qwen3() {
+        let mut settings = AppSettings::default();
+        settings.asr_languages.insert("qwen3-asr".to_string(), "en".to_string());
+        settings.num_speakers = "3".to_string();
+        let vars = build_transcribe_env_vars("qwen3-asr", &settings, "test.mp3").unwrap();
+        let asr_lang = vars.iter().find(|(k, _)| k == "ASR_LANGUAGE").unwrap();
+        assert_eq!(asr_lang.1, "English");
+        let num = vars.iter().find(|(k, _)| k == "NUM_SPEAKERS").unwrap();
+        assert_eq!(num.1, "3");
+    }
+
+    #[test]
+    fn test_build_transcribe_env_vars_qwen3_auto() {
+        let mut settings = AppSettings::default();
+        settings.asr_languages.insert("qwen3-asr".to_string(), "auto".to_string());
+        let vars = build_transcribe_env_vars("qwen3-asr", &settings, "test.mp3").unwrap();
+        let asr_lang = vars.iter().find(|(k, _)| k == "ASR_LANGUAGE").unwrap();
+        assert_eq!(asr_lang.1, "auto");
+        // auto時はNUM_SPEAKERSを渡さない
+        assert!(!vars.iter().any(|(k, _)| k == "NUM_SPEAKERS"));
+    }
+
+    #[test]
+    fn test_build_transcribe_env_vars_kotoba() {
+        let settings = AppSettings::default();
+        let vars = build_transcribe_env_vars("kotoba-whisper", &settings, "test.mp3").unwrap();
+        let asr_lang = vars.iter().find(|(k, _)| k == "ASR_LANGUAGE").unwrap();
+        assert_eq!(asr_lang.1, "japanese");
+    }
+
+    #[test]
+    fn test_build_transcribe_env_vars_reazonspeech() {
+        let settings = AppSettings::default();
+        let vars = build_transcribe_env_vars("reazonspeech", &settings, "test.mp3").unwrap();
+        assert!(!vars.iter().any(|(k, _)| k == "ASR_LANGUAGE"));
+    }
+
+    #[test]
+    fn test_same_filename_different_job_ids() {
+        // 同名ファイルでも異なるjobIdならワークディレクトリが異なる
+        let job1 = "550e8400-e29b-41d4-a716-446655440000";
+        let job2 = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        assert_ne!(job1, job2);
+        // UUID検証は両方通る
+        assert!(validate_job_id(job1).is_ok());
+        assert!(validate_job_id(job2).is_ok());
+    }
+
+    // ---- Pure Validation Functions ----
+
+    #[test]
+    fn test_validate_audio_file_nonexistent() {
+        let result = validate_audio_file("/nonexistent/path/audio.wav");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("存在しません"));
+    }
+
+    #[test]
+    fn test_validate_audio_file_invalid_extension() {
+        // 既存の一時ファイルを作って拡張子テスト
+        let dir = std::env::temp_dir().join("asr_test_ext");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.txt");
+        std::fs::write(&path, "dummy").unwrap();
+        let result = validate_audio_file(path.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("拡張子"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_validate_audio_file_valid_extensions() {
+        let dir = std::env::temp_dir().join("asr_test_valid_ext");
+        std::fs::create_dir_all(&dir).unwrap();
+        for ext in &["mp3", "wav", "mp4", "m4a", "flac"] {
+            let path = dir.join(format!("test.{ext}"));
+            std::fs::write(&path, "dummy").unwrap();
+            assert!(validate_audio_file(path.to_str().unwrap()).is_ok(), "Failed for .{ext}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_validate_asr_engine_valid() {
+        assert!(validate_asr_engine("reazonspeech").is_ok());
+        assert!(validate_asr_engine("kotoba-whisper").is_ok());
+        assert!(validate_asr_engine("qwen3-asr").is_ok());
+    }
+
+    #[test]
+    fn test_validate_asr_engine_invalid() {
+        assert!(validate_asr_engine("unknown").is_err());
+        assert!(validate_asr_engine("").is_err());
+        assert!(validate_asr_engine("google_stt").is_err());
+    }
+
+    #[test]
+    fn test_validate_num_speakers_valid() {
+        assert!(validate_num_speakers("auto").is_ok());
+        assert!(validate_num_speakers("").is_ok());
+        assert!(validate_num_speakers("1").is_ok());
+        assert!(validate_num_speakers("4").is_ok());
+        assert!(validate_num_speakers("8").is_ok());
+    }
+
+    #[test]
+    fn test_validate_num_speakers_invalid() {
+        assert!(validate_num_speakers("0").is_err());
+        assert!(validate_num_speakers("9").is_err());
+        assert!(validate_num_speakers("abc").is_err());
+        assert!(validate_num_speakers("1.5").is_err());
+    }
+
+    #[test]
+    fn test_validate_language_for_engine_qwen3_valid() {
+        assert!(validate_language_for_engine("qwen3-asr", "ja").is_ok());
+        assert!(validate_language_for_engine("qwen3-asr", "en").is_ok());
+        assert!(validate_language_for_engine("qwen3-asr", "auto").is_ok());
+    }
+
+    #[test]
+    fn test_validate_language_for_engine_qwen3_invalid() {
+        assert!(validate_language_for_engine("qwen3-asr", "xx").is_err());
+    }
+
+    #[test]
+    fn test_validate_language_for_engine_kotoba_ja_only() {
+        assert!(validate_language_for_engine("kotoba-whisper", "ja").is_ok());
+        assert!(validate_language_for_engine("kotoba-whisper", "en").is_err());
+    }
+
+    #[test]
+    fn test_validate_language_for_engine_reazonspeech_ja_only() {
+        assert!(validate_language_for_engine("reazonspeech", "ja").is_ok());
+        assert!(validate_language_for_engine("reazonspeech", "en").is_err());
+    }
+
+    #[test]
+    fn test_validate_transcribe_settings_not_local() {
+        let mut settings = AppSettings::default();
+        settings.asr_mode = "cloud".to_string();
+        settings.asr_engine = "qwen3-asr".to_string();
+        settings.speaker_diarization = true;
+        let result = validate_transcribe_settings(&settings);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("ローカル"));
+    }
+
+    #[test]
+    fn test_validate_transcribe_settings_speaker_off() {
+        let mut settings = AppSettings::default();
+        settings.asr_mode = "local".to_string();
+        settings.asr_engine = "qwen3-asr".to_string();
+        settings.speaker_diarization = false;
+        let result = validate_transcribe_settings(&settings);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("話者分離"));
+    }
+
+    #[test]
+    fn test_validate_transcribe_settings_valid() {
+        let mut settings = AppSettings::default();
+        settings.asr_mode = "local".to_string();
+        settings.asr_engine = "qwen3-asr".to_string();
+        settings.speaker_diarization = true;
+        settings.asr_languages.insert("qwen3-asr".to_string(), "ja".to_string());
+        assert!(validate_transcribe_settings(&settings).is_ok());
     }
 }
