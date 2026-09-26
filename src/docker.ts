@@ -273,6 +273,16 @@ export function getLocalAsrUiState(
   return "installed";
 }
 
+export const LOCAL_ASR_DISPLAY_NAMES: Record<string, string> = {
+  "reazonspeech": "ReazonSpeech",
+  "kotoba-whisper": "Kotoba Whisper",
+  "qwen3-asr": "Qwen3 ASR",
+};
+
+export function getLocalAsrDisplayName(engineId: string): string {
+  return LOCAL_ASR_DISPLAY_NAMES[engineId] ?? engineId;
+}
+
 export interface LocalAsrProgressDisplay {
   percent: number;
   message: string;
@@ -296,8 +306,25 @@ const LOCAL_ASR_STAGES: Record<string, LocalAsrProgressDisplay> = {
   "completed": { percent: 100, message: "インストールが完了しました" },
 };
 
-export function getLocalAsrProgressDisplay(stage: string): LocalAsrProgressDisplay {
-  return LOCAL_ASR_STAGES[stage] ?? { percent: 0, message: "処理を開始しています" };
+export function getLocalAsrProgressDisplay(stage: string, engineId?: string): LocalAsrProgressDisplay {
+  const base = LOCAL_ASR_STAGES[stage] ?? { percent: 0, message: "処理を開始しています" };
+  const displayName = engineId ? getLocalAsrDisplayName(engineId) : "ReazonSpeech";
+
+  if (stage === "building-engine-start") {
+    return {
+      percent: base.percent,
+      message: `${displayName}環境の構築を開始しています`,
+    };
+  }
+
+  if (stage === "exporting-engine-image") {
+    return {
+      percent: base.percent,
+      message: `${displayName}イメージを書き出しています`,
+    };
+  }
+
+  return base;
 }
 
 export type LocalAsrSectionState =

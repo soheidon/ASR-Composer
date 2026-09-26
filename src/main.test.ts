@@ -1,11 +1,20 @@
 // @vitest-environment jsdom
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   setButtonLoading,
   restoreButtonLoading,
   setGoogleSttAdvancedOpen,
 } from "./provider-config-save";
 import { asrProviders } from "./providers";
+import {
+  setupWindowCloseGuard,
+  requestAppClose,
+  resetWindowCloseGuardForTest,
+  setTauriWindowForTest,
+  isForceClosingForTest,
+} from "./main";
+import { setEditorDocument, isEditorDirty } from "./editor";
+import * as statusModule from "./status";
 
 /**
  * Google STT 組み込みテスト・表示に関するDOM整合性テスト。
@@ -737,3 +746,301 @@ describe("Xiaomi MiMo ASR full UI", () => {
     expect(fileBtn).toBeTruthy();
   });
 });
+
+// ---- Window Close Guard (Cases 8A - 8G) ----
+
+describe("Window Close Guard (Cases 8A - 8G)", () => {
+  let closeRequestedHandler: ((event: any) => Promise<void>) | null = null;
+  let mockWindow: any;
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    closeRequestedHandler = null;
+    resetWindowCloseGuardForTest();
+    setEditorDocument(null);
+
+    mockWindow = {
+      isMaximized: vi.fn().mockResolvedValue(false),
+      toggleMaximize: vi.fn().mockResolvedValue(undefined),
+      minimize: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn().mockResolvedValue(undefined),
+      onResized: vi.fn().mockResolvedValue(() => {}),
+      onCloseRequested: vi.fn().mockImplementation((cb: (event: any) => Promise<void>) => {
+        closeRequestedHandler = cb;
+        return Promise.resolve(() => {});
+      }),
+    };
+    setTauriWindowForTest(mockWindow);
+  });
+
+  function createTestDirtyDoc() {
+    setEditorDocument({
+      schemaVersion: 1,
+      mediaPath: "C:\\audio.wav",
+      mediaFileName: "audio.wav",
+      createdAt: "2026-09-26T20:00:00Z",
+      updatedAt: "2026-09-26T20:00:00Z",
+      language: "ja",
+      sourceEngine: "reazonspeech",
+      sourceRunId: "run-1",
+      segments: [{
+        id: "seg-1",
+        start: 0,
+        end: 5,
+        speaker: "SPEAKER_00",
+        originalSpeaker: "SPEAKER_00",
+        text: "テスト",
+        originalText: "テスト",
+        sourceEngine: "reazonspeech",
+        sourceSegmentId: "1",
+        sourceRunId: "run-1",
+        status: "raw",
+      }],
+    }, null); // null path = dirty/unsaved
+  }
+
+  it("Case 8A: onCloseRequested handler is registered only once across multiple setups", async () => {
+    await setupWindowCloseGuard();
+    await setupWindowCloseGuard();
+    await setupWindowCloseGuard();
+
+    expect(mockWindow.onCloseRequested).toHaveBeenCalledTimes(1);
+    expect(mockWindow.onResized).toHaveBeenCalledTimes(1);
+  });
+
+  it("Case 8B: custom close button, dirty editor, cancel confirmation", async () => {
+    createTestDirtyDoc();
+    expect(isEditorDirty()).toBe(true);
+
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(false);
+
+    await requestAppClose();
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(mockWindow.destroy).not.toHaveBeenCalled();
+    expect(isForceClosingForTest()).toBe(false);
+    expect(isEditorDirty()).toBe(true);
+  });
+
+  it("Case 8C: custom close button, dirty editor, approve confirmation", async () => {
+    createTestDirtyDoc();
+    expect(isEditorDirty()).toBe(true);
+
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(true);
+
+    await requestAppClose();
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(isForceClosingForTest()).toBe(true);
+    expect(mockWindow.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("Case 8D: Alt+F4 / onCloseRequested event, dirty editor, cancel confirmation", async () => {
+    await setupWindowCloseGuard();
+    createTestDirtyDoc();
+    expect(isEditorDirty()).toBe(true);
+
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(false);
+    const mockEvent = { preventDefault: vi.fn() };
+
+    await closeRequestedHandler!(mockEvent);
+
+    expect(mockEvent.preventDefault).toHaveBeenCalledTimes(1);
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(mockWindow.destroy).not.toHaveBeenCalled();
+    expect(isForceClosingForTest()).toBe(false);
+  });
+
+  it("Case 8E: Alt+F4 / onCloseRequested event, dirty editor, approve confirmation", async () => {
+    await setupWindowCloseGuard();
+    createTestDirtyDoc();
+    expect(isEditorDirty()).toBe(true);
+
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(true);
+    const mockEvent = { preventDefault: vi.fn() };
+
+    await closeRequestedHandler!(mockEvent);
+
+    expect(mockEvent.preventDefault).toHaveBeenCalledTimes(1);
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(isForceClosingForTest()).toBe(true);
+    expect(mockWindow.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("Case 8F: clean state close proceeds directly without prompt", async () => {
+    await setupWindowCloseGuard();
+    expect(isEditorDirty()).toBe(false);
+
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm");
+
+    // Custom close
+    await requestAppClose();
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(mockWindow.destroy).toHaveBeenCalledTimes(1);
+
+    // Reset and test onCloseRequested
+    resetWindowCloseGuardForTest();
+    await setupWindowCloseGuard();
+    const mockEvent = { preventDefault: vi.fn() };
+    await closeRequestedHandler!(mockEvent);
+
+    expect(mockEvent.preventDefault).not.toHaveBeenCalled();
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(isForceClosingForTest()).toBe(true);
+  });
+
+  it("Case 8G: re-entrant close while forceClosing=true does not prompt or duplicate destroy", async () => {
+    await setupWindowCloseGuard();
+    createTestDirtyDoc();
+
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(true);
+
+    // First close
+    await requestAppClose();
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(mockWindow.destroy).toHaveBeenCalledTimes(1);
+    expect(isForceClosingForTest()).toBe(true);
+
+    // Second close attempt while forceClosing=true
+    await requestAppClose();
+    expect(confirmSpy).toHaveBeenCalledTimes(1); // no extra confirm
+    expect(mockWindow.destroy).toHaveBeenCalledTimes(1); // no extra destroy
+
+    // Also onCloseRequested re-entry
+    const mockEvent = { preventDefault: vi.fn() };
+    await closeRequestedHandler!(mockEvent);
+    expect(mockEvent.preventDefault).not.toHaveBeenCalled();
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("Case 8H: after beforeunload event, close guard listeners remain intact and functional", async () => {
+    await setupWindowCloseGuard();
+    createTestDirtyDoc();
+    expect(isEditorDirty()).toBe(true);
+
+    // Simulate beforeunload (e.g. browser tab close / navigation cancel)
+    const beforeUnloadEvent = new Event("beforeunload", { cancelable: true }) as BeforeUnloadEvent;
+    const preventDefaultSpy = vi.spyOn(beforeUnloadEvent, "preventDefault");
+    window.dispatchEvent(beforeUnloadEvent);
+
+    expect(preventDefaultSpy).toHaveBeenCalledTimes(1);
+
+    // Ensure onCloseRequested listener is still registered and active
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(true);
+    const mockEvent = { preventDefault: vi.fn() };
+    await closeRequestedHandler!(mockEvent);
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(mockWindow.destroy).toHaveBeenCalledTimes(1);
+    expect(isForceClosingForTest()).toBe(true);
+  });
+
+  it("Case 8I: custom close button recovers forceClosing=false when destroy() rejects", async () => {
+    createTestDirtyDoc();
+    expect(isEditorDirty()).toBe(true);
+
+    mockWindow.destroy.mockRejectedValueOnce(new Error("destroy failed"));
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(true);
+
+    // 1st close: destroy rejects
+    await requestAppClose();
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(isForceClosingForTest()).toBe(false); // restored to false
+
+    // 2nd close: should be retriable and prompt confirm again
+    mockWindow.destroy.mockResolvedValueOnce(undefined);
+    await requestAppClose();
+    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    expect(isForceClosingForTest()).toBe(true);
+    expect(mockWindow.destroy).toHaveBeenCalledTimes(2);
+  });
+
+  it("Case 8J: onCloseRequested recovers forceClosing=false when destroy() rejects", async () => {
+    await setupWindowCloseGuard();
+    createTestDirtyDoc();
+    expect(isEditorDirty()).toBe(true);
+
+    mockWindow.destroy.mockRejectedValueOnce(new Error("destroy failed"));
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(true);
+
+    // 1st Alt+F4: destroy rejects
+    const mockEvent1 = { preventDefault: vi.fn() };
+    await closeRequestedHandler!(mockEvent1);
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(isForceClosingForTest()).toBe(false); // restored to false
+
+    // 2nd Alt+F4: should be retriable and prompt confirm again
+    mockWindow.destroy.mockResolvedValueOnce(undefined);
+    const mockEvent2 = { preventDefault: vi.fn() };
+    await closeRequestedHandler!(mockEvent2);
+    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    expect(isForceClosingForTest()).toBe(true);
+    expect(mockWindow.destroy).toHaveBeenCalledTimes(2);
+  });
+
+  it("Case 8K: retrying setupWindowCloseGuard after listener rejection registers missing listener without duplicating others", async () => {
+    mockWindow.onCloseRequested
+      .mockRejectedValueOnce(new Error("IPC failed"))
+      .mockResolvedValueOnce(() => {});
+
+    // 1st setup: onResized succeeds, onCloseRequested fails
+    await setupWindowCloseGuard();
+    expect(mockWindow.onResized).toHaveBeenCalledTimes(1);
+    expect(mockWindow.onCloseRequested).toHaveBeenCalledTimes(1);
+
+    // 2nd setup: onResized is skipped (already initialized), onCloseRequested succeeds
+    await setupWindowCloseGuard();
+    expect(mockWindow.onResized).toHaveBeenCalledTimes(1); // not duplicated!
+    expect(mockWindow.onCloseRequested).toHaveBeenCalledTimes(2);
+  });
+
+  it("Case 8L: beforeunload does not preventDefault when forceClosing is true", async () => {
+    await setupWindowCloseGuard();
+    createTestDirtyDoc();
+
+    // Confirm close via custom button
+    vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(true);
+    await requestAppClose();
+    expect(isForceClosingForTest()).toBe(true);
+
+    // Dispatch beforeunload while forceClosing = true
+    const beforeUnloadEvent = new Event("beforeunload", { cancelable: true }) as BeforeUnloadEvent;
+    const preventDefaultSpy = vi.spyOn(beforeUnloadEvent, "preventDefault");
+    window.dispatchEvent(beforeUnloadEvent);
+
+    expect(preventDefaultSpy).not.toHaveBeenCalled();
+  });
+
+  it("Case 8M: beforeunload listener is registered and executed exactly once across setup retries", async () => {
+    const addEventListenerSpy = vi.spyOn(window, "addEventListener");
+
+    // 1st setup: fails on close request
+    mockWindow.onCloseRequested
+      .mockRejectedValueOnce(new Error("IPC failed"))
+      .mockResolvedValueOnce(() => {});
+    await setupWindowCloseGuard();
+
+    // 2nd setup: retry succeeds
+    await setupWindowCloseGuard();
+
+    // Verify addEventListener("beforeunload", ...) was called exactly once
+    const beforeUnloadCalls = addEventListenerSpy.mock.calls.filter(c => c[0] === "beforeunload");
+    expect(beforeUnloadCalls.length).toBe(1);
+
+    // Verify executing beforeunload runs the handler exactly once
+    createTestDirtyDoc();
+    const event = new Event("beforeunload", { cancelable: true }) as BeforeUnloadEvent;
+    const preventDefaultSpy = vi.spyOn(event, "preventDefault");
+    window.dispatchEvent(event);
+    expect(preventDefaultSpy).toHaveBeenCalledTimes(1);
+
+    // Verify resetWindowCloseGuardForTest removes the listener
+    resetWindowCloseGuardForTest();
+    const event2 = new Event("beforeunload", { cancelable: true }) as BeforeUnloadEvent;
+    const preventDefaultSpy2 = vi.spyOn(event2, "preventDefault");
+    window.dispatchEvent(event2);
+    expect(preventDefaultSpy2).not.toHaveBeenCalled();
+  });
+});
+
+

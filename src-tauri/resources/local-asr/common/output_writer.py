@@ -107,6 +107,9 @@ def write_outputs(results, output_dir, stem, formats, always_write_txt=True):
 
     generated = []
 
+    # 内部Canonicalデータ用: 出力形式に関わらず常時生成
+    write_json(results, output_dir / f"{stem}.segments.json")
+
     if always_write_txt:
         txt_path = output_dir / f"{stem}.txt"
         write_txt(results, txt_path)

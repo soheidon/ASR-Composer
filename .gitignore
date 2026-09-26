@@ -2,8 +2,17 @@ node_modules/
 dist/
 src-tauri/target/
 *.log
+__pycache__/
+*.pyc
 /test-audio.wav
 /test-speech-jp.wav
 /dev-screenshot.png
 /screenshot.png
 /screenshot.jpg
+/test-env/
+/test-output-*/
+/test-pipeline/
+/test-tmp-*/
+/.claude/
+/stitch-screens/
+/icon/

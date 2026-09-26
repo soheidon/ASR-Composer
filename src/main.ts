@@ -17,10 +17,31 @@ import {
   setButtonLoading,
   restoreButtonLoading,
 } from "./provider-config-save";
-import { renderDockerStatusContent, renderHuggingFaceTokenSection, renderLocalAsrSection, renderLocalAsrInstallCache, renderLocalAsrEngineCard, getLocalAsrProgressDisplay, escapeHtml } from "./docker";
+import {
+  renderDockerStatusContent,
+  renderHuggingFaceTokenSection,
+  renderLocalAsrSection,
+  renderLocalAsrInstallCache,
+  renderLocalAsrEngineCard,
+  getLocalAsrProgressDisplay,
+  getLocalAsrDisplayName,
+  escapeHtml,
+} from "./docker";
 import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus, LocalAsrProgress, LocalAsrInstallState } from "./docker";
+import {
+  renderEditorPage,
+  bindEditorEvents,
+  confirmDiscardChanges,
+  discardEditorChanges,
+  setEditorDocument,
+  setEditorInvoke,
+  isEditorDirty,
+} from "./editor";
+import type { TranscriptDocument } from "./transcript";
 
-const app = document.getElementById("app")!;
+function getAppElement(): HTMLElement | null {
+  return document.getElementById("app");
+}
 
 // ---- Tauri API Guard ----
 
@@ -37,6 +58,8 @@ async function initializeTauri(): Promise<void> {
   const core = await import("@tauri-apps/api/core");
   tauriWindow = getCurrentWindow();
   invokeFn = core.invoke;
+  setEditorInvoke(invokeFn);
+  await setupWindowCloseGuard();
 }
 
 async function invokeTauri<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -479,6 +502,10 @@ const transcribePage = `
         <div class="result-actions">
           <button class="btn-ghost" id="copyResultBtn">コピー</button>
           <button class="btn-ghost" id="saveResultBtn">保存</button>
+          <button class="btn-primary" id="openEditorBtn" style="display:none">
+            <span class="material-symbols-outlined">edit_note</span>
+            正本編集を開く
+          </button>
         </div>
       </section>
 
@@ -717,10 +744,11 @@ const settingsBackgroundPage = `
   </div>
 `;
 
-type PageName = "transcribe" | "settings" | "settings-ollama" | "settings-docker" | "settings-dictionary" | "settings-background" | "settings-general";
+type PageName = "transcribe" | "editor" | "settings" | "settings-ollama" | "settings-docker" | "settings-dictionary" | "settings-background" | "settings-general";
 
 function renderHeader(activePage: PageName): string {
   const transcribeActive = activePage === "transcribe" ? "active" : "";
+  const editorActive = activePage === "editor" ? "active" : "";
   const settingsActive = (activePage === "settings" || activePage === "settings-ollama" || activePage === "settings-docker" || activePage === "settings-dictionary" || activePage === "settings-background" || activePage === "settings-general") ? "active" : "";
   return `
   <header class="app-header">
@@ -730,6 +758,7 @@ function renderHeader(activePage: PageName): string {
       <div class="header-divider"></div>
       <nav class="header-nav">
         <a class="nav-link ${transcribeActive}" href="#" data-page="transcribe">文字起こし</a>
+        <a class="nav-link ${editorActive}" href="#" data-page="editor">正本編集</a>
         <a class="nav-link" href="#">統合</a>
         <a class="nav-link ${settingsActive}" href="#" data-page="settings-general">設定</a>
       </nav>
@@ -754,12 +783,6 @@ let sidebarDelegationBound = false;
 let dockerPageLoadRevision = 0;
 
 // ---- Local ASR Install State ----
-const LOCAL_ASR_DISPLAY_NAMES: Record<string, string> = {
-  "reazonspeech": "ReazonSpeech",
-  "kotoba-whisper": "Kotoba Whisper",
-  "qwen3-asr": "Qwen3 ASR",
-};
-
 const localAsrInstallStates = new Map<string, LocalAsrInstallState>();
 const localAsrInstallPromises = new Map<string, Promise<void>>();
 let localAsrProgressListenerPromise: Promise<void> | null = null;
@@ -1203,23 +1226,34 @@ function populateLanguagesForEngine(engineId: string, savedCode?: string): void 
 
 async function navigateTo(page: PageName) {
   if (currentPage === page) return;
+  if (currentPage === "editor" && page !== "editor" && isEditorDirty()) {
+    const confirmed = await confirmDiscardChanges();
+    if (!confirmed) return;
+    discardEditorChanges();
+  }
   currentPage = page;
 
   const body = page === "transcribe" ? transcribePage
+    : page === "editor" ? renderEditorPage()
     : page === "settings-ollama" ? settingsOllamaPage
     : page === "settings-docker" ? settingsDockerPage
     : page === "settings-dictionary" ? settingsDictionaryPage
     : page === "settings-background" ? settingsBackgroundPage
     : page === "settings-general" ? settingsGeneralPage
     : settingsApiPage;
-  app.innerHTML = renderHeader(page) + body;
+  const appEl = getAppElement();
+  if (appEl) {
+    appEl.innerHTML = renderHeader(page) + body;
+  }
 
   bindWindowControls();
   bindNavigation();
   bindAccordions();
   bindSettingsSidebarNav();
 
-  if (page === "settings") {
+  if (page === "editor") {
+    bindEditorEvents(navigateTo);
+  } else if (page === "settings") {
     loadSavedSettings();
     bindApiSaveButtons();
     bindVisibilityToggles();
@@ -1281,33 +1315,138 @@ function bindSettingsSidebarNav() {
   });
 }
 
-// ---- Window Controls ----
+// ---- Window Lifecycle & Close Guard ----
+
+let forceClosing = false;
+let resizeListenerInitialized = false;
+let closeGuardInitialized = false;
+let beforeUnloadInitialized = false;
+let unlistenResize: (() => void) | undefined;
+let unlistenCloseRequest: (() => void) | undefined;
+
+const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+  if (!forceClosing && isEditorDirty()) {
+    e.preventDefault();
+    e.returnValue = "";
+  }
+};
+
+export function setTauriWindowForTest(win: any): void {
+  tauriWindow = win;
+}
+
+export function resetWindowCloseGuardForTest(): void {
+  forceClosing = false;
+  resizeListenerInitialized = false;
+  closeGuardInitialized = false;
+  if (beforeUnloadInitialized) {
+    window.removeEventListener("beforeunload", handleBeforeUnload);
+    beforeUnloadInitialized = false;
+  }
+  unlistenResize?.();
+  unlistenCloseRequest?.();
+  unlistenResize = undefined;
+  unlistenCloseRequest = undefined;
+}
+
+export function isForceClosingForTest(): boolean {
+  return forceClosing;
+}
+
+export async function requestAppClose(): Promise<void> {
+  if (forceClosing || !tauriWindow) return;
+
+  if (isEditorDirty()) {
+    const confirmed = await confirmDiscardChanges();
+    if (!confirmed) return;
+  }
+
+  forceClosing = true;
+  try {
+    await tauriWindow.destroy();
+  } catch (err) {
+    forceClosing = false;
+    console.error("destroy failed:", err);
+  }
+}
+
+export async function setupWindowCloseGuard(): Promise<void> {
+  if (!tauriWindow) return;
+
+  if (!resizeListenerInitialized) {
+    try {
+      unlistenResize = await tauriWindow.onResized(() => updateMaximizeIcon());
+      resizeListenerInitialized = true;
+    } catch (err) {
+      console.error("Failed to listen onResized:", err);
+    }
+  }
+
+  if (!closeGuardInitialized) {
+    try {
+      unlistenCloseRequest = await tauriWindow.onCloseRequested(async (event: any) => {
+        if (forceClosing) return;
+        if (isEditorDirty()) {
+          event.preventDefault();
+          const confirmed = await confirmDiscardChanges();
+          if (confirmed) {
+            forceClosing = true;
+            try {
+              await tauriWindow.destroy();
+            } catch (err) {
+              forceClosing = false;
+              console.error("destroy failed:", err);
+            }
+          }
+        } else {
+          forceClosing = true;
+        }
+      });
+      closeGuardInitialized = true;
+    } catch (err) {
+      console.error("Failed to listen onCloseRequested:", err);
+    }
+  }
+
+  if (!beforeUnloadInitialized) {
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    beforeUnloadInitialized = true;
+  }
+}
+
+async function updateMaximizeIcon() {
+  if (!tauriWindow) return;
+  const maximizeBtn = document.getElementById("maximizeBtn");
+  const maximizeIcon = document.getElementById("maximizeIcon");
+  if (!maximizeBtn || !maximizeIcon) return;
+  try {
+    const isMaximized = await tauriWindow.isMaximized();
+    maximizeIcon.textContent = isMaximized ? "filter_none" : "crop_square";
+    maximizeBtn.title = isMaximized ? "元のサイズに戻す" : "最大化";
+  } catch (e) {
+    console.error("Failed to update maximize icon:", e);
+  }
+}
+
+// ---- Window Controls Binding (per header render) ----
 
 function bindWindowControls() {
   if (!tauriWindow) return; // browser preview mode
 
-  const minimizeBtn = document.getElementById("minimizeBtn")!;
-  const maximizeBtn = document.getElementById("maximizeBtn")!;
-  const closeBtn = document.getElementById("closeBtn")!;
-  const maximizeIcon = document.getElementById("maximizeIcon")!;
+  const minimizeBtn = document.getElementById("minimizeBtn");
+  const maximizeBtn = document.getElementById("maximizeBtn");
+  const closeBtn = document.getElementById("closeBtn");
+  const headerDragArea = document.getElementById("headerDragArea");
 
-  async function updateMaximizeIcon() {
-    try {
-      const isMaximized = await tauriWindow.isMaximized();
-      maximizeIcon.textContent = isMaximized ? "filter_none" : "crop_square";
-      maximizeBtn.title = isMaximized ? "元のサイズに戻す" : "最大化";
-    } catch (e) {
-      console.error("Failed to update maximize icon:", e);
-    }
-  }
+  void updateMaximizeIcon();
 
-  minimizeBtn.addEventListener("click", async (e) => {
+  minimizeBtn?.addEventListener("click", async (e) => {
     e.preventDefault();
     e.stopPropagation();
     try { await tauriWindow.minimize(); } catch (err) { console.error("minimize failed:", err); }
   });
 
-  maximizeBtn.addEventListener("click", async (e) => {
+  maximizeBtn?.addEventListener("click", async (e) => {
     e.preventDefault();
     e.stopPropagation();
     try {
@@ -1316,23 +1455,12 @@ function bindWindowControls() {
     } catch (err) { console.error("toggleMaximize failed:", err); }
   });
 
-  closeBtn.addEventListener("click", async (e) => {
+  closeBtn?.addEventListener("click", async (e) => {
     e.preventDefault();
     e.stopPropagation();
-    try { await tauriWindow.close(); } catch (err) { console.error("close failed:", err); }
+    await requestAppClose();
   });
 
-  let unlistenResize: (() => void) | undefined;
-
-  async function initWindowControls() {
-    await updateMaximizeIcon();
-    unlistenResize = await tauriWindow.onResized(() => updateMaximizeIcon());
-  }
-
-  initWindowControls();
-  window.addEventListener("beforeunload", () => { unlistenResize?.(); });
-
-  const headerDragArea = document.getElementById("headerDragArea");
   headerDragArea?.addEventListener("mousedown", async (event: MouseEvent) => {
     if (event.button !== 0) return;
     event.preventDefault();
@@ -1406,6 +1534,7 @@ type TranscriptionResult = {
   engine: string;
   language: string;
   savedFiles: SavedOutputFile[];
+  document?: TranscriptDocument | null;
 };
 
 type TranscriptionProgress = {
@@ -1647,8 +1776,11 @@ function bindStartButton(): void {
   });
 }
 
+let lastTranscriptionDocument: TranscriptDocument | null = null;
+
 function displayTranscriptionResult(result: TranscriptionResult): void {
   showResultSection();
+  lastTranscriptionDocument = result.document ?? null;
   const textArea = document.getElementById("resultText") as HTMLTextAreaElement | null;
   if (textArea) {
     textArea.value = result.txtContent;
@@ -1661,6 +1793,11 @@ function displayTranscriptionResult(result: TranscriptionResult): void {
     savedFilesEl.style.display = "";
   } else if (savedFilesEl) {
     savedFilesEl.style.display = "none";
+  }
+
+  const openEditorBtn = document.getElementById("openEditorBtn");
+  if (openEditorBtn) {
+    openEditorBtn.style.display = result.document ? "" : "none";
   }
 }
 
@@ -1701,6 +1838,16 @@ function bindResultButtons(): void {
     });
     if (path) {
       await invokeTauri("save_text_file", { path, content: textArea.value });
+    }
+  });
+  document.getElementById("openEditorBtn")?.addEventListener("click", async () => {
+    if (lastTranscriptionDocument) {
+      if (isEditorDirty()) {
+        const confirmed = await confirmDiscardChanges();
+        if (!confirmed) return;
+      }
+      setEditorDocument(lastTranscriptionDocument, null);
+      await navigateTo("editor");
     }
   });
 }
@@ -3280,7 +3427,7 @@ async function handleLocalAsrUninstall(
   button: HTMLButtonElement,
 ): Promise<void> {
   const originalHtml = button.innerHTML;
-  const displayName = LOCAL_ASR_DISPLAY_NAMES[engine] ?? engine;
+  const displayName = getLocalAsrDisplayName(engine);
 
   const confirmed = await showAppConfirm({
     title: `${displayName}環境を削除`,
@@ -3329,7 +3476,7 @@ function ensureLocalAsrProgressListener(): Promise<void> {
       ({ payload }) => {
         const state = localAsrInstallStates.get(payload.engine);
         if (!state || state.status !== "installing") return;
-        const display = getLocalAsrProgressDisplay(payload.stage);
+        const display = getLocalAsrProgressDisplay(payload.stage, payload.engine);
         state.progress = display.percent;
         state.message = display.message;
         updateVisibleLocalAsrProgress(payload.engine, display.percent, display.message);
@@ -3532,5 +3679,7 @@ async function loadAndRenderLocalAsrStatus(revision?: number, useFast: boolean =
 
 // ---- Init ----
 initializeTauri().then(() => {
-  void navigateTo("transcribe");
+  if (getAppElement()) {
+    void navigateTo("transcribe");
+  }
 });

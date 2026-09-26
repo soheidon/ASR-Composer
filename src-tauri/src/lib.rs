@@ -1,3 +1,5 @@
+pub mod transcript;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -298,6 +300,7 @@ struct TranscriptionResult {
     engine: String,
     language: String,
     saved_files: Vec<SavedOutputFile>,
+    document: Option<transcript::TranscriptDocument>,
 }
 
 fn validate_job_id(job_id: &str) -> Result<(), String> {
@@ -812,6 +815,40 @@ async fn local_asr_transcribe(
                 }
             }
 
+            // CanonicalセグメントJSONの読み込みとTranscriptDocument生成
+            let segments_json_path = output_dir.join(format!("{output_stem}.segments.json"));
+            let document = if segments_json_path.exists() {
+                match fs::read_to_string(&segments_json_path) {
+                    Ok(content) => match serde_json::from_str::<Vec<transcript::RawSegment>>(&content) {
+                        Ok(raw_segments) => {
+                            let lang = settings
+                                .asr_languages
+                                .get(&settings.asr_engine)
+                                .cloned()
+                                .unwrap_or_else(|| "ja".to_string());
+                            Some(transcript::TranscriptDocument::from_raw_segments(
+                                raw_segments,
+                                audio_path.clone(),
+                                input_filename.clone(),
+                                Some(lang),
+                                Some(engine.clone()),
+                                Some(job_id.clone()),
+                            ))
+                        }
+                        Err(e) => {
+                            eprintln!("segments.jsonパース警告: {e}");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("segments.json読み込み警告: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             emit_transcribe_progress(&app, &job_id, "completed", "完了");
 
             if !copy_errors.is_empty() {
@@ -831,6 +868,7 @@ async fn local_asr_transcribe(
                     .cloned()
                     .unwrap_or_else(|| "ja".to_string()),
                 saved_files,
+                document,
             })
         }
         Err(e) => Err(e),
@@ -914,6 +952,16 @@ async fn cancel_transcription(
 #[tauri::command]
 fn save_text_file(path: String, content: String) -> Result<(), String> {
     fs::write(&path, content).map_err(|e| format!("ファイル保存エラー: {e}"))
+}
+
+#[tauri::command]
+fn save_transcript_document(path: String, document: transcript::TranscriptDocument) -> Result<(), String> {
+    transcript::save_transcript_document_atomic(std::path::Path::new(&path), &document)
+}
+
+#[tauri::command]
+fn load_transcript_document(path: String) -> Result<transcript::TranscriptDocument, String> {
+    transcript::load_transcript_document(std::path::Path::new(&path))
 }
 
 const MIMO_ASR_MAX_BASE64_SIZE: usize = 10 * 1024 * 1024; // 10MB
@@ -4234,7 +4282,9 @@ pub fn run() {
             local_asr_uninstall,
             local_asr_transcribe,
             cancel_transcription,
-            save_text_file
+            save_text_file,
+            save_transcript_document,
+            load_transcript_document
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -7417,7 +7467,8 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.asr_languages.insert("qwen3-asr".to_string(), "en".to_string());
         settings.num_speakers = "3".to_string();
-        let vars = build_transcribe_env_vars("qwen3-asr", &settings, "test.mp3").unwrap();
+        let formats = vec!["txt".to_string()];
+        let vars = build_transcribe_env_vars("qwen3-asr", &settings, "test.mp3", &formats).unwrap();
         let asr_lang = vars.iter().find(|(k, _)| k == "ASR_LANGUAGE").unwrap();
         assert_eq!(asr_lang.1, "English");
         let num = vars.iter().find(|(k, _)| k == "NUM_SPEAKERS").unwrap();
@@ -7428,7 +7479,8 @@ mod tests {
     fn test_build_transcribe_env_vars_qwen3_auto() {
         let mut settings = AppSettings::default();
         settings.asr_languages.insert("qwen3-asr".to_string(), "auto".to_string());
-        let vars = build_transcribe_env_vars("qwen3-asr", &settings, "test.mp3").unwrap();
+        let formats = vec!["txt".to_string()];
+        let vars = build_transcribe_env_vars("qwen3-asr", &settings, "test.mp3", &formats).unwrap();
         let asr_lang = vars.iter().find(|(k, _)| k == "ASR_LANGUAGE").unwrap();
         assert_eq!(asr_lang.1, "auto");
         // auto時はNUM_SPEAKERSを渡さない
@@ -7438,7 +7490,8 @@ mod tests {
     #[test]
     fn test_build_transcribe_env_vars_kotoba() {
         let settings = AppSettings::default();
-        let vars = build_transcribe_env_vars("kotoba-whisper", &settings, "test.mp3").unwrap();
+        let formats = vec!["txt".to_string()];
+        let vars = build_transcribe_env_vars("kotoba-whisper", &settings, "test.mp3", &formats).unwrap();
         let asr_lang = vars.iter().find(|(k, _)| k == "ASR_LANGUAGE").unwrap();
         assert_eq!(asr_lang.1, "japanese");
     }
@@ -7446,7 +7499,8 @@ mod tests {
     #[test]
     fn test_build_transcribe_env_vars_reazonspeech() {
         let settings = AppSettings::default();
-        let vars = build_transcribe_env_vars("reazonspeech", &settings, "test.mp3").unwrap();
+        let formats = vec!["txt".to_string()];
+        let vars = build_transcribe_env_vars("reazonspeech", &settings, "test.mp3", &formats).unwrap();
         assert!(!vars.iter().any(|(k, _)| k == "ASR_LANGUAGE"));
     }
 

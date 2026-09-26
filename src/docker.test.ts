@@ -1,6 +1,15 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
-import { getDockerUiState, escapeHtml, renderDockerStatusContent, renderHuggingFaceTokenSection, getLocalAsrUiState, renderLocalAsrSection, getLocalAsrProgressDisplay } from "./docker";
+import {
+  getDockerUiState,
+  escapeHtml,
+  renderDockerStatusContent,
+  renderHuggingFaceTokenSection,
+  getLocalAsrUiState,
+  renderLocalAsrSection,
+  getLocalAsrProgressDisplay,
+  getLocalAsrDisplayName,
+} from "./docker";
 import type { DockerStatus, LocalAsrEngineStatus, LocalAsrInstallState } from "./docker";
 
 // ---- getDockerUiState ----
@@ -702,4 +711,47 @@ describe("getLocalAsrProgressDisplay", () => {
       expect(d.message.length).toBeGreaterThan(0);
     }
   });
+
+  describe("engineId awareness", () => {
+    it("building-engine-start formats engine name dynamically", () => {
+      expect(getLocalAsrProgressDisplay("building-engine-start", "reazonspeech").message)
+        .toBe("ReazonSpeech環境の構築を開始しています");
+      expect(getLocalAsrProgressDisplay("building-engine-start", "kotoba-whisper").message)
+        .toBe("Kotoba Whisper環境の構築を開始しています");
+      expect(getLocalAsrProgressDisplay("building-engine-start", "qwen3-asr").message)
+        .toBe("Qwen3 ASR環境の構築を開始しています");
+      expect(getLocalAsrProgressDisplay("building-engine-start", "custom-engine").message)
+        .toBe("custom-engine環境の構築を開始しています");
+      expect(getLocalAsrProgressDisplay("building-engine-start").message)
+        .toBe("ReazonSpeech環境の構築を開始しています");
+    });
+
+    it("exporting-engine-image formats engine name dynamically", () => {
+      expect(getLocalAsrProgressDisplay("exporting-engine-image", "reazonspeech").message)
+        .toBe("ReazonSpeechイメージを書き出しています");
+      expect(getLocalAsrProgressDisplay("exporting-engine-image", "kotoba-whisper").message)
+        .toBe("Kotoba Whisperイメージを書き出しています");
+      expect(getLocalAsrProgressDisplay("exporting-engine-image", "qwen3-asr").message)
+        .toBe("Qwen3 ASRイメージを書き出しています");
+      expect(getLocalAsrProgressDisplay("exporting-engine-image", "custom-engine").message)
+        .toBe("custom-engineイメージを書き出しています");
+      expect(getLocalAsrProgressDisplay("exporting-engine-image").message)
+        .toBe("ReazonSpeechイメージを書き出しています");
+    });
+  });
 });
+
+// ---- getLocalAsrDisplayName ----
+
+describe("getLocalAsrDisplayName", () => {
+  it("resolves known engine ids", () => {
+    expect(getLocalAsrDisplayName("reazonspeech")).toBe("ReazonSpeech");
+    expect(getLocalAsrDisplayName("kotoba-whisper")).toBe("Kotoba Whisper");
+    expect(getLocalAsrDisplayName("qwen3-asr")).toBe("Qwen3 ASR");
+  });
+
+  it("falls back to engine id when unknown", () => {
+    expect(getLocalAsrDisplayName("unknown-engine")).toBe("unknown-engine");
+  });
+});
+
