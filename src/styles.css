@@ -230,6 +230,39 @@ html, body {
   pointer-events: none;
 }
 
+/* ==================== Workspace Viewport & Pages ==================== */
+.workspace-viewport {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+.workspace-page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.workspace-page.hidden {
+  display: none !important;
+}
+
+.settings-subpage {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+}
+
+.settings-subpage.hidden {
+  display: none !important;
+}
+
 /* ==================== Main ==================== */
 .main-content {
   flex: 1;
@@ -677,7 +710,8 @@ html, body {
 /* ==================== Settings Layout ==================== */
 .settings-layout {
   display: flex;
-  height: calc(100vh - 48px);
+  flex: 1;
+  height: 100%;
   overflow: hidden;
 }
 
@@ -2418,5 +2452,16 @@ html, body {
   color: var(--on-surface-variant, #64748b);
   line-height: 1.4;
 }
+
+.btn-editor-cancel-correction {
+  background-color: #fee2e2;
+  color: #b91c1c;
+  border: 1px solid #fca5a5;
+}
+
+.btn-editor-cancel-correction:hover {
+  background-color: #fecaca;
+}
+
 
 

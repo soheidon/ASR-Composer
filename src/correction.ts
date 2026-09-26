@@ -34,17 +34,23 @@ export interface CorrectionContext {
 }
 
 /**
- * 補正提案 (LLM / Provider 出力境界)
- * ※ changes は含めず、originalText と correctedText を正本とする
+ * 外部/パース直後の補正提案候補型（LLM出力境界・IDなし）
  */
-export interface CorrectionProposal {
-  id: string;
+export interface ParsedProposalCandidate {
   segmentId: string;
   originalText: string;    // 提案生成時点の segment.text スナップショット
   correctedText: string;   // 補正後テキスト（採用時の正本データ）
   evidence: CorrectionEvidence[];
   explanation: string;
   confidence?: number;     // 0.0 - 1.0 (表示用メタデータ・自動採用には不使用)
+}
+
+/**
+ * 内部で管理される信頼済み補正提案（一意IDを持つ）
+ * ※ changes は含めず、originalText と correctedText を正本とする
+ */
+export interface CorrectionProposal extends ParsedProposalCandidate {
+  id: string;              // アプリ側で付与された一意ID
 }
 
 /**
@@ -60,10 +66,11 @@ export interface TextChange {
  */
 export type ValidationErrorType =
   | "MISSING_SEGMENT"
-  | "TEXT_MISMATCH"        // 受信時点で segment.text と不一致
+  | "TARGET_SEGMENT_MISMATCH" // Context専用セグメントへの補正提案を拒否
+  | "TEXT_MISMATCH"          // 受信時点で segment.text と不一致
   | "EMPTY_TEXT"
-  | "NO_CHANGE"            // originalText === correctedText
-  | "MISSING_EVIDENCE"     // evidence が空配列または未指定
+  | "NO_CHANGE"              // originalText === correctedText
+  | "MISSING_EVIDENCE"       // evidence が空配列または未指定
   | "BAD_EVIDENCE_TYPE"
   | "INVALID_CONFIDENCE";
 
@@ -78,6 +85,24 @@ export interface ValidationResult {
   valid: boolean;
   errors: ValidationErrorType[];
   warnings: ValidationWarningType[];
+}
+
+/**
+ * Ollama エラー分類型
+ */
+export type OllamaErrorKind =
+  | "ConnectionRefused"
+  | "HttpStatusError"
+  | "ModelNotFound"
+  | "Timeout"
+  | "MalformedOllamaPayload"
+  | "JsonParseError"
+  | "SchemaError";
+
+export interface OllamaError {
+  kind: OllamaErrorKind;
+  message: string;
+  statusCode?: number;
 }
 
 /**
@@ -106,7 +131,10 @@ export interface CorrectionRequest {
  * 補正プロバイダー抽象インターフェース
  */
 export interface CorrectionProvider {
-  correct(request: CorrectionRequest): Promise<CorrectionProposal[]>;
+  correct(
+    request: CorrectionRequest,
+    onProgress?: (completed: number, total: number) => void
+  ): Promise<CorrectionProposal[]>;
 }
 
 /**
@@ -117,6 +145,7 @@ export function cloneTranscriptDocument<T>(doc: T): T {
     ? structuredClone(doc)
     : (JSON.parse(JSON.stringify(doc)) as T);
 }
+
 
 /**
  * Provider呼び出し前の境界関数。
@@ -172,16 +201,15 @@ export function parseCorrectionEvidence(value: unknown): CorrectionEvidence | nu
 }
 
 /**
- * unknown 値をランタイムで検査し、安全な CorrectionProposal オブジェクトであるか検証する
+ * unknown 値をランタイムで検査し、安全な ParsedProposalCandidate オブジェクト（IDなし）であるか検証する
  */
-export function parseCorrectionProposal(value: unknown): CorrectionProposal | null {
+export function parseRawProposalCandidate(value: unknown): ParsedProposalCandidate | null {
   if (typeof value !== "object" || value === null) {
     return null;
   }
   const obj = value as Record<string, unknown>;
 
   if (
-    typeof obj.id !== "string" ||
     typeof obj.segmentId !== "string" ||
     typeof obj.originalText !== "string" ||
     typeof obj.correctedText !== "string" ||
@@ -212,13 +240,80 @@ export function parseCorrectionProposal(value: unknown): CorrectionProposal | nu
   }
 
   return {
-    id: obj.id,
     segmentId: obj.segmentId,
     originalText: obj.originalText,
     correctedText: obj.correctedText,
     evidence: parsedEvidences,
     explanation: obj.explanation,
     confidence,
+  };
+}
+
+/**
+ * unknown 値（配列または { proposals: [...] }）を検査し、有効な候補リスト（IDなし）を抽出する
+ */
+export function parseRawProposalCandidates(value: unknown): {
+  candidates: ParsedProposalCandidate[];
+  discardedCount: number;
+} {
+  let list: unknown[];
+  if (Array.isArray(value)) {
+    list = value;
+  } else if (typeof value === "object" && value !== null && Array.isArray((value as Record<string, unknown>).proposals)) {
+    list = (value as Record<string, unknown>).proposals as unknown[];
+  } else {
+    throw new Error("プロポーザルデータが配列または { proposals: [...] } 形式ではありません。");
+  }
+
+  const candidates: ParsedProposalCandidate[] = [];
+  let discardedCount = 0;
+
+  for (const item of list) {
+    const parsed = parseRawProposalCandidate(item);
+    if (parsed) {
+      candidates.push(parsed);
+    } else {
+      discardedCount++;
+    }
+  }
+
+  return { candidates, discardedCount };
+}
+
+/**
+ * 有効な ParsedProposalCandidate に一意な ID を付与して CorrectionProposal へ昇格させる
+ */
+export function promoteCandidateToProposal(
+  candidate: ParsedProposalCandidate,
+  idGenerator: () => string = () =>
+    typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `prop-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+): CorrectionProposal {
+  return {
+    ...candidate,
+    id: idGenerator(),
+  };
+}
+
+/**
+ * unknown 値をランタイムで検査し、安全な CorrectionProposal オブジェクトであるか検証する
+ */
+export function parseCorrectionProposal(value: unknown): CorrectionProposal | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const obj = value as Record<string, unknown>;
+  if (typeof obj.id !== "string" || obj.id.trim() === "") {
+    return null;
+  }
+
+  const candidate = parseRawProposalCandidate(value);
+  if (!candidate) return null;
+
+  return {
+    id: obj.id,
+    ...candidate,
   };
 }
 
@@ -289,11 +384,15 @@ export function deriveTextChanges(originalText: string, correctedText: string): 
 const VALID_EVIDENCE_TYPES = new Set<CorrectionEvidenceType>(["dictionary", "background", "context"]);
 
 /**
- * 提案の妥当性検証
+ * 提案候補の妥当性検証
+ * @param candidate 検証対象の提案候補
+ * @param segment 対象セグメント
+ * @param allowedTargetSegmentIds 補正対象として許可されたセグメントIDの集合（Context専用セグメントへの提案を TARGET_SEGMENT_MISMATCH で拒否）
  */
-export function validateProposal(
-  proposal: CorrectionProposal,
-  segment: TranscriptSegment | undefined
+export function validateProposalCandidate(
+  candidate: ParsedProposalCandidate,
+  segment: TranscriptSegment | undefined,
+  allowedTargetSegmentIds?: Set<string>
 ): ValidationResult {
   const errors: ValidationErrorType[] = [];
   const warnings: ValidationWarningType[] = [];
@@ -304,27 +403,32 @@ export function validateProposal(
     return { valid: false, errors, warnings };
   }
 
-  // 2. 本文一致 (Stale / Mismatch)
-  if (proposal.originalText !== segment.text) {
+  // 2. チャンク内対象範囲外（コンテキスト専用セグメントへの提案）
+  if (allowedTargetSegmentIds && !allowedTargetSegmentIds.has(candidate.segmentId)) {
+    errors.push("TARGET_SEGMENT_MISMATCH");
+  }
+
+  // 3. 本文一致 (Stale / Mismatch)
+  if (candidate.originalText !== segment.text) {
     errors.push("TEXT_MISMATCH");
   }
 
-  // 3. 空文字
-  if (!proposal.correctedText || proposal.correctedText.trim() === "") {
+  // 4. 空文字
+  if (!candidate.correctedText || candidate.correctedText.trim() === "") {
     errors.push("EMPTY_TEXT");
   }
 
-  // 4. NO_CHANGE
-  if (proposal.originalText === proposal.correctedText) {
+  // 5. NO_CHANGE
+  if (candidate.originalText === candidate.correctedText) {
     errors.push("NO_CHANGE");
   }
 
-  // 5. MISSING_EVIDENCE
-  if (!Array.isArray(proposal.evidence) || proposal.evidence.length === 0) {
+  // 6. MISSING_EVIDENCE
+  if (!Array.isArray(candidate.evidence) || candidate.evidence.length === 0) {
     errors.push("MISSING_EVIDENCE");
   } else {
-    // 6. BAD_EVIDENCE_TYPE
-    for (const ev of proposal.evidence) {
+    // 7. BAD_EVIDENCE_TYPE
+    for (const ev of candidate.evidence) {
       if (!ev || !VALID_EVIDENCE_TYPES.has(ev.type)) {
         errors.push("BAD_EVIDENCE_TYPE");
         break;
@@ -332,13 +436,13 @@ export function validateProposal(
     }
   }
 
-  // 7. INVALID_CONFIDENCE
-  if (proposal.confidence !== undefined) {
+  // 8. INVALID_CONFIDENCE
+  if (candidate.confidence !== undefined) {
     if (
-      typeof proposal.confidence !== "number" ||
-      !Number.isFinite(proposal.confidence) ||
-      proposal.confidence < 0 ||
-      proposal.confidence > 1
+      typeof candidate.confidence !== "number" ||
+      !Number.isFinite(candidate.confidence) ||
+      candidate.confidence < 0 ||
+      candidate.confidence > 1
     ) {
       errors.push("INVALID_CONFIDENCE");
     }
@@ -347,17 +451,17 @@ export function validateProposal(
   // Warnings チェック (validの場合に評価)
   if (errors.length === 0) {
     // LARGE_CHANGE warning: 文字数差が20文字以上、または元テキストが10文字以上で変化比率50%超
-    const lenDiff = Math.abs(proposal.correctedText.length - proposal.originalText.length);
-    const origLen = proposal.originalText.length;
+    const lenDiff = Math.abs(candidate.correctedText.length - candidate.originalText.length);
+    const origLen = candidate.originalText.length;
     if (lenDiff >= 20 || (origLen >= 10 && lenDiff / origLen >= 0.5)) {
       warnings.push("LARGE_CHANGE");
     }
 
     // AMBIGUOUS_OCCURRENCE: 簡易diffで得られた from が元テキスト内に2箇所以上出現する場合
-    const changes = deriveTextChanges(proposal.originalText, proposal.correctedText);
+    const changes = deriveTextChanges(candidate.originalText, candidate.correctedText);
     for (const ch of changes) {
       if (ch.from.length > 0) {
-        const count = proposal.originalText.split(ch.from).length - 1;
+        const count = candidate.originalText.split(ch.from).length - 1;
         if (count > 1) {
           warnings.push("AMBIGUOUS_OCCURRENCE");
           break;
@@ -371,6 +475,17 @@ export function validateProposal(
     errors,
     warnings,
   };
+}
+
+/**
+ * 提案の妥当性検証（CorrectionProposal / ParsedProposalCandidate 共通）
+ */
+export function validateProposal(
+  proposal: CorrectionProposal,
+  segment: TranscriptSegment | undefined,
+  allowedTargetSegmentIds?: Set<string>
+): ValidationResult {
+  return validateProposalCandidate(proposal, segment, allowedTargetSegmentIds);
 }
 
 /**

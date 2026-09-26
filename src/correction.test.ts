@@ -10,6 +10,8 @@ import {
   parseCorrectionEvidence,
   parseCorrectionProposal,
   parseCorrectionProposals,
+  parseRawProposalCandidates,
+  promoteCandidateToProposal,
   type CorrectionProposal,
   type CorrectionEvidence,
 } from "./correction";
@@ -520,4 +522,61 @@ describe("Runtime Shape Validation (parseCorrectionProposal / parseCorrectionPro
     expect(res.discardedCount).toBe(3);
   });
 });
+
+describe("Phase 2: parseRawProposalCandidates & promoteCandidateToProposal", () => {
+  const validCandidateObj = {
+    segmentId: "seg-001",
+    originalText: "クロナゼパンを飲んでいます",
+    correctedText: "クロナゼパムを飲んでいます",
+    evidence: [{ type: "dictionary" as const, description: "医薬品辞書" }],
+    explanation: "薬品名の訂正",
+    confidence: 0.95,
+  };
+
+  it("IDなしの未検証オブジェクトを正常にパースできる", () => {
+    const raw = {
+      proposals: [
+        validCandidateObj,
+        { ...validCandidateObj, segmentId: "seg-002", originalText: "テキスト2", correctedText: "修正2" },
+      ],
+    };
+    const { candidates, discardedCount } = parseRawProposalCandidates(raw);
+    expect(candidates).toHaveLength(2);
+    expect(candidates[0].segmentId).toBe("seg-001");
+    expect(discardedCount).toBe(0);
+  });
+
+  it("配列形式の直接入力も許容する", () => {
+    const { candidates } = parseRawProposalCandidates([validCandidateObj]);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].correctedText).toBe("クロナゼパムを飲んでいます");
+  });
+
+  it("不正なオブジェクト（proposalsフィールドも配列もない）は例外をスローする", () => {
+    expect(() => parseRawProposalCandidates("invalid")).toThrow("プロポーザルデータが配列または");
+    expect(() => parseRawProposalCandidates({ other: 123 })).toThrow("プロポーザルデータが配列または");
+  });
+
+  it("promoteCandidateToProposal で一意な ID を付与して昇格できる", () => {
+    const customIdGen = () => "custom-uuid-12345";
+    const prop = promoteCandidateToProposal(validCandidateObj, customIdGen);
+    expect(prop.id).toBe("custom-uuid-12345");
+    expect(prop.segmentId).toBe("seg-001");
+    expect(prop.correctedText).toBe("クロナゼパムを飲んでいます");
+  });
+
+  it("validateProposalCandidate: allowedTargetSegmentIds に含まれないセグメントは TARGET_SEGMENT_MISMATCH でエラー", () => {
+    const seg = createDummySegment({ id: "seg-context-only" });
+    const candidate = {
+      ...validCandidateObj,
+      segmentId: "seg-context-only",
+      originalText: seg.text,
+    };
+    const allowed = new Set(["seg-001", "seg-002"]);
+    const val = validateProposal(candidate as any, seg, allowed);
+    expect(val.valid).toBe(false);
+    expect(val.errors).toContain("TARGET_SEGMENT_MISMATCH");
+  });
+});
+
 

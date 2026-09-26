@@ -12,8 +12,23 @@ import {
   resetWindowCloseGuardForTest,
   setTauriWindowForTest,
   isForceClosingForTest,
+  navigateTo,
+  resetMountedPagesForTest,
+  pageMounts,
+  setTauriInvokeForTest,
+  resetDockerStatusRevisionForTest,
+  loadAndRenderDockerStatus,
 } from "./main";
-import { setEditorDocument, isEditorDirty } from "./editor";
+import {
+  setEditorDocument,
+  isEditorDirty,
+  getEditorDocument,
+  getEditorDocumentSessionId,
+  getActiveProposals,
+  setActiveProposalsForTest,
+} from "./editor";
+import type { TranscriptDocument } from "./transcript";
+import type { CorrectionProposal } from "./correction";
 import * as statusModule from "./status";
 
 /**
@@ -1040,6 +1055,612 @@ describe("Window Close Guard (Cases 8A - 8G)", () => {
     const preventDefaultSpy2 = vi.spyOn(event2, "preventDefault");
     window.dispatchEvent(event2);
     expect(preventDefaultSpy2).not.toHaveBeenCalled();
+  });
+});
+
+// ---- Persistent Workspace DOM Retention (Cases PW-A - PW-M) ----
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+const defaultMockSettings = {
+  providers: {
+    ollama: {
+      base_url: "http://localhost:11434",
+      default_model: "llama3:latest",
+    },
+    openai_audio: {
+      env_name: "OPENAI_API_KEY",
+      default_model: "whisper-1",
+    },
+  },
+  asr_mode: "cloud",
+  asr_engine: "google_stt",
+  asr_languages: {},
+  speaker_diarization: false,
+  num_speakers: "auto",
+  output_path: "",
+};
+
+describe("Persistent Workspace DOM Retention", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    document.body.innerHTML = '<div id="app"></div>';
+    resetMountedPagesForTest();
+    resetWindowCloseGuardForTest();
+    resetDockerStatusRevisionForTest();
+    setEditorDocument(null);
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        return defaultMockSettings;
+      }
+      if (command === "docker_check_status") {
+        return {
+          cliFound: true,
+          cliVersion: "24.0.5",
+          daemonRunning: true,
+          serverVersion: "24.0.5",
+          desktopFound: true,
+          cliPath: "/usr/bin/docker",
+          desktopPath: null,
+          errorKind: null,
+          errorMessage: null,
+        };
+      }
+      if (command === "local_asr_get_status" || command === "local_asr_get_status_fast") {
+        return [];
+      }
+      if (command === "hf_token_get_status") {
+        return { configured: false, envName: "HF_TOKEN" };
+      }
+      return null;
+    }) as any);
+  });
+
+  it("Case PW-A: Transcribe workspace retains DOM state and inputs across tab switches", async () => {
+    await navigateTo("transcribe");
+
+    const transcribeEl = document.getElementById("page-transcribe");
+    expect(transcribeEl).toBeTruthy();
+    expect(transcribeEl!.classList.contains("hidden")).toBe(false);
+
+    // Simulate user selecting an output path and having transcript result displayed
+    const outputPathInput = document.getElementById("outputPathInput") as HTMLInputElement;
+    expect(outputPathInput).toBeTruthy();
+    outputPathInput.value = "C:/Custom/Path";
+
+    const resultSection = document.getElementById("resultSection") as HTMLElement;
+    const resultText = document.getElementById("resultText") as HTMLTextAreaElement;
+    resultSection.style.display = "";
+    resultText.value = "文字起こし結果テキスト";
+
+    // Switch to Editor tab
+    await navigateTo("editor");
+    const editorEl = document.getElementById("page-editor");
+    expect(editorEl!.classList.contains("hidden")).toBe(false);
+    expect(transcribeEl!.classList.contains("hidden")).toBe(true);
+
+    // Switch back to Transcribe tab
+    await navigateTo("transcribe");
+    expect(transcribeEl!.classList.contains("hidden")).toBe(false);
+    expect(editorEl!.classList.contains("hidden")).toBe(true);
+
+    // Verify DOM inputs and result are preserved exactly
+    expect((document.getElementById("outputPathInput") as HTMLInputElement).value).toBe("C:/Custom/Path");
+    expect((document.getElementById("resultText") as HTMLTextAreaElement).value).toBe("文字起こし結果テキスト");
+    expect((document.getElementById("resultSection") as HTMLElement).style.display).toBe("");
+  });
+
+  it("Case PW-B: Editor dirty edits, status badge, proposals, and session ID are preserved without discard prompt on tab switch", async () => {
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm");
+
+    const initialDoc: TranscriptDocument = {
+      schemaVersion: 1,
+      mediaPath: "C:\\meeting.wav",
+      mediaFileName: "meeting.wav",
+      createdAt: "2026-09-26T20:00:00Z",
+      updatedAt: "2026-09-26T20:00:00Z",
+      language: "ja",
+      sourceEngine: "whisper",
+      sourceRunId: "run-1",
+      segments: [
+        {
+          id: "seg-1",
+          start: 0,
+          end: 4,
+          speaker: "SPEAKER_00",
+          originalSpeaker: "SPEAKER_00",
+          text: "初めのテキスト",
+          originalText: "初めのテキスト",
+          sourceEngine: "whisper",
+          sourceSegmentId: "1",
+          sourceRunId: "run-1",
+          status: "raw",
+        },
+      ],
+    };
+
+    setEditorDocument(initialDoc, "C:/meeting.asrc.json");
+    const initialSessionId = getEditorDocumentSessionId();
+
+    await navigateTo("editor");
+    const editorEl = document.getElementById("page-editor");
+    expect(editorEl!.classList.contains("hidden")).toBe(false);
+
+    // Edit the text area
+    const textarea = editorEl!.querySelector(".segment-text-input") as HTMLTextAreaElement;
+    expect(textarea).toBeTruthy();
+    textarea.value = "編集後のテキスト";
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+
+    expect(isEditorDirty()).toBe(true);
+    const badge = editorEl!.querySelector("#editorStatusContainer");
+    expect(badge?.textContent).toContain("未保存");
+
+    // Add an active proposal
+    const testProposals = new Map<string, CorrectionProposal[]>([
+      [
+        "seg-1",
+        [
+          {
+            id: "prop-1",
+            segmentId: "seg-1",
+            originalText: "編集後のテキスト",
+            correctedText: "修正後テキスト",
+            explanation: "誤認識修正",
+            evidence: [{ type: "dictionary", description: "辞書" }],
+            confidence: 0.95,
+          },
+        ],
+      ],
+    ]);
+    setActiveProposalsForTest(testProposals);
+
+    // Switch to Settings tab
+    await navigateTo("settings-general");
+    const settingsEl = document.getElementById("page-settings");
+    expect(settingsEl!.classList.contains("hidden")).toBe(false);
+    expect(editorEl!.classList.contains("hidden")).toBe(true);
+
+    // Confirm that NO discard confirmation was prompted
+    expect(confirmSpy).not.toHaveBeenCalled();
+
+    // Switch back to Editor tab
+    await navigateTo("editor");
+    expect(editorEl!.classList.contains("hidden")).toBe(false);
+    expect(settingsEl!.classList.contains("hidden")).toBe(true);
+
+    // Verify all editor state is completely preserved
+    const currentDoc = getEditorDocument();
+    expect(currentDoc?.segments[0].text).toBe("編集後のテキスト");
+    expect(currentDoc?.segments[0].status).toBe("edited");
+    expect(isEditorDirty()).toBe(true);
+    expect(editorEl!.querySelector("#editorStatusContainer")?.textContent).toContain("未保存");
+    expect(getEditorDocumentSessionId()).toBe(initialSessionId);
+    expect(getActiveProposals().get("seg-1")?.length).toBe(1);
+    expect(confirmSpy).not.toHaveBeenCalled();
+  });
+
+  it("Case PW-C: Switching tabs updates header active nav classes", async () => {
+    await navigateTo("transcribe");
+    let navLinks = document.querySelectorAll<HTMLElement>(".header-nav .nav-link");
+    expect(navLinks[0].classList.contains("active")).toBe(true); // 文字起こし
+    expect(navLinks[1].classList.contains("active")).toBe(false); // 正本編集
+    expect(navLinks[2].classList.contains("active")).toBe(false); // 統合
+    expect(navLinks[3].classList.contains("active")).toBe(false); // 設定
+
+    await navigateTo("editor");
+    navLinks = document.querySelectorAll<HTMLElement>(".header-nav .nav-link");
+    expect(navLinks[0].classList.contains("active")).toBe(false);
+    expect(navLinks[1].classList.contains("active")).toBe(true);
+    expect(navLinks[2].classList.contains("active")).toBe(false);
+    expect(navLinks[3].classList.contains("active")).toBe(false);
+
+    await navigateTo("merge");
+    navLinks = document.querySelectorAll<HTMLElement>(".header-nav .nav-link");
+    expect(navLinks[0].classList.contains("active")).toBe(false);
+    expect(navLinks[1].classList.contains("active")).toBe(false);
+    expect(navLinks[2].classList.contains("active")).toBe(true);
+    expect(navLinks[3].classList.contains("active")).toBe(false);
+
+    await navigateTo("settings-ollama");
+    navLinks = document.querySelectorAll<HTMLElement>(".header-nav .nav-link");
+    expect(navLinks[0].classList.contains("active")).toBe(false);
+    expect(navLinks[1].classList.contains("active")).toBe(false);
+    expect(navLinks[2].classList.contains("active")).toBe(false);
+    expect(navLinks[3].classList.contains("active")).toBe(true);
+  });
+
+  it("Case PW-D: Repeated navigation does not duplicate event listeners", async () => {
+    const initialDoc: TranscriptDocument = {
+      schemaVersion: 1,
+      mediaPath: "C:\\audio.wav",
+      mediaFileName: "audio.wav",
+      createdAt: "2026-09-26T20:00:00Z",
+      updatedAt: "2026-09-26T20:00:00Z",
+      language: "ja",
+      sourceEngine: "whisper",
+      sourceRunId: "run-1",
+      segments: [
+        {
+          id: "seg-1",
+          start: 0,
+          end: 2,
+          speaker: "SPEAKER_00",
+          originalSpeaker: "SPEAKER_00",
+          text: "テスト",
+          originalText: "テスト",
+          sourceEngine: "whisper",
+          sourceSegmentId: "1",
+          sourceRunId: "run-1",
+          status: "raw",
+        },
+      ],
+    };
+    setEditorDocument(initialDoc, "C:/audio.asrc.json");
+
+    await navigateTo("transcribe");
+    await navigateTo("editor");
+    await navigateTo("settings-general");
+    await navigateTo("editor");
+    await navigateTo("transcribe");
+    await navigateTo("editor");
+
+    const editorEl = document.getElementById("page-editor");
+    const textarea = editorEl!.querySelector(".segment-text-input") as HTMLTextAreaElement;
+
+    let inputEventCount = 0;
+    const list = document.getElementById("editorSegmentsList");
+    list?.addEventListener("input", () => {
+      inputEventCount++;
+    });
+
+    textarea.value = "変更テスト";
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+
+    expect(inputEventCount).toBe(1);
+    expect(getEditorDocument()?.segments[0].text).toBe("変更テスト");
+  });
+
+  it("Case PW-E: Window close guard triggers when editor dirty while user is on transcribe tab", async () => {
+    const mockWindow = {
+      isMaximized: vi.fn().mockResolvedValue(false),
+      destroy: vi.fn().mockResolvedValue(undefined),
+      onResized: vi.fn().mockResolvedValue(() => {}),
+      onCloseRequested: vi.fn().mockResolvedValue(() => {}),
+    };
+    setTauriWindowForTest(mockWindow);
+    await setupWindowCloseGuard();
+
+    const dirtyDoc: TranscriptDocument = {
+      schemaVersion: 1,
+      mediaPath: "C:\\audio.wav",
+      mediaFileName: "audio.wav",
+      createdAt: "2026-09-26T20:00:00Z",
+      updatedAt: "2026-09-26T20:00:00Z",
+      language: "ja",
+      sourceEngine: "whisper",
+      sourceRunId: "run-1",
+      segments: [
+        {
+          id: "seg-1",
+          start: 0,
+          end: 2,
+          speaker: "SPEAKER_00",
+          originalSpeaker: "SPEAKER_00",
+          text: "未保存テキスト",
+          originalText: "未保存テキスト",
+          sourceEngine: "whisper",
+          sourceSegmentId: "1",
+          sourceRunId: "run-1",
+          status: "raw",
+        },
+      ],
+    };
+    setEditorDocument(dirtyDoc, null); // null path = dirty
+
+    // User is on Transcribe tab
+    await navigateTo("transcribe");
+    expect(isEditorDirty()).toBe(true);
+
+    const confirmSpy = vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(false);
+
+    await requestAppClose();
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(mockWindow.destroy).not.toHaveBeenCalled();
+  });
+
+  it("Case PW-F: Slower stale navigation completing out of order does not overwrite UI", async () => {
+    const settingsDef = deferred<any>();
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        return settingsDef.promise;
+      }
+      return defaultMockSettings;
+    }) as any);
+
+    // Navigation 1: settings-ollama (starts loadOllamaSettings, held pending by settingsDef)
+    const nav1 = navigateTo("settings-ollama");
+
+    // Navigation 2: settings-general
+    const nav2 = navigateTo("settings-general");
+    await nav2;
+
+    const generalEl = document.getElementById("subpage-settings-general");
+    const ollamaEl = document.getElementById("subpage-settings-ollama");
+    expect(generalEl!.classList.contains("hidden")).toBe(false);
+    expect(ollamaEl!.classList.contains("hidden")).toBe(true);
+
+    // Now resolve Navigation 1's pending settings load
+    settingsDef.resolve(defaultMockSettings);
+    await nav1;
+
+    // Verify UI remains on settings-general, NOT overwritten by the stale settings-ollama navigation
+    expect(generalEl!.classList.contains("hidden")).toBe(false);
+    expect(ollamaEl!.classList.contains("hidden")).toBe(true);
+  });
+
+  it("Case PW-G: Concurrent navigation to same page runs mount once via Promise registry", async () => {
+    let loadCount = 0;
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        loadCount++;
+        return defaultMockSettings;
+      }
+      return null;
+    }) as any);
+
+    await Promise.all([
+      navigateTo("settings"),
+      navigateTo("settings"),
+      navigateTo("settings"),
+    ]);
+
+    expect(pageMounts.has("workspace:settings")).toBe(true);
+    expect(pageMounts.has("settings:api")).toBe(true);
+    expect(loadCount).toBe(1);
+
+    const subpageSettings = document.getElementById("subpage-settings");
+    expect(subpageSettings!.classList.contains("hidden")).toBe(false);
+  });
+
+  it("Case PW-H: Shared cancelled mount Promise is retried automatically once by current navigation", async () => {
+    const def1 = deferred<any>();
+    let callCount = 0;
+
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        callCount++;
+        if (callCount === 1) {
+          return def1.promise;
+        }
+        return defaultMockSettings;
+      }
+      return null;
+    }) as any);
+
+    // Navigation A: start settings-ollama (call 1, pending on def1)
+    const navA = navigateTo("settings-ollama");
+
+    // Allow navA to progress past workspace:settings and invoke load_api_settings
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(callCount).toBe(1);
+
+    // Navigation B: switch to settings-general
+    const navB = navigateTo("settings-general");
+    await navB;
+
+    // Navigation C: switch back to settings-ollama while def1 is still pending
+    // C shares pageMounts.get("settings:ollama") with A
+    const navC = navigateTo("settings-ollama");
+
+    // Allow microtasks to settle so C is awaiting A's promise
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Now resolve def1.
+    // Navigation A evaluates generation mismatch (A's navId !== C's generation) and returns "cancelled".
+    // Navigation C receives "cancelled", recognizes it is current generation, and retries mount once (call 2).
+    def1.resolve(defaultMockSettings);
+
+    await Promise.all([navA, navC]);
+
+    expect(callCount).toBe(2);
+    expect(pageMounts.has("settings:ollama")).toBe(true);
+    const ollamaSubpage = document.getElementById("subpage-settings-ollama");
+    expect(ollamaSubpage!.classList.contains("hidden")).toBe(false);
+    expect((document.getElementById("ollamaBaseUrl") as HTMLInputElement).value).toBe("http://localhost:11434");
+  });
+
+  it("Case PW-I: Local ASR progress updates persistent DOM across tab switches", async () => {
+    // Mount settings-docker
+    await navigateTo("settings-docker");
+    const localAsrContainer = document.getElementById("localAsrContainer");
+    expect(localAsrContainer).toBeTruthy();
+
+    // Set up dummy engine install card in container
+    localAsrContainer!.innerHTML = `
+      <div data-install-engine-status="whisper">
+        <div class="local-asr-progress-fill" style="width: 0%;"></div>
+        <div class="local-asr-progress-track" aria-valuenow="0"></div>
+        <div class="local-asr-progress-percent">0%</div>
+        <div class="local-asr-progress-message">準備中</div>
+      </div>
+    `;
+
+    // Navigate to Transcribe
+    await navigateTo("transcribe");
+    const settingsEl = document.getElementById("page-settings");
+    expect(settingsEl!.classList.contains("hidden")).toBe(true);
+
+    // Call update progress while on transcribe tab
+    const statusEl = document.querySelector<HTMLElement>('[data-install-engine-status="whisper"]');
+    expect(statusEl).toBeTruthy();
+    expect(statusEl!.isConnected).toBe(true);
+
+    const fill = statusEl!.querySelector<HTMLElement>(".local-asr-progress-fill")!;
+    const track = statusEl!.querySelector<HTMLElement>(".local-asr-progress-track")!;
+    const percentEl = statusEl!.querySelector<HTMLElement>(".local-asr-progress-percent")!;
+    const messageEl = statusEl!.querySelector<HTMLElement>(".local-asr-progress-message")!;
+
+    fill.style.width = "75%";
+    track.setAttribute("aria-valuenow", "75");
+    percentEl.textContent = "75%";
+    messageEl.textContent = "ダウンロード中...";
+
+    // Navigate back to settings-docker
+    await navigateTo("settings-docker");
+    expect(settingsEl!.classList.contains("hidden")).toBe(false);
+    expect(fill.style.width).toBe("75%");
+    expect(percentEl.textContent).toBe("75%");
+    expect(messageEl.textContent).toBe("ダウンロード中...");
+  });
+
+  it("Case PW-J: Docker status stale response reverse-order overwrite prevention", async () => {
+    // First mount settings-docker
+    await navigateTo("settings-docker");
+    const container = document.getElementById("dockerStatusContainer")!;
+    expect(container).toBeTruthy();
+
+    const defA = deferred<any>();
+    const defB = deferred<any>();
+    let reqCount = 0;
+
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "docker_check_status") {
+        reqCount++;
+        if (reqCount === 1) return defA.promise;
+        if (reqCount === 2) return defB.promise;
+      }
+      return null;
+    }) as any);
+
+    // Directly trigger Request A (slow) and Request B (fast)
+    const pA = loadAndRenderDockerStatus();
+    const pB = loadAndRenderDockerStatus();
+
+    expect(reqCount).toBe(2);
+
+    // Resolve B first with running status
+    defB.resolve({
+      cliFound: true,
+      cliVersion: "24.0.5",
+      daemonRunning: true,
+      serverVersion: "24.0.5",
+      desktopFound: true,
+      cliPath: "/usr/bin/docker",
+      desktopPath: null,
+      errorKind: null,
+      errorMessage: null,
+    });
+
+    await pB;
+    await Promise.resolve();
+
+    // Container should show running status ("Docker Desktopは利用可能です")
+    expect(container.textContent).toContain("利用可能");
+
+    // Now resolve A later with older stopped status
+    defA.resolve({
+      cliFound: true,
+      cliVersion: "24.0.5",
+      daemonRunning: false,
+      serverVersion: null,
+      desktopFound: true,
+      cliPath: "/usr/bin/docker",
+      desktopPath: null,
+      errorKind: "daemon-stopped",
+      errorMessage: "Docker is stopped",
+    });
+
+    await pA;
+    await Promise.resolve();
+
+    // Verify DOM still shows B's running state, not overwritten by A's stale response
+    expect(container.textContent).toContain("利用可能");
+  });
+
+  it("Case PW-K: Settings IPC failure is not cached as mounted and allows retry", async () => {
+    let failIpc = true;
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        if (failIpc) {
+          throw new Error("Disk IO failure");
+        }
+        return defaultMockSettings;
+      }
+      return null;
+    }) as any);
+
+    // First attempt fails
+    await navigateTo("settings");
+    expect(pageMounts.has("settings:api")).toBe(false);
+
+    // Second attempt after IPC recovery
+    failIpc = false;
+    await navigateTo("settings");
+    expect(pageMounts.has("settings:api")).toBe(true);
+    const subpageSettings = document.getElementById("subpage-settings");
+    expect(subpageSettings!.classList.contains("hidden")).toBe(false);
+  });
+
+  it("Case PW-L: Navigating to settings-docker invokes docker_check_status exactly once", async () => {
+    let dockerCheckCount = 0;
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "docker_check_status") {
+        dockerCheckCount++;
+        return {
+          cliFound: true,
+          cliVersion: "24.0.5",
+          daemonRunning: true,
+          serverVersion: "24.0.5",
+          desktopFound: true,
+          cliPath: "/usr/bin/docker",
+          desktopPath: null,
+          errorKind: null,
+          errorMessage: null,
+        };
+      }
+      return null;
+    }) as any);
+
+    await navigateTo("settings-docker");
+    expect(dockerCheckCount).toBe(1);
+  });
+
+  it("Case PW-M: Workspace and Settings subpages have separated keys in registry", async () => {
+    // Navigating to settings-general mounts workspace:settings and settings:general
+    await navigateTo("settings-general");
+    expect(pageMounts.has("workspace:settings")).toBe(true);
+    expect(pageMounts.has("settings:general")).toBe(true);
+    expect(pageMounts.has("settings:api")).toBe(false);
+
+    // Navigating to settings (API subpage) mounts settings:api without re-mounting workspace:settings
+    await navigateTo("settings");
+    expect(pageMounts.has("settings:api")).toBe(true);
+    const subpageSettings = document.getElementById("subpage-settings");
+    expect(subpageSettings!.classList.contains("hidden")).toBe(false);
+  });
+
+  it("Case PW-N: Missing container throws error and cleans up pageMounts registry", async () => {
+    // Break DOM by emptying body completely so #app doesn't exist
+    document.body.innerHTML = "";
+
+    await expect(navigateTo("transcribe")).rejects.toThrow();
+    expect(pageMounts.has("workspace:transcribe")).toBe(false);
   });
 });
 

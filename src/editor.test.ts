@@ -16,6 +16,11 @@ import {
   clearActiveProposalsForTest,
   setActiveProposalsForTest,
   bindEditorEvents,
+  getEditorDocumentSessionId,
+  setCorrectionProviderForTest,
+  runLlmCorrection,
+  cancelActiveCorrectionRunAndResetUi,
+  renderEditor,
 } from "./editor";
 import { deriveSegmentStatus, type TranscriptDocument } from "./transcript";
 import type { CorrectionProposal } from "./correction";
@@ -364,6 +369,177 @@ describe("Canonical Editor", () => {
     expect(navigateSpy).toHaveBeenCalledWith("editor");
   });
 
+  it("Case 6D: Same-Page Open File DOM Re-rendering: 同一エディター画面内で開く成功後、ヘッダー・セグメント数・本文・dirty表示が新Documentへ即座に再描画される", async () => {
+    // 1. Doc A を準備し DOM に描画
+    const docA = createSampleDocument(2);
+    docA.mediaFileName = "docA.wav";
+    docA.segments[0].text = "Doc A セグメント 1 のテキスト";
+    docA.segments[1].text = "Doc A セグメント 2 のテキスト";
+    setEditorDocument(docA, "C:\\docA.asrc.json");
+
+    // Doc A 用に補正提案を付与
+    const propA: CorrectionProposal = {
+      id: "prop-docA-1",
+      segmentId: docA.segments[0].id,
+      originalText: docA.segments[0].text,
+      correctedText: "Doc A 補正後テキスト",
+      evidence: [{ type: "context" }],
+      explanation: "提案A",
+    };
+    setActiveProposalsForTest(new Map([[docA.segments[0].id, [propA]]]));
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    // 初期状態の確認
+    expect(document.querySelector(".editor-filename")?.textContent).toBe("docA.wav");
+    expect(document.querySelector(".editor-subtitle")?.textContent).toContain("2 セグメント");
+    expect(document.querySelectorAll(".segment-card")).toHaveLength(2);
+    expect(document.body.innerHTML).toContain("Doc A セグメント 1");
+    expect(document.body.innerHTML).toContain("補正候補 (1件)");
+
+    // 2. Doc B の準備
+    const docB = createSampleDocument(3);
+    docB.mediaFileName = "docB.wav";
+    docB.segments[0].id = "seg-b-1";
+    docB.segments[0].text = "Doc B セグメント 1";
+    docB.segments[1].id = "seg-b-2";
+    docB.segments[1].text = "Doc B セグメント 2";
+    docB.segments[2].id = "seg-b-3";
+    docB.segments[2].text = "Doc B セグメント 3";
+
+    vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(true);
+    (mockOpenDialog as any).mockResolvedValue("C:\\docB.asrc.json");
+
+    setEditorInvoke(async <T>(cmd: string): Promise<T> => {
+      if (cmd === "load_transcript_document") {
+        return docB as T;
+      }
+      return null as T;
+    });
+
+    // 3. 開くを実行
+    const openBtn = document.getElementById("btnEditorOpenFile") as HTMLButtonElement;
+    openBtn.click();
+
+    // 非同期処理の完了を待機
+    await new Promise((r) => setTimeout(r, 0));
+
+    // 4. 検証: DOM 全体が Doc B に再描画されていること
+    expect(document.querySelector(".editor-filename")?.textContent).toBe("docB.wav");
+    expect(document.querySelector(".editor-subtitle")?.textContent).toContain("3 セグメント");
+    expect(document.querySelector(".editor-subtitle")?.textContent).toContain("C:\\docB.asrc.json");
+    expect(document.querySelectorAll(".segment-card")).toHaveLength(3);
+
+    const textareas = document.querySelectorAll<HTMLTextAreaElement>(".segment-text-input");
+    expect(textareas[0].value).toBe("Doc B セグメント 1");
+    expect(textareas[1].value).toBe("Doc B セグメント 2");
+    expect(textareas[2].value).toBe("Doc B セグメント 3");
+
+    // Doc A の内容が DOM に残っていないこと
+    expect(document.body.innerHTML).not.toContain("docA.wav");
+    expect(document.body.innerHTML).not.toContain("Doc A セグメント 1");
+    expect(document.body.innerHTML).not.toContain("Doc A セグメント 2");
+    expect(document.body.innerHTML).not.toContain("補正候補");
+
+    // 内部状態の検証
+    expect(getEditorDocument()!.mediaFileName).toBe("docB.wav");
+    expect(getEditorFilePath()).toBe("C:\\docB.asrc.json");
+    expect(isEditorDirty()).toBe(false);
+    expect(getActiveProposals().size).toBe(0);
+
+    // イベントが再バインドされていること（セグメント編集で dirty になる）
+    textareas[0].value = "Doc B 編集済みテキスト";
+    textareas[0].dispatchEvent(new Event("input", { bubbles: true }));
+    expect(isEditorDirty()).toBe(true);
+    expect(document.querySelector(".editor-status-badge")?.textContent).toContain("未保存");
+  });
+
+  it("Case 6E: Same-Page Open File during active LLM Correction: 補正実行中に別ファイルを開いた場合、旧RunがキャンセルされUIがアイドル化しDoc Bが描画される", async () => {
+    const docA = createSampleDocument(2);
+    docA.mediaFileName = "docA.wav";
+    setEditorDocument(docA, "C:\\docA.asrc.json");
+
+    let resolveProvider: (proposals: CorrectionProposal[]) => void = () => {};
+    const deferredProvider = {
+      correct: vi.fn().mockImplementation(() => {
+        return new Promise<CorrectionProposal[]>((resolve) => {
+          resolveProvider = resolve;
+        });
+      }),
+    };
+    setCorrectionProviderForTest(deferredProvider as any);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+    const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+
+    // 1. Doc A 上で補正を開始
+    const p1 = runLlmCorrection();
+    expect(btnLlm.disabled).toBe(true);
+    expect(btnCancel.style.display).toBe("inline-flex");
+
+    // 2. 補正実行中に Doc B を開く
+    const docB = createSampleDocument(1);
+    docB.mediaFileName = "docB.wav";
+    docB.segments[0].text = "Doc B 単一セグメント";
+
+    vi.spyOn(statusModule, "showAppConfirm").mockResolvedValue(true);
+    (mockOpenDialog as any).mockResolvedValue("C:\\docB.asrc.json");
+
+    setEditorInvoke(async <T>(cmd: string): Promise<T> => {
+      if (cmd === "load_transcript_document") {
+        return docB as T;
+      }
+      return null as T;
+    });
+
+    const openBtn = document.getElementById("btnEditorOpenFile") as HTMLButtonElement;
+    openBtn.click();
+    await new Promise((r) => setTimeout(r, 0));
+
+    // 3. UI が Doc B に切り替わり、補正UIもアイドル化していること
+    expect(document.querySelector(".editor-filename")?.textContent).toBe("docB.wav");
+    const reloadedLlmBtn = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+    const reloadedCancelBtn = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+    expect(reloadedLlmBtn.disabled).toBe(false);
+    expect(reloadedCancelBtn.style.display).toBe("none");
+
+    // 4. 旧プロバイダーが後から解決しても Doc B は一切影響を受けない
+    resolveProvider([
+      {
+        id: "prop-docA-late",
+        segmentId: docA.segments[0].id,
+        originalText: docA.segments[0].text,
+        correctedText: "遅延提案",
+        evidence: [{ type: "context" }],
+        explanation: "late",
+      },
+    ]);
+    await p1;
+
+    expect(getActiveProposals().size).toBe(0);
+    expect(document.body.innerHTML).not.toContain("遅延提案");
+    expect(document.body.innerHTML).not.toContain("補正候補");
+
+    setCorrectionProviderForTest(null);
+  });
+
+  it("renderEditor: 現在の currentDoc を用いて .editor-container を明示的に再描画しイベントを再バインドする", () => {
+    const doc = createSampleDocument(1);
+    doc.mediaFileName = "re-render-test.wav";
+    setEditorDocument(doc, "C:\\re-render.asrc.json");
+
+    document.body.innerHTML = `<div class="editor-container">旧コンテンツ</div>`;
+
+    renderEditor();
+
+    expect(document.querySelector(".editor-filename")?.textContent).toBe("re-render-test.wav");
+    expect(document.querySelector(".segment-card")).not.toBeNull();
+  });
+
   // ---- Cases 7A, 7B, 7C: Aliasing & Deep Cloning ----
 
   it("Case 7A: setEditorDocument(source, null) clones source independently (source not mutated)", () => {
@@ -702,25 +878,43 @@ describe("Phase 1 LLM Correction UI Integration", () => {
     expect(getActiveProposals().get(seg.id)![0].id).toBe("prop-1");
   });
 
-  it("Case O: Mock correction button in toolbar generates mock proposals and updates DOM", async () => {
+  it("Case O: LLM correction button in toolbar triggers correction and updates DOM", async () => {
     const doc = createSampleDocument(2);
     setEditorDocument(doc, "C:\\test.asrc.json");
+
+    const seg0 = doc.segments[0];
+    const mockProvider = {
+      correct: vi.fn().mockResolvedValue([
+        {
+          id: "prop-ollama-1",
+          segmentId: seg0.id,
+          originalText: seg0.text,
+          correctedText: "補正後のセグメント1テキスト",
+          evidence: [{ type: "context", description: "文脈" }],
+          explanation: "LLM補正",
+        },
+      ]),
+    };
+    setCorrectionProviderForTest(mockProvider as any);
 
     document.body.innerHTML = renderEditorPage();
     bindEditorEvents();
 
     expect(document.querySelectorAll(".proposal-card").length).toBe(0);
 
-    const mockBtn = document.getElementById("btnEditorMockCorrection") as HTMLButtonElement;
-    expect(mockBtn).not.toBeNull();
+    const llmBtn = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+    expect(llmBtn).not.toBeNull();
 
-    mockBtn.click();
+    llmBtn.click();
     await Promise.resolve();
 
-    // 提案カードがDOMにレンダリングされる
+    expect(mockProvider.correct).toHaveBeenCalled();
     const proposalCards = document.querySelectorAll(".proposal-card");
-    expect(proposalCards.length).toBeGreaterThan(0);
-    expect(getActiveProposals().size).toBeGreaterThan(0);
+    expect(proposalCards.length).toBe(1);
+    expect(getActiveProposals().size).toBe(1);
+    expect(getActiveProposals().get(seg0.id)![0].correctedText).toBe("補正後のセグメント1テキスト");
+
+    setCorrectionProviderForTest(null);
   });
 
   it("Case Q: 11-step E2E Correction Workflow Scenario (Steps 1-11)", async () => {
@@ -731,28 +925,9 @@ describe("Phase 1 LLM Correction UI Integration", () => {
     const mockInvoke = vi.fn().mockResolvedValue(true);
     setEditorInvoke(mockInvoke);
 
-    document.body.innerHTML = renderEditorPage();
-    bindEditorEvents();
-
-    // Step 1: 正本エディターで「補正候補テスト」を押す
-    const mockBtn = document.getElementById("btnEditorMockCorrection") as HTMLButtonElement;
-    mockBtn.click();
-    await Promise.resolve();
-
-    // Step 2: 提案カードが表示される
-    const proposalCards = document.querySelectorAll(".proposal-card");
-    expect(proposalCards.length).toBeGreaterThanOrEqual(2);
-
-    // Step 3: 根拠バッジと簡易diffが見える
-    const badge = document.querySelector(".evidence-badge");
-    const diff = document.querySelector(".proposal-diff");
-    expect(badge).not.toBeNull();
-    expect(diff).not.toBeNull();
-    expect(diff!.innerHTML).toContain("diff-");
-
-    // セグメント0に2件の提案をセットして複数提案の挙動を検証
-    const seg0 = getEditorDocument()!.segments[0];
-    const seg1 = getEditorDocument()!.segments[1];
+    const current = getEditorDocument()!;
+    const seg0 = current.segments[0];
+    const seg1 = current.segments[1];
     const initialOrigText0 = seg0.originalText;
 
     const prop0A: CorrectionProposal = {
@@ -780,13 +955,29 @@ describe("Phase 1 LLM Correction UI Integration", () => {
       explanation: "説明1A",
     };
 
-    setActiveProposalsForTest(new Map([
-      [seg0.id, [prop0A, prop0B]],
-      [seg1.id, [prop1A]],
-    ]));
+    const mockProvider = {
+      correct: vi.fn().mockResolvedValue([prop0A, prop0B, prop1A]),
+    };
+    setCorrectionProviderForTest(mockProvider as any);
 
     document.body.innerHTML = renderEditorPage();
     bindEditorEvents();
+
+    // Step 1: 正本エディターで「LLM補正」を押す
+    const llmBtn = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+    llmBtn.click();
+    await Promise.resolve();
+
+    // Step 2: 提案カードが表示される
+    const proposalCards = document.querySelectorAll(".proposal-card");
+    expect(proposalCards.length).toBe(3);
+
+    // Step 3: 根拠バッジと簡易diffが見える
+    const badge = document.querySelector(".evidence-badge");
+    const diff = document.querySelector(".proposal-diff");
+    expect(badge).not.toBeNull();
+    expect(diff).not.toBeNull();
+    expect(diff!.innerHTML).toContain("diff-");
 
     // Step 4: 1件を採用する (prop-0A)
     const applyBtn0A = document.querySelector<HTMLButtonElement>(`button.btn-apply-proposal[data-proposal-id="prop-0A"]`)!;
@@ -848,7 +1039,658 @@ describe("Phase 1 LLM Correction UI Integration", () => {
     // Step 11: Document切替または破棄でproposalが消える
     discardEditorChanges();
     expect(getActiveProposals().size).toBe(0);
+
+    setCorrectionProviderForTest(null);
+  });
+
+  it("Case R: Document Session Guard: 非同期実行中にDocumentが切り替わった場合、旧セッションの提案は安全に破棄される", async () => {
+    const docA = createSampleDocument(2);
+    setEditorDocument(docA, "C:\\docA.asrc.json");
+
+    let resolveProvider: (proposals: CorrectionProposal[]) => void = () => {};
+    const delayedProvider = {
+      correct: vi.fn().mockImplementation(() => {
+        return new Promise<CorrectionProposal[]>((resolve) => {
+          resolveProvider = resolve;
+        });
+      }),
+    };
+    setCorrectionProviderForTest(delayedProvider as any);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    // 非同期補正リクエストを開始（docA）
+    const initialSession = getEditorDocumentSessionId();
+    const correctionPromise = runLlmCorrection();
+
+    // 途中でユーザーが別のドキュメント docB をロード
+    const docB = createSampleDocument(3);
+    setEditorDocument(docB, "C:\\docB.asrc.json");
+    expect(getEditorDocumentSessionId()).toBeGreaterThan(initialSession);
+
+    // 旧 docA のプロポーザルが遅れて到着
+    resolveProvider([
+      {
+        id: "prop-delayed-docA",
+        segmentId: docA.segments[0].id,
+        originalText: docA.segments[0].text,
+        correctedText: "遅延到着テキスト",
+        evidence: [{ type: "context" }],
+        explanation: "旧ドキュメント用提案",
+      },
+    ]);
+
+    await correctionPromise;
+
+    // 現在の activeProposals に旧ドキュメントの提案が混入していないことを検証
+    expect(getActiveProposals().size).toBe(0);
+
+    setCorrectionProviderForTest(null);
+  });
+
+  it("Case S: Logical Cancellation: ユーザーがキャンセルした場合、後続処理を中断し結果を破棄する", async () => {
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    let resolveProvider: (proposals: CorrectionProposal[]) => void = () => {};
+    const delayedProvider = {
+      correct: vi.fn().mockImplementation(() => {
+        return new Promise<CorrectionProposal[]>((resolve) => {
+          resolveProvider = resolve;
+        });
+      }),
+    };
+    setCorrectionProviderForTest(delayedProvider as any);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const correctionPromise = runLlmCorrection();
+
+    const cancelBtn = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+    expect(cancelBtn.style.display).toBe("inline-flex");
+
+    // キャンセルボタンをクリック
+    cancelBtn.click();
+    expect(cancelBtn.style.display).toBe("none");
+
+    // その後プロバイダーが結果を返しても破棄される
+    resolveProvider([
+      {
+        id: "prop-cancelled",
+        segmentId: doc.segments[0].id,
+        originalText: doc.segments[0].text,
+        correctedText: "キャンセル後テキスト",
+        evidence: [{ type: "context" }],
+        explanation: "キャンセル後",
+      },
+    ]);
+
+    await correctionPromise;
+    expect(getActiveProposals().size).toBe(0);
+
+    setCorrectionProviderForTest(null);
+  });
+
+  it("Case T: Error Boundary: プロバイダーがエラーを投げても既存の activeProposals は保持される", async () => {
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    const seg0 = doc.segments[0];
+    const existingProp: CorrectionProposal = {
+      id: "prop-existing",
+      segmentId: seg0.id,
+      originalText: seg0.text,
+      correctedText: "既存の有効提案",
+      evidence: [{ type: "dictionary" }],
+      explanation: "既存提案",
+    };
+    setActiveProposalsForTest(new Map([[seg0.id, [existingProp]]]));
+
+    const dialogSpy = vi.spyOn(statusModule, "showAppDialog").mockResolvedValue();
+
+    const failingProvider = {
+      correct: vi.fn().mockRejectedValue(new Error("Ollama connection refused (HTTP 500)")),
+    };
+    setCorrectionProviderForTest(failingProvider as any);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    await runLlmCorrection();
+
+    // エラーダイアログが表示される
+    expect(dialogSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "LLM補正エラー",
+        type: "error",
+      })
+    );
+
+    // 既存の提案は消去されずに保持される
+    expect(getActiveProposals().size).toBe(1);
+    expect(getActiveProposals().get(seg0.id)![0].id).toBe("prop-existing");
+
+    setCorrectionProviderForTest(null);
+  });
+
+  it("Case U: Ollama Settings Connection & Model Presence Validation", async () => {
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    const dialogSpy = vi.spyOn(statusModule, "showAppDialog").mockResolvedValue();
+
+    // 1. モデル未設定の場合 -> 実行中止 & ダイアログ表示
+    setEditorInvoke((async <T>(cmd: string): Promise<T> => {
+      if (cmd === "load_api_settings") {
+        return { providers: { ollama: { base_url: "http://localhost:11434", default_model: "" } } } as unknown as T;
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    }));
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    await runLlmCorrection();
+    expect(dialogSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Ollamaモデル未設定",
+        type: "info",
+      })
+    );
+
+    // 2. モデル設定済みの場合 -> call_ollama_chat に渡る
+    let capturedChatInput: any = null;
+    setEditorInvoke((async <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => {
+      if (cmd === "load_api_settings") {
+        return {
+          providers: {
+            ollama: {
+              base_url: "http://192.168.1.50:11434",
+              default_model: "my-custom-qwen:9b",
+            },
+          },
+        } as unknown as T;
+      }
+      if (cmd === "call_ollama_chat") {
+        capturedChatInput = args;
+        return {
+          message: {
+            role: "assistant",
+            content: JSON.stringify({ proposals: [] }),
+          },
+        } as unknown as T;
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    }));
+
+    await runLlmCorrection();
+    expect(capturedChatInput).not.toBeNull();
+    expect(capturedChatInput.input).toBeDefined();
+    expect(capturedChatInput.input.baseUrl).toBe("http://192.168.1.50:11434");
+    expect(capturedChatInput.input.model).toBe("my-custom-qwen:9b");
+  });
+
+  it("Case V: Transactional Replace: 成功した新RunのProposal集合でactiveProposalsを完全置換する", async () => {
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    const seg0 = doc.segments[0];
+    const oldProp: CorrectionProposal = {
+      id: "prop-old",
+      segmentId: seg0.id,
+      originalText: seg0.text,
+      correctedText: "旧バージョンの補正候補",
+      evidence: [{ type: "context" }],
+      explanation: "旧",
+    };
+    setActiveProposalsForTest(new Map([[seg0.id, [oldProp]]]));
+    expect(getActiveProposals().get(seg0.id)![0].id).toBe("prop-old");
+
+    const newProp: CorrectionProposal = {
+      id: "prop-new",
+      segmentId: seg0.id,
+      originalText: seg0.text,
+      correctedText: "新バージョンの補正候補",
+      evidence: [{ type: "dictionary" }],
+      explanation: "新",
+    };
+
+    const mockProvider = {
+      correct: vi.fn().mockResolvedValue([newProp]),
+    };
+    setCorrectionProviderForTest(mockProvider as any);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    await runLlmCorrection();
+
+    // 古い提案はマージされず、新しい提案セットだけで完全に置換されている
+    expect(getActiveProposals().size).toBe(1);
+    const props = getActiveProposals().get(seg0.id)!;
+    expect(props).toHaveLength(1);
+    expect(props[0].id).toBe("prop-new");
+    expect(props[0].correctedText).toBe("新バージョンの補正候補");
+
+    setCorrectionProviderForTest(null);
+  });
+
+  it("Case W: Run Generation UI Guard: Run A キャンセル直後に Run B が開始された場合、遅れて完了した Run A の finally が Run B の UI を壊さない", async () => {
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    let resolveRunA: (proposals: CorrectionProposal[]) => void = () => {};
+    let resolveRunB: (proposals: CorrectionProposal[]) => void = () => {};
+
+    let callCount = 0;
+    const multiRunProvider = {
+      correct: vi.fn().mockImplementation(() => {
+        callCount++;
+        const currentCount = callCount;
+        return new Promise<CorrectionProposal[]>((resolve) => {
+          if (currentCount === 1) {
+            resolveRunA = resolve;
+          } else {
+            resolveRunB = resolve;
+          }
+        });
+      }),
+    };
+    setCorrectionProviderForTest(multiRunProvider as any);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+    const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+
+    // 1. Run A を開始
+    const promiseA = runLlmCorrection();
+    expect(btnLlm.disabled).toBe(true);
+    expect(btnCancel.style.display).toBe("inline-flex");
+
+    // 2. キャンセルをクリック
+    btnCancel.click();
+    expect(btnLlm.disabled).toBe(false);
+    expect(btnCancel.style.display).toBe("none");
+
+    // 3. すぐに Run B を開始
+    const promiseB = runLlmCorrection();
+    expect(btnLlm.disabled).toBe(true);
+    expect(btnCancel.style.display).toBe("inline-flex");
+
+    // 4. Run A が遅れて完了（resolve）
+    resolveRunA([
+      {
+        id: "prop-run-A",
+        segmentId: doc.segments[0].id,
+        originalText: doc.segments[0].text,
+        correctedText: "Run A の遅延提案",
+        evidence: [{ type: "context" }],
+        explanation: "A",
+      },
+    ]);
+    await promiseA;
+
+    // Run A の finally が実行された後も、実行中である Run B の UI（disabled, cancel表示）が維持されていること！
+    expect(btnLlm.disabled).toBe(true);
+    expect(btnCancel.style.display).toBe("inline-flex");
+
+    // 5. Run B が正常完了
+    resolveRunB([
+      {
+        id: "prop-run-B",
+        segmentId: doc.segments[0].id,
+        originalText: doc.segments[0].text,
+        correctedText: "Run B の正当提案",
+        evidence: [{ type: "dictionary" }],
+        explanation: "B",
+      },
+    ]);
+    await promiseB;
+
+    // Run B 完了後は正常にアイドル状態へリセット
+    expect(btnLlm.disabled).toBe(false);
+    expect(btnCancel.style.display).toBe("none");
+    expect(getActiveProposals().get(doc.segments[0].id)![0].id).toBe("prop-run-B");
+
+    setCorrectionProviderForTest(null);
+  });
+
+  it("Case X: 設定読み込み待ち中の二重起動防止 (Double-invocation Guard): load_api_settings 非同期待機中の多重呼び出しを確実に拒否する", async () => {
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    let resolveSettings: (val: any) => void = () => {};
+    let callCount = 0;
+
+    setEditorInvoke(vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === "load_api_settings") {
+        callCount++;
+        return new Promise((resolve) => {
+          resolveSettings = resolve;
+        });
+      }
+      if (cmd === "call_ollama_chat") {
+        return Promise.resolve({
+          message: {
+            role: "assistant",
+            content: JSON.stringify({ proposals: [] }),
+          },
+        });
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    }));
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+    const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+
+    // 1. 初回呼び出し開始（設定読み込み待ち）
+    const p1 = runLlmCorrection();
+    expect(btnLlm.disabled).toBe(true);
+    expect(btnCancel.style.display).toBe("inline-flex");
+    expect(callCount).toBe(1);
+
+    // 2. 設定読み込み待ち中に二重呼び出し
+    const p2 = runLlmCorrection();
+    expect(callCount).toBe(1); // 2回目の load_api_settings は呼ばれない
+
+    // 3. 設定を解決して完了させる
+    resolveSettings({
+      providers: {
+        ollama: {
+          base_url: "http://localhost:11434",
+          default_model: "qwen2.5:7b",
+        },
+      },
+    });
+
+    await p1;
+    await p2;
+
+    expect(btnLlm.disabled).toBe(false);
+    expect(btnCancel.style.display).toBe("none");
+  });
+
+  it("Case Y: 設定読み込み待ち中のドキュメント切替: load_api_settings 待機中に別Docへ切り替わった場合、応答は破棄され新Docを汚染しない", async () => {
+    const docA = createSampleDocument(2);
+    const docB = createSampleDocument(2);
+    docB.segments[0].id = "seg-doc-b-001";
+    docB.segments[0].text = "ドキュメントBのテキスト";
+    setEditorDocument(docA, "C:\\docA.asrc.json");
+
+    let resolveSettings: (val: any) => void = () => {};
+    let ollamaChatCalled = false;
+
+    setEditorInvoke(vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === "load_api_settings") {
+        return new Promise((resolve) => {
+          resolveSettings = resolve;
+        });
+      }
+      if (cmd === "call_ollama_chat") {
+        ollamaChatCalled = true;
+        return Promise.resolve({
+          message: {
+            role: "assistant",
+            content: JSON.stringify({
+              proposals: [
+                {
+                  segmentId: docA.segments[0].id,
+                  originalText: docA.segments[0].text,
+                  correctedText: "ドキュメントAの補正提案",
+                  evidence: [{ type: "context" }],
+                  explanation: "test",
+                },
+              ],
+            }),
+          },
+        });
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    }));
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    // 1. Doc A で補正開始
+    const p1 = runLlmCorrection();
+
+    // 2. 設定読み込み待機中に Doc B へ切替
+    setEditorDocument(docB, "C:\\docB.asrc.json");
+
+    // 3. 設定読み込みが完了
+    resolveSettings({
+      providers: {
+        ollama: {
+          base_url: "http://localhost:11434",
+          default_model: "qwen2.5:7b",
+        },
+      },
+    });
+
+    await p1;
+
+    // Doc B の提案は空のままで、Provider も呼び出されない
+    expect(ollamaChatCalled).toBe(false);
+    expect(getActiveProposals().size).toBe(0);
+  });
+
+  it("Case Z: 実行中ドキュメント切替時のUIリセット: 補正実行中に setEditorDocument が呼ばれた場合、UIが即座にアイドル状態へ戻る", async () => {
+    const docA = createSampleDocument(2);
+    const docB = createSampleDocument(2);
+    setEditorDocument(docA, "C:\\docA.asrc.json");
+
+    let resolveProvider: (proposals: CorrectionProposal[]) => void = () => {};
+    const deferredProvider = {
+      correct: vi.fn().mockImplementation(() => {
+        return new Promise<CorrectionProposal[]>((resolve) => {
+          resolveProvider = resolve;
+        });
+      }),
+    };
+    setCorrectionProviderForTest(deferredProvider as any);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+    const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+
+    // 1. 補正開始
+    const p1 = runLlmCorrection();
+    expect(btnLlm.disabled).toBe(true);
+    expect(btnCancel.style.display).toBe("inline-flex");
+
+    // 2. 実行中に setEditorDocument で別ファイルを開く
+    setEditorDocument(docB, "C:\\docB.asrc.json");
+
+    // UI が即座にリセットされていること
+    expect(btnLlm.disabled).toBe(false);
+    expect(btnCancel.style.display).toBe("none");
+
+    // 3. 旧プロバイダーが後から解決しても何もしない
+    resolveProvider([
+      {
+        id: "prop-stale",
+        segmentId: docA.segments[0].id,
+        originalText: docA.segments[0].text,
+        correctedText: "遅延提案",
+        evidence: [{ type: "context" }],
+        explanation: "stale",
+      },
+    ]);
+    await p1;
+
+    expect(getActiveProposals().size).toBe(0);
+    setCorrectionProviderForTest(null);
+  });
+
+  it("Case AA: 実行中未保存変更破棄 (discardEditorChanges): 補正実行中に破棄された場合、UIが即座にリセットされ提案もクリアされる", async () => {
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    // セグメントを変更して dirty にする
+    doc.segments[0].text = "編集後のテキスト";
+
+    let resolveProvider: (proposals: CorrectionProposal[]) => void = () => {};
+    const deferredProvider = {
+      correct: vi.fn().mockImplementation(() => {
+        return new Promise<CorrectionProposal[]>((resolve) => {
+          resolveProvider = resolve;
+        });
+      }),
+    };
+    setCorrectionProviderForTest(deferredProvider as any);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+    const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+
+    // 1. 補正開始
+    const p1 = runLlmCorrection();
+    expect(btnLlm.disabled).toBe(true);
+    expect(btnCancel.style.display).toBe("inline-flex");
+
+    // 2. 変更を破棄
+    discardEditorChanges();
+
+    // UI が即座にアイドルへリセットされていること
+    expect(btnLlm.disabled).toBe(false);
+    expect(btnCancel.style.display).toBe("none");
+
+    resolveProvider([]);
+    await p1;
+
+    expect(getActiveProposals().size).toBe(0);
+    setCorrectionProviderForTest(null);
+  });
+
+  it("Case AB: エラー時の既存Proposal保持 (Transactional Replace): 補正処理中にエラーが発生した場合、既存のactiveProposalsが100%保持される", async () => {
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    const seg0 = doc.segments[0];
+    const existingProp: CorrectionProposal = {
+      id: "prop-existing-1",
+      segmentId: seg0.id,
+      originalText: seg0.text,
+      correctedText: "既存の補正提案",
+      evidence: [{ type: "context" }],
+      explanation: "既存",
+    };
+    setActiveProposalsForTest(new Map([[seg0.id, [existingProp]]]));
+
+    const failingProvider = {
+      correct: vi.fn().mockRejectedValue(new Error("Ollama connection failed (HTTP 500)")),
+    };
+    setCorrectionProviderForTest(failingProvider as any);
+
+    const dialogSpy = vi.spyOn(statusModule, "showAppDialog").mockResolvedValue();
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    await runLlmCorrection();
+
+    // エラーダイアログが表示されたこと
+    expect(dialogSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "LLM補正エラー",
+        type: "error",
+      })
+    );
+
+    // 既存の提案が削除・置換されずに完全に保持されていること
+    expect(getActiveProposals().size).toBe(1);
+    const props = getActiveProposals().get(seg0.id)!;
+    expect(props[0].id).toBe("prop-existing-1");
+    expect(props[0].correctedText).toBe("既存の補正提案");
+
+    setCorrectionProviderForTest(null);
+  });
+
+  it("Case AC: キャンセル時の既存Proposal保持 (Transactional Replace): 補正実行を途中でキャンセルした場合、既存のactiveProposalsが100%保持される", async () => {
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    const seg0 = doc.segments[0];
+    const existingProp: CorrectionProposal = {
+      id: "prop-existing-1",
+      segmentId: seg0.id,
+      originalText: seg0.text,
+      correctedText: "既存の補正提案",
+      evidence: [{ type: "context" }],
+      explanation: "既存",
+    };
+    setActiveProposalsForTest(new Map([[seg0.id, [existingProp]]]));
+
+    let resolveProvider: (proposals: CorrectionProposal[]) => void = () => {};
+    const deferredProvider = {
+      correct: vi.fn().mockImplementation(() => {
+        return new Promise<CorrectionProposal[]>((resolve) => {
+          resolveProvider = resolve;
+        });
+      }),
+    };
+    setCorrectionProviderForTest(deferredProvider as any);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+
+    // 1. 補正開始
+    const p1 = runLlmCorrection();
+
+    // 2. キャンセル実行
+    btnCancel.click();
+
+    // 3. プロバイダーが遅れて完了
+    resolveProvider([
+      {
+        id: "prop-new-discarded",
+        segmentId: seg0.id,
+        originalText: seg0.text,
+        correctedText: "破棄されるべき新提案",
+        evidence: [{ type: "dictionary" }],
+        explanation: "new",
+      },
+    ]);
+    await p1;
+
+    // キャンセルされたため、既存提案がそのまま残っていること
+    expect(getActiveProposals().size).toBe(1);
+    const props = getActiveProposals().get(seg0.id)!;
+    expect(props[0].id).toBe("prop-existing-1");
+    expect(props[0].correctedText).toBe("既存の補正提案");
+
+    setCorrectionProviderForTest(null);
+  });
+
+  it("cancelActiveCorrectionRunAndResetUi: 呼び出し時に実行IDを0にし、UI要素をアイドル状態に復元する", () => {
+    document.body.innerHTML = `
+      <button id="btnEditorLlmCorrection" disabled>補正中...</button>
+      <button id="btnEditorCancelCorrection" style="display: inline-flex;">キャンセル</button>
+    `;
+
+    cancelActiveCorrectionRunAndResetUi();
+
+    const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+    const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+
+    expect(btnLlm.disabled).toBe(false);
+    expect(btnLlm.innerHTML).toContain("LLM補正");
+    expect(btnCancel.style.display).toBe("none");
   });
 });
+
 
 

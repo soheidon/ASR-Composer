@@ -12,12 +12,12 @@ import {
   validateProposal,
   deriveTextChanges,
   createCorrectionRequest,
-  MockCorrectionProvider,
   cloneTranscriptDocument,
   escapeAttr,
-  parseCorrectionProposals,
   type CorrectionProposal,
+  type CorrectionProvider,
 } from "./correction";
+import { OllamaCorrectionProvider } from "./ollama-provider";
 
 // Tauri invokeラッパー型
 type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -40,6 +40,48 @@ let currentDoc: TranscriptDocument | null = null;
 let savedBaselineDoc: TranscriptDocument | null = null;
 let currentFilePath: string | null = null;
 let activeProposals = new Map<string, CorrectionProposal[]>();
+let editorDocumentSessionId = 0;
+let correctionRunGeneration = 0;
+let currentActiveRunId = 0;
+
+interface CorrectionRunToken {
+  isCancelled: boolean;
+}
+let activeCorrectionRun: CorrectionRunToken | null = null;
+let customCorrectionProvider: CorrectionProvider | null = null;
+
+export function getEditorDocumentSessionId(): number {
+  return editorDocumentSessionId;
+}
+
+export function getCurrentActiveRunId(): number {
+  return currentActiveRunId;
+}
+
+export function setCorrectionProviderForTest(provider: CorrectionProvider | null): void {
+  customCorrectionProvider = provider;
+}
+
+export function cancelActiveCorrectionRunAndResetUi(): void {
+  currentActiveRunId = 0;
+  if (activeCorrectionRun) {
+    activeCorrectionRun.isCancelled = true;
+    activeCorrectionRun = null;
+  }
+  const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement | null;
+  const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement | null;
+  if (btnLlm) {
+    btnLlm.disabled = false;
+    btnLlm.innerHTML = `<span class="material-symbols-outlined">auto_fix_high</span> LLM補正`;
+  }
+  if (btnCancel) {
+    btnCancel.style.display = "none";
+  }
+}
+
+export function cancelActiveCorrection(): void {
+  cancelActiveCorrectionRunAndResetUi();
+}
 
 export function getActiveProposals(): Map<string, CorrectionProposal[]> {
   return activeProposals;
@@ -62,7 +104,6 @@ export function getSavedBaselineDoc(): TranscriptDocument | null {
 }
 
 export function getEditorFilePath(): string | null {
-
   return currentFilePath;
 }
 
@@ -102,6 +143,8 @@ export async function confirmDiscardChanges(): Promise<boolean> {
  */
 export function discardEditorChanges(): void {
   activeProposals.clear();
+  editorDocumentSessionId++;
+  cancelActiveCorrection();
   if (currentFilePath !== null && savedBaselineDoc !== null) {
     currentDoc = cloneTranscriptDocument(savedBaselineDoc);
   } else {
@@ -119,6 +162,8 @@ export function discardEditorChanges(): void {
  */
 export function setEditorDocument(doc: TranscriptDocument | null, filePath: string | null = null): void {
   activeProposals.clear();
+  editorDocumentSessionId++;
+  cancelActiveCorrection();
   if (doc === null) {
     currentDoc = null;
     savedBaselineDoc = null;
@@ -194,9 +239,13 @@ export function renderEditorPage(): string {
             <span class="material-symbols-outlined">folder_open</span>
             開く
           </button>
-          <button class="btn btn-secondary" id="btnEditorMockCorrection" type="button" title="補正候補のモックテスト (Phase 1)">
+          <button class="btn btn-secondary" id="btnEditorLlmCorrection" type="button" title="ローカルLLM（Ollama）による音声誤認識補正">
             <span class="material-symbols-outlined">auto_fix_high</span>
-            補正候補テスト
+            LLM補正
+          </button>
+          <button class="btn btn-secondary btn-editor-cancel-correction" id="btnEditorCancelCorrection" type="button" title="補正処理をキャンセル" style="display: none;">
+            <span class="material-symbols-outlined">cancel</span>
+            キャンセル
           </button>
           <button class="btn btn-secondary" id="btnEditorSaveAs" type="button" title="名前を付けて保存">
             <span class="material-symbols-outlined">save_as</span>
@@ -357,6 +406,149 @@ export function generateMockFixturesForDoc(doc: TranscriptDocument): CorrectionP
   return fixtures;
 }
 
+/**
+ * LLM（Ollama）による補正処理を実行する
+ */
+export async function runLlmCorrection(): Promise<void> {
+  if (!currentDoc || currentDoc.segments.length === 0) {
+    await showAppDialog({
+      title: "情報",
+      message: "補正対象のセグメントがありません。",
+      type: "info",
+    });
+    return;
+  }
+
+  if (currentActiveRunId !== 0) {
+    return; // 既に実行中
+  }
+
+  // 1. Run ID・Session ID の即時確保と実行中登録
+  const runId = ++correctionRunGeneration;
+  const requestSessionId = editorDocumentSessionId;
+  currentActiveRunId = runId;
+
+  const runToken: CorrectionRunToken = { isCancelled: false };
+  activeCorrectionRun = runToken;
+
+  const isCancelled = () =>
+    runId !== currentActiveRunId ||
+    requestSessionId !== editorDocumentSessionId ||
+    runToken.isCancelled;
+
+  // 2. UI を即座に「補正中」状態へ移行
+  const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement | null;
+  const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement | null;
+
+  if (btnLlm) {
+    btnLlm.disabled = true;
+    btnLlm.innerHTML = `<span class="material-symbols-outlined">sync</span> 補正中...`;
+  }
+  if (btnCancel) {
+    btnCancel.style.display = "inline-flex";
+  }
+
+  try {
+    // 3. 設定読み込み（Ollama設定のsource of truthを一本化）
+    let baseUrl = "http://localhost:11434";
+    let selectedModel = "";
+
+    if (!customCorrectionProvider) {
+      try {
+        const settings = await invokeTauri<{
+          providers?: Record<string, { base_url?: string; default_model?: string }>;
+        }>("load_api_settings");
+        const ollama = settings?.providers?.["ollama"];
+        if (ollama?.base_url && ollama.base_url.trim().length > 0) {
+          baseUrl = ollama.base_url.trim();
+        }
+        if (ollama?.default_model && ollama.default_model.trim().length > 0) {
+          selectedModel = ollama.default_model.trim();
+        }
+      } catch (e) {
+        console.warn("設定読み込みに失敗しました:", e);
+      }
+
+      if (isCancelled()) {
+        return;
+      }
+
+      if (!selectedModel) {
+        await showAppDialog({
+          title: "Ollamaモデル未設定",
+          message: "Ollamaのモデルが選択されていません。設定画面でモデルを選択してください。",
+          type: "info",
+        });
+        return;
+      }
+    }
+
+    if (isCancelled()) {
+      return;
+    }
+
+    const provider =
+      customCorrectionProvider ||
+      new OllamaCorrectionProvider({
+        baseUrl,
+        model: selectedModel,
+        invokeTauri: invokeFn || undefined,
+        isCancelled,
+      });
+    const request = createCorrectionRequest(currentDoc);
+
+    const proposals = await provider.correct(request, (completed, total) => {
+      if (isCancelled()) return;
+      if (btnLlm && runId === currentActiveRunId) {
+        btnLlm.innerHTML = `<span class="material-symbols-outlined">sync</span> 補正中 (${completed}/${total})...`;
+      }
+    });
+
+    // 早期キャンセルまたはセッション不一致の確認
+    if (isCancelled() || !currentDoc) {
+      return; // 破棄（activeProposals は一切変更しない）
+    }
+
+    // 新提案セットのローカル構築
+    const nextProposals = new Map<string, CorrectionProposal[]>();
+    for (const prop of proposals) {
+      const seg = currentDoc.segments.find((s) => s.id === prop.segmentId);
+      const val = validateProposal(prop, seg);
+      if (val.valid) {
+        const existing = nextProposals.get(prop.segmentId) || [];
+        if (!existing.some((p) => p.id === prop.id)) {
+          existing.push(prop);
+          nextProposals.set(prop.segmentId, existing);
+        }
+      }
+    }
+
+    // 最終コミットガード
+    if (isCancelled() || !currentDoc) {
+      return;
+    }
+
+    // Transactional Replace: 新提案セットで完全置換
+    activeProposals = nextProposals;
+    renderSegmentsList();
+  } catch (err: unknown) {
+    if (isCancelled()) {
+      return;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    await showAppDialog({
+      title: "LLM補正エラー",
+      message: `補正処理中にエラーが発生しました。\n${msg}`,
+      type: "error",
+    });
+    // ※ 失敗時は既存の activeProposals を 100% 保持
+  } finally {
+    if (runId === currentActiveRunId) {
+      cancelActiveCorrectionRunAndResetUi();
+    }
+  }
+}
+
 function renderSegmentCard(seg: TranscriptSegment, index: number): string {
   const timeRange = `${formatTimestamp(seg.start)} - ${formatTimestamp(seg.end)}`;
   const statusLabel = seg.status === "edited" ? "編集済" : "原文";
@@ -485,39 +677,14 @@ export function bindEditorEvents(onNavigate?: (page: any) => Promise<void>): voi
     });
   }
 
-  // 補正候補テストボタン (Phase 1 Mock)
-  document.getElementById("btnEditorMockCorrection")?.addEventListener("click", async () => {
-    if (!currentDoc || currentDoc.segments.length === 0) {
-      await showAppDialog({
-        title: "情報",
-        message: "補正対象のセグメントがありません。",
-        type: "info",
-      });
-      return;
-    }
+  // LLM補正ボタン
+  document.getElementById("btnEditorLlmCorrection")?.addEventListener("click", async () => {
+    await runLlmCorrection();
+  });
 
-    const mockFixtures = generateMockFixturesForDoc(currentDoc);
-    const provider = new MockCorrectionProvider(mockFixtures);
-    const request = createCorrectionRequest(currentDoc);
-    const rawProposals = await provider.correct(request);
-
-    // ランタイム shape validation を適用
-    const { proposals: parsedProposals, discardedCount } = parseCorrectionProposals(rawProposals);
-    if (discardedCount > 0) {
-      console.warn(`不正な形式の補正候補を ${discardedCount} 件破棄しました`);
-    }
-
-    activeProposals.clear();
-    for (const p of parsedProposals) {
-      const seg = currentDoc.segments.find((s) => s.id === p.segmentId);
-      const val = validateProposal(p, seg);
-      if (val.valid) {
-        const existing = activeProposals.get(p.segmentId) || [];
-        existing.push(p);
-        activeProposals.set(p.segmentId, existing);
-      }
-    }
-    renderSegmentsList();
+  // キャンセルボタン
+  document.getElementById("btnEditorCancelCorrection")?.addEventListener("click", () => {
+    cancelActiveCorrectionRunAndResetUi();
   });
 
   // 保存ボタン
@@ -620,6 +787,28 @@ async function executeSaveDocument(path: string): Promise<boolean> {
 }
 
 /**
+ * エディターUIを現在の currentDoc で明示的に再描画し、イベントリスナーを再バインドする
+ */
+export function renderEditor(onNavigate?: (page: any) => Promise<void>): void {
+  const pageContainer = document.getElementById("page-editor");
+  if (pageContainer) {
+    const editorEl = pageContainer.querySelector(".editor-container, .editor-empty-state");
+    if (editorEl) {
+      editorEl.outerHTML = renderEditorPage();
+    } else {
+      pageContainer.innerHTML = renderEditorPage();
+    }
+    bindEditorEvents(onNavigate);
+    return;
+  }
+  const editorEl = document.querySelector(".editor-container, .editor-empty-state");
+  if (editorEl) {
+    editorEl.outerHTML = renderEditorPage();
+    bindEditorEvents(onNavigate);
+  }
+}
+
+/**
  * 既存の .asrc.json を開く
  */
 export async function handleOpenFile(onNavigate?: (page: any) => Promise<void>): Promise<void> {
@@ -643,6 +832,7 @@ export async function handleOpenFile(onNavigate?: (page: any) => Promise<void>):
     });
 
     setEditorDocument(doc, selected);
+    renderEditor(onNavigate);
     if (onNavigate) {
       await onNavigate("editor");
     }
@@ -651,3 +841,4 @@ export async function handleOpenFile(onNavigate?: (page: any) => Promise<void>):
     await showAppDialog({ title: "読み込みエラー", message: `正本ファイルの読み込みに失敗しました:\n${err}`, type: "error" });
   }
 }
+

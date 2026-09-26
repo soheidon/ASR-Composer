@@ -30,9 +30,9 @@ import {
 import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus, LocalAsrProgress, LocalAsrInstallState } from "./docker";
 import {
   renderEditorPage,
+  renderEditor,
   bindEditorEvents,
   confirmDiscardChanges,
-  discardEditorChanges,
   setEditorDocument,
   setEditorInvoke,
   isEditorDirty,
@@ -67,6 +67,10 @@ async function invokeTauri<T>(command: string, args?: Record<string, unknown>): 
     throw new Error("この操作はTauriアプリ内でのみ利用できます");
   }
   return invokeFn<T>(command, args);
+}
+
+export function setTauriInvokeForTest(fn: InvokeFn | null): void {
+  invokeFn = fn;
 }
 
 // ---- Template Builders ----
@@ -744,12 +748,44 @@ const settingsBackgroundPage = `
   </div>
 `;
 
-type PageName = "transcribe" | "editor" | "settings" | "settings-ollama" | "settings-docker" | "settings-dictionary" | "settings-background" | "settings-general";
+export type WorkspacePage = "transcribe" | "editor" | "merge" | "settings";
+export type PageName =
+  | "transcribe"
+  | "editor"
+  | "merge"
+  | "settings"
+  | "settings-ollama"
+  | "settings-docker"
+  | "settings-dictionary"
+  | "settings-background"
+  | "settings-general";
+
+const mergePage = `
+  <main class="main-content">
+    <div class="content-wrapper">
+      <section class="section-card">
+        <h3 class="section-header"><span class="section-title">統合処理</span></h3>
+        <p style="color: var(--on-surface-variant); padding: 16px 0;">複数文字起こし結果の統合・比較機能は今後実装予定です。</p>
+      </section>
+    </div>
+  </main>
+`;
+
+function getWorkspaceForPage(page: PageName): WorkspacePage {
+  if (page.startsWith("settings")) {
+    return "settings";
+  }
+  if (page === "editor") return "editor";
+  if (page === "merge") return "merge";
+  return "transcribe";
+}
 
 function renderHeader(activePage: PageName): string {
-  const transcribeActive = activePage === "transcribe" ? "active" : "";
-  const editorActive = activePage === "editor" ? "active" : "";
-  const settingsActive = (activePage === "settings" || activePage === "settings-ollama" || activePage === "settings-docker" || activePage === "settings-dictionary" || activePage === "settings-background" || activePage === "settings-general") ? "active" : "";
+  const ws = getWorkspaceForPage(activePage);
+  const transcribeActive = ws === "transcribe" ? "active" : "";
+  const editorActive = ws === "editor" ? "active" : "";
+  const mergeActive = ws === "merge" ? "active" : "";
+  const settingsActive = ws === "settings" ? "active" : "";
   return `
   <header class="app-header">
     <div class="header-left">
@@ -759,7 +795,7 @@ function renderHeader(activePage: PageName): string {
       <nav class="header-nav">
         <a class="nav-link ${transcribeActive}" href="#" data-page="transcribe">文字起こし</a>
         <a class="nav-link ${editorActive}" href="#" data-page="editor">正本編集</a>
-        <a class="nav-link" href="#">統合</a>
+        <a class="nav-link ${mergeActive}" href="#" data-page="merge">統合</a>
         <a class="nav-link ${settingsActive}" href="#" data-page="settings-general">設定</a>
       </nav>
     </div>
@@ -1224,80 +1260,301 @@ function populateLanguagesForEngine(engineId: string, savedCode?: string): void 
   languageSelect.value = japanese?.code ?? languages[0].code;
 }
 
-async function navigateTo(page: PageName) {
-  if (currentPage === page) return;
-  if (currentPage === "editor" && page !== "editor" && isEditorDirty()) {
-    const confirmed = await confirmDiscardChanges();
-    if (!confirmed) return;
-    discardEditorChanges();
+export type MountResult = "mounted" | "cancelled";
+export const pageMounts = new Map<string, Promise<MountResult>>();
+export let navigationGeneration = 0;
+
+export function resetMountedPagesForTest(): void {
+  pageMounts.clear();
+  currentPage = null;
+  navigationGeneration = 0;
+}
+
+async function runMountWithRegistry(
+  key: string,
+  mountFn: () => Promise<MountResult>,
+): Promise<MountResult> {
+  const existing = pageMounts.get(key);
+  if (existing) {
+    return existing;
   }
+
+  const promise = (async () => {
+    try {
+      const res = await mountFn();
+      if (res === "cancelled") {
+        pageMounts.delete(key);
+      }
+      return res;
+    } catch (err) {
+      pageMounts.delete(key);
+      throw err;
+    }
+  })();
+
+  pageMounts.set(key, promise);
+  return promise;
+}
+
+async function ensureMountedForNavigation(
+  key: string,
+  mountFn: () => Promise<MountResult>,
+  navId: number,
+): Promise<boolean> {
+  let result = await runMountWithRegistry(key, mountFn);
+
+  if (navId !== navigationGeneration) {
+    return false;
+  }
+
+  if (result === "mounted") {
+    return true;
+  }
+
+  // If the shared in-flight mount was cancelled by an earlier navigation,
+  // retry once since we are the current navigation.
+  result = await runMountWithRegistry(key, mountFn);
+
+  if (navId !== navigationGeneration) {
+    return false;
+  }
+
+  return result === "mounted";
+}
+
+function updateHeaderActiveNav(page: PageName): void {
+  const activeWorkspace = getWorkspaceForPage(page);
+  const links = document.querySelectorAll<HTMLElement>(".header-nav .nav-link");
+  links.forEach((link) => {
+    const linkPage = link.dataset.page as PageName | undefined;
+    if (!linkPage) return;
+    const linkWorkspace = getWorkspaceForPage(linkPage);
+    if (linkWorkspace === activeWorkspace) {
+      link.classList.add("active");
+    } else {
+      link.classList.remove("active");
+    }
+  });
+}
+
+function ensureAppShell(activePage: PageName = "transcribe"): void {
+  const appEl = getAppElement();
+  if (!appEl) return;
+  if (!appEl.querySelector(".workspace-viewport")) {
+    appEl.innerHTML = `
+      ${renderHeader(activePage)}
+      <div class="workspace-viewport">
+        <div id="page-transcribe" class="workspace-page"></div>
+        <div id="page-editor" class="workspace-page hidden"></div>
+        <div id="page-merge" class="workspace-page hidden"></div>
+        <div id="page-settings" class="workspace-page hidden"></div>
+      </div>
+    `;
+    bindWindowControls();
+    bindNavigation();
+    bindSettingsSidebarNav();
+  }
+}
+
+async function mountTranscribeWorkspace(): Promise<MountResult> {
+  const container = document.getElementById("page-transcribe");
+  if (!container) throw new Error("Missing #page-transcribe container");
+  container.innerHTML = transcribePage;
+  try {
+    await restoreAsrSelection();
+  } catch (e) {
+    console.error("restoreAsrSelection failed:", e);
+  }
+  bindAsrModeSelect();
+  bindAsrEngineSettingsButton();
+  bindFileSelection();
+  bindStartButton();
+  await bindTranscribeProgress();
+  bindResultButtons();
+  bindBrowseOutputPath();
+  return "mounted";
+}
+
+function mountEditorWorkspace(): MountResult {
+  const container = document.getElementById("page-editor");
+  if (!container) throw new Error("Missing #page-editor container");
+  container.innerHTML = renderEditorPage();
+  bindEditorEvents(navigateTo);
+  return "mounted";
+}
+
+function mountMergeWorkspace(): MountResult {
+  const container = document.getElementById("page-merge");
+  if (!container) throw new Error("Missing #page-merge container");
+  container.innerHTML = mergePage;
+  return "mounted";
+}
+
+function mountSettingsWorkspace(): MountResult {
+  const container = document.getElementById("page-settings");
+  if (!container) throw new Error("Missing #page-settings container");
+  container.innerHTML = `
+    <div id="subpage-settings-general" class="settings-subpage hidden">
+      ${settingsGeneralPage}
+    </div>
+    <div id="subpage-settings-dictionary" class="settings-subpage hidden">
+      ${settingsDictionaryPage}
+    </div>
+    <div id="subpage-settings-background" class="settings-subpage hidden">
+      ${settingsBackgroundPage}
+    </div>
+    <div id="subpage-settings" class="settings-subpage hidden">
+      ${settingsApiPage}
+    </div>
+    <div id="subpage-settings-ollama" class="settings-subpage hidden">
+      ${settingsOllamaPage}
+    </div>
+    <div id="subpage-settings-docker" class="settings-subpage hidden">
+      ${settingsDockerPage}
+    </div>
+  `;
+  bindAccordions(container);
+  return "mounted";
+}
+
+function getSettingsSubpageKey(page: PageName): { key: string; elementId: string } | null {
+  switch (page) {
+    case "settings":
+      return { key: "settings:api", elementId: "subpage-settings" };
+    case "settings-ollama":
+      return { key: "settings:ollama", elementId: "subpage-settings-ollama" };
+    case "settings-docker":
+      return { key: "settings:docker", elementId: "subpage-settings-docker" };
+    case "settings-general":
+      return { key: "settings:general", elementId: "subpage-settings-general" };
+    case "settings-dictionary":
+      return { key: "settings:dictionary", elementId: "subpage-settings-dictionary" };
+    case "settings-background":
+      return { key: "settings:background", elementId: "subpage-settings-background" };
+    default:
+      return null;
+  }
+}
+
+async function mountSettingsSubpage(
+  subpageKey: string,
+  subpageElementId: string,
+  navGeneration: number,
+): Promise<MountResult> {
+  const subContainer = document.getElementById(subpageElementId);
+  if (!subContainer) throw new Error(`Missing #${subpageElementId} container`);
+
+  if (subpageKey === "settings:api") {
+    const loaded = await loadSavedSettings(navGeneration, subContainer);
+    if (!loaded) return "cancelled";
+    bindApiSaveButtons(subContainer);
+    bindVisibilityToggles(subContainer);
+    bindResetUrlButtons(subContainer);
+    bindModelSelects(subContainer);
+    bindProviderConfigAutoSave(subContainer);
+    bindFetchModelsButtons(subContainer);
+    bindTestSendButtons(subContainer);
+    bindGoogleSttHandlers(subContainer);
+    bindXiaomiMimoAsrHandlers(subContainer);
+    return "mounted";
+  } else if (subpageKey === "settings:ollama") {
+    const loaded = await loadOllamaSettings(navGeneration, subContainer);
+    if (!loaded) return "cancelled";
+    bindOllamaAutoSave(subContainer);
+    bindResetUrlButtons(subContainer);
+    bindModelSelects(subContainer);
+    bindOllamaFetchButton(subContainer);
+    bindOllamaTestButton(subContainer);
+    return "mounted";
+  } else if (subpageKey === "settings:docker") {
+    void loadAndRenderHuggingFaceToken();
+    bindLocalAsrDelegation(subContainer);
+    return "mounted";
+  } else {
+    // general, dictionary, background
+    return "mounted";
+  }
+}
+
+export async function navigateTo(page: PageName): Promise<void> {
+  const navId = ++navigationGeneration;
   currentPage = page;
 
-  const body = page === "transcribe" ? transcribePage
-    : page === "editor" ? renderEditorPage()
-    : page === "settings-ollama" ? settingsOllamaPage
-    : page === "settings-docker" ? settingsDockerPage
-    : page === "settings-dictionary" ? settingsDictionaryPage
-    : page === "settings-background" ? settingsBackgroundPage
-    : page === "settings-general" ? settingsGeneralPage
-    : settingsApiPage;
-  const appEl = getAppElement();
-  if (appEl) {
-    appEl.innerHTML = renderHeader(page) + body;
+  ensureAppShell(page);
+
+  const activeWorkspace = getWorkspaceForPage(page);
+  const workspaceKey = `workspace:${activeWorkspace}`;
+
+  const workspaceMounted = await ensureMountedForNavigation(
+    workspaceKey,
+    async () => {
+      if (activeWorkspace === "transcribe") {
+        return await mountTranscribeWorkspace();
+      } else if (activeWorkspace === "editor") {
+        return mountEditorWorkspace();
+      } else if (activeWorkspace === "merge") {
+        return mountMergeWorkspace();
+      } else if (activeWorkspace === "settings") {
+        return mountSettingsWorkspace();
+      }
+      return "mounted";
+    },
+    navId,
+  );
+
+  if (!workspaceMounted || navId !== navigationGeneration) return;
+
+  const subpageInfo = getSettingsSubpageKey(page);
+  if (subpageInfo) {
+    const subpageMounted = await ensureMountedForNavigation(
+      subpageInfo.key,
+      async () => {
+        return await mountSettingsSubpage(subpageInfo.key, subpageInfo.elementId, navId);
+      },
+      navId,
+    );
+    if (!subpageMounted || navId !== navigationGeneration) return;
   }
 
-  bindWindowControls();
-  bindNavigation();
-  bindAccordions();
-  bindSettingsSidebarNav();
+  if (navId !== navigationGeneration) return;
 
-  if (page === "editor") {
-    bindEditorEvents(navigateTo);
-  } else if (page === "settings") {
-    loadSavedSettings();
-    bindApiSaveButtons();
-    bindVisibilityToggles();
-    bindResetUrlButtons();
-    bindModelSelects();
-    bindProviderConfigAutoSave();
-    bindFetchModelsButtons();
-    bindTestSendButtons();
-    bindGoogleSttHandlers();
-    bindXiaomiMimoAsrHandlers();
-  } else if (page === "settings-ollama") {
-    await loadOllamaSettings();
-    if (currentPage !== "settings-ollama") return;
-    bindOllamaAutoSave();
-    bindResetUrlButtons();
-    bindModelSelects();
-    bindOllamaFetchButton();
-    bindOllamaTestButton();
-  } else if (page === "settings-docker") {
+  if (page === "settings-docker") {
     void loadDockerPageStatuses();
-    void loadAndRenderHuggingFaceToken();
-    bindLocalAsrDelegation();
-  } else if (page === "transcribe") {
-    try {
-      await restoreAsrSelection();
-    } catch (e) {
-      console.error("restoreAsrSelection failed:", e);
-      // restoreに失敗してもbindは実行する（ブラウザプレビュー等）
-      bindAsrModeSelect();
-      bindAsrEngineSettingsButton();
-      bindFileSelection();
-      bindStartButton();
-      await bindTranscribeProgress();
-      bindResultButtons();
-      bindBrowseOutputPath();
-      return;
+  }
+
+  updateHeaderActiveNav(page);
+
+  const workspaces: WorkspacePage[] = ["transcribe", "editor", "merge", "settings"];
+  for (const ws of workspaces) {
+    const wsEl = document.getElementById(`page-${ws}`);
+    if (wsEl) {
+      if (ws === activeWorkspace) {
+        wsEl.classList.remove("hidden");
+      } else {
+        wsEl.classList.add("hidden");
+      }
     }
-    bindAsrModeSelect();
-    bindAsrEngineSettingsButton();
-    bindFileSelection();
-    bindStartButton();
-    await bindTranscribeProgress();
-    bindResultButtons();
-    bindBrowseOutputPath();
+  }
+
+  if (activeWorkspace === "settings" && subpageInfo) {
+    const allSubpages = [
+      "subpage-settings-general",
+      "subpage-settings-dictionary",
+      "subpage-settings-background",
+      "subpage-settings",
+      "subpage-settings-ollama",
+      "subpage-settings-docker",
+    ];
+    for (const subId of allSubpages) {
+      const subEl = document.getElementById(subId);
+      if (subEl) {
+        if (subId === subpageInfo.elementId) {
+          subEl.classList.remove("hidden");
+        } else {
+          subEl.classList.add("hidden");
+        }
+      }
+    }
   }
 }
 
@@ -1493,8 +1750,8 @@ function bindNavigation() {
 
 // ---- Accordion ----
 
-function bindAccordions() {
-  document.querySelectorAll<HTMLElement>(".accordion-header").forEach((header) => {
+function bindAccordions(container: ParentNode = document) {
+  container.querySelectorAll<HTMLElement>(".accordion-header").forEach((header) => {
     header.addEventListener("click", () => {
       const item = header.closest(".accordion-item");
       if (!item) return;
@@ -1665,23 +1922,27 @@ function hideResultSection(): void {
 }
 
 async function bindTranscribeProgress(): Promise<void> {
-  unlistenTranscriptionProgress?.();
-  const { listen } = await import("@tauri-apps/api/event");
-  unlistenTranscriptionProgress = await listen<TranscriptionProgress>(
-    "local-asr-transcription-progress",
-    (event) => {
-      const { jobId, stage, message } = event.payload;
-      if (jobId !== activeJobId) return;
-      const stageEl = document.getElementById("progressStage");
-      if (stageEl) {
-        if (stage === "completed") {
-          stageEl.textContent = "完了";
-        } else if (message) {
-          stageEl.textContent = message;
+  try {
+    unlistenTranscriptionProgress?.();
+    const { listen } = await import("@tauri-apps/api/event");
+    unlistenTranscriptionProgress = await listen<TranscriptionProgress>(
+      "local-asr-transcription-progress",
+      (event) => {
+        const { jobId, stage, message } = event.payload;
+        if (jobId !== activeJobId) return;
+        const stageEl = document.getElementById("progressStage");
+        if (stageEl) {
+          if (stage === "completed") {
+            stageEl.textContent = "完了";
+          } else if (message) {
+            stageEl.textContent = message;
+          }
         }
-      }
-    },
-  );
+      },
+    );
+  } catch (error) {
+    // browser preview / test environment
+  }
 }
 
 function setTranscriptionRunning(running: boolean): void {
@@ -1847,6 +2108,7 @@ function bindResultButtons(): void {
         if (!confirmed) return;
       }
       setEditorDocument(lastTranscriptionDocument, null);
+      renderEditor(navigateTo);
       await navigateTo("editor");
     }
   });
@@ -1876,12 +2138,17 @@ interface SavedAppSettings {
   output_path: string;
 }
 
-async function loadSavedSettings() {
+async function loadSavedSettings(navGeneration?: number, container: ParentNode = document): Promise<boolean> {
+  if (navGeneration !== undefined && navGeneration !== navigationGeneration) return false;
   try {
     const settings = await invokeTauri<SavedAppSettings>("load_api_settings");
-    if (currentPage !== "settings") return;
+    if (navGeneration !== undefined && navGeneration !== navigationGeneration) return false;
 
-    document.querySelectorAll<HTMLElement>(".accordion-item[data-provider-id]").forEach((item) => {
+    const targetContainer = container instanceof HTMLElement && container.id === "subpage-settings"
+      ? container
+      : container.querySelector<HTMLElement>("#subpage-settings") ?? container;
+
+    targetContainer.querySelectorAll<HTMLElement>(".accordion-item[data-provider-id]").forEach((item) => {
       const providerId = item.dataset.providerId;
       if (!providerId) return;
       const saved = settings.providers[providerId];
@@ -1952,15 +2219,17 @@ async function loadSavedSettings() {
         });
       }
     });
+    return true;
   } catch (e) {
     console.error("Failed to load API settings:", e);
+    return false;
   }
 }
 
 // ---- API Settings: Save ----
 
-function bindApiSaveButtons() {
-  document.querySelectorAll<HTMLElement>(".btn-api-save").forEach((btn) => {
+function bindApiSaveButtons(container: ParentNode = document) {
+  container.querySelectorAll<HTMLElement>(".btn-api-save").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const providerId = btn.dataset.providerId;
       if (!providerId) return;
@@ -2064,8 +2333,8 @@ function getModelValue(item: Element): string {
 
 // ---- API Settings: Visibility Toggle ----
 
-function bindVisibilityToggles() {
-  document.querySelectorAll<HTMLElement>(".api-visibility-btn").forEach((btn) => {
+function bindVisibilityToggles(container: ParentNode = document) {
+  container.querySelectorAll<HTMLElement>(".api-visibility-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const wrap = btn.closest(".api-key-input-wrap");
       if (!wrap) return;
@@ -2086,8 +2355,8 @@ function bindVisibilityToggles() {
 
 // ---- API Settings: Reset URL ----
 
-function bindResetUrlButtons() {
-  document.querySelectorAll<HTMLElement>(".btn-reset-url").forEach((btn) => {
+function bindResetUrlButtons(container: ParentNode = document) {
+  container.querySelectorAll<HTMLElement>(".btn-reset-url").forEach((btn) => {
     btn.addEventListener("click", () => {
       const row = btn.closest(".api-baseurl-row");
       if (!row) return;
@@ -2104,8 +2373,8 @@ function bindResetUrlButtons() {
 
 // ---- Model Select: Manual Input Toggle ----
 
-function bindModelSelects() {
-  document.querySelectorAll<HTMLSelectElement>('[data-field="model"]').forEach((select) => {
+function bindModelSelects(container: ParentNode = document) {
+  container.querySelectorAll<HTMLSelectElement>('[data-field="model"]').forEach((select) => {
     select.addEventListener("change", () => {
       const item = select.closest(".accordion-item");
       if (!item) return;
@@ -2124,8 +2393,8 @@ function bindModelSelects() {
 
 // ---- Provider Config: Auto Save on blur/change ----
 
-function bindProviderConfigAutoSave() {
-  document.querySelectorAll<HTMLElement>(".accordion-item[data-provider-id]").forEach((item) => {
+function bindProviderConfigAutoSave(container: ParentNode = document) {
+  container.querySelectorAll<HTMLElement>(".accordion-item[data-provider-id]").forEach((item) => {
     const providerId = item.dataset.providerId;
     if (!providerId || providerId === "ollama") return;
 
@@ -2270,8 +2539,8 @@ function bindProviderConfigAutoSave() {
 
 // ---- Model Fetch Button ----
 
-function bindFetchModelsButtons() {
-  document.querySelectorAll<HTMLElement>(".btn-fetch-models").forEach((btn) => {
+function bindFetchModelsButtons(container: ParentNode = document) {
+  container.querySelectorAll<HTMLElement>(".btn-fetch-models").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const providerId = btn.dataset.providerId;
       if (!providerId) return;
@@ -2493,8 +2762,8 @@ async function fetchProviderModels(providerId: string, item: Element, btn: HTMLE
 
 // ---- LLM Test Send ----
 
-function bindTestSendButtons() {
-  document.querySelectorAll<HTMLElement>(".accordion-item[data-provider-id]").forEach((item) => {
+function bindTestSendButtons(container: ParentNode = document) {
+  container.querySelectorAll<HTMLElement>(".accordion-item[data-provider-id]").forEach((item) => {
     const providerId = item.dataset.providerId;
     if (!providerId || providerId === "ollama" || providerId === "google_stt") return;
 
@@ -2531,9 +2800,9 @@ function bindTestSendButtons() {
   });
 }
 
-function bindGoogleSttHandlers() {
+function bindGoogleSttHandlers(container: ParentNode = document) {
   // ADC認証チェック
-  document.querySelectorAll<HTMLElement>(".btn-google-stt-check-adc").forEach((btn) => {
+  container.querySelectorAll<HTMLElement>(".btn-google-stt-check-adc").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const item = btn.closest<HTMLElement>(".accordion-item");
       if (!item) return;
@@ -2542,7 +2811,7 @@ function bindGoogleSttHandlers() {
   });
 
   // 別の音声ファイルで試す（詳細設定内: 選択→即認識）
-  document.querySelectorAll<HTMLElement>(".btn-google-stt-select-file").forEach((btn) => {
+  container.querySelectorAll<HTMLElement>(".btn-google-stt-select-file").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const item = btn.closest<HTMLElement>(".accordion-item");
       if (!item) return;
@@ -2596,7 +2865,7 @@ function bindGoogleSttHandlers() {
   });
 
   // 接続・認識テスト（同梱音声）- Google STTプロバイダー内のみ
-  document.querySelectorAll<HTMLElement>('.accordion-item[data-provider-id="google_stt"] .btn-google-stt-builtin-test').forEach((btn) => {
+  container.querySelectorAll<HTMLElement>('.accordion-item[data-provider-id="google_stt"] .btn-google-stt-builtin-test').forEach((btn) => {
     btn.addEventListener("click", async () => {
       const item = btn.closest<HTMLElement>(".accordion-item");
       if (!item) return;
@@ -2734,8 +3003,8 @@ async function runXiaomiMimoAsrFileTest(item: HTMLElement, btn: HTMLButtonElemen
   }
 }
 
-function bindXiaomiMimoAsrHandlers() {
-  document.querySelectorAll<HTMLElement>('.accordion-item[data-provider-id="xiaomi_mimo_asr"]').forEach((item) => {
+function bindXiaomiMimoAsrHandlers(container: ParentNode = document) {
+  container.querySelectorAll<HTMLElement>('.accordion-item[data-provider-id="xiaomi_mimo_asr"]').forEach((item) => {
     // 注意: 詳細設定トグルは bindProviderConfigAutoSave() で全プロバイダー共通に登録済み
     // ここでは重複登録しない
 
@@ -2927,14 +3196,18 @@ async function runBuiltinTest(item: HTMLElement, btn: HTMLElement): Promise<void
 
 // ---- Ollama Settings Page ----
 
-async function loadOllamaSettings() {
-  if (currentPage !== "settings-ollama") return;
+async function loadOllamaSettings(navGeneration?: number, container: ParentNode = document): Promise<boolean> {
+  if (navGeneration !== undefined && navGeneration !== navigationGeneration) return false;
   try {
     const settings = await invokeTauri<SavedAppSettings>("load_api_settings");
-    if (currentPage !== "settings-ollama") return;
+    if (navGeneration !== undefined && navGeneration !== navigationGeneration) return false;
 
-    const item = document.querySelector<HTMLElement>(".accordion-item[data-provider-id='ollama']");
-    if (!item) return;
+    const targetContainer = container instanceof HTMLElement && container.id === "subpage-settings-ollama"
+      ? container
+      : container.querySelector<HTMLElement>("#subpage-settings-ollama") ?? container;
+
+    const item = targetContainer.querySelector<HTMLElement>(".accordion-item[data-provider-id='ollama']");
+    if (!item) return true;
 
     const saved = settings.providers["ollama"];
 
@@ -2967,8 +3240,10 @@ async function loadOllamaSettings() {
     if (statusBadgeEl && saved) {
       setStatusBadge(statusBadgeEl, "設定済み");
     }
+    return true;
   } catch (e) {
     console.error("Failed to load Ollama settings:", e);
+    return false;
   }
 }
 
@@ -3034,14 +3309,15 @@ function scheduleOllamaSave() {
   }, 300);
 }
 
-function bindOllamaAutoSave() {
-  document.getElementById("ollamaBaseUrl")?.addEventListener("change", () => { scheduleOllamaSave(); });
-  document.getElementById("ollamaModelSelect")?.addEventListener("change", () => { scheduleOllamaSave(); });
-  document.getElementById("ollamaModelManual")?.addEventListener("change", () => { scheduleOllamaSave(); });
+function bindOllamaAutoSave(container: ParentNode = document) {
+  const c = container instanceof HTMLElement ? container : document;
+  c.querySelector("#ollamaBaseUrl")?.addEventListener("change", () => { scheduleOllamaSave(); });
+  c.querySelector("#ollamaModelSelect")?.addEventListener("change", () => { scheduleOllamaSave(); });
+  c.querySelector("#ollamaModelManual")?.addEventListener("change", () => { scheduleOllamaSave(); });
 }
 
-function bindOllamaFetchButton() {
-  document.querySelectorAll<HTMLElement>(".btn-fetch-models").forEach((btn) => {
+function bindOllamaFetchButton(container: ParentNode = document) {
+  container.querySelectorAll<HTMLElement>(".btn-fetch-models").forEach((btn) => {
     if (btn.dataset.providerId !== "ollama") return;
     btn.addEventListener("click", async () => {
       const item = btn.closest(".accordion-item");
@@ -3051,8 +3327,9 @@ function bindOllamaFetchButton() {
   });
 }
 
-function bindOllamaTestButton() {
-  const item = document.querySelector(".accordion-item[data-provider-id='ollama']");
+function bindOllamaTestButton(container: ParentNode = document) {
+  const c = container instanceof HTMLElement ? container : document;
+  const item = c.querySelector(".accordion-item[data-provider-id='ollama']");
   if (!item) return;
   const btn = item.querySelector<HTMLButtonElement>(".btn-test-send");
   if (!btn) return;
@@ -3091,14 +3368,23 @@ function bindOllamaTestButton() {
 
 // ---- Docker Event Handlers ----
 
-async function loadAndRenderDockerStatus(): Promise<DockerStatus | null> {
+let dockerStatusRequestRevision = 0;
+
+export function resetDockerStatusRevisionForTest(): void {
+  dockerStatusRequestRevision = 0;
+}
+
+export async function loadAndRenderDockerStatus(): Promise<DockerStatus | null> {
   const container = document.getElementById("dockerStatusContainer");
   if (!container) return null;
+
+  const reqRevision = ++dockerStatusRequestRevision;
 
   container.innerHTML = renderDockerStatusContent(null);
   bindDockerRefreshBtn();
   try {
     const status = await invokeTauri<DockerStatus>("docker_check_status");
+    if (reqRevision !== dockerStatusRequestRevision) return null;
     if (!container.isConnected) return null;
     container.innerHTML = renderDockerStatusContent(status);
     bindDockerRefreshBtn();
@@ -3107,6 +3393,7 @@ async function loadAndRenderDockerStatus(): Promise<DockerStatus | null> {
     return status;
   } catch (e) {
     console.error("docker_check_status error:", e);
+    if (reqRevision !== dockerStatusRequestRevision) return null;
     if (!container.isConnected) return null;
     const errorStatus: DockerStatus = {
       cliFound: false,
@@ -3313,16 +3600,18 @@ function bindHfTokenVisibility(): void {
 
 // ---- Local ASR Event Handlers ----
 
-function bindLocalAsrDelegation(): void {
-  const container = document.getElementById("localAsrContainer");
-  if (!container) return;
+function bindLocalAsrDelegation(container: ParentNode = document): void {
+  const targetContainer = container instanceof HTMLElement && container.id === "localAsrContainer"
+    ? container
+    : container.querySelector<HTMLElement>("#localAsrContainer");
+  if (!targetContainer) return;
 
-  if (container.dataset.delegationBound === "true") return;
-  container.dataset.delegationBound = "true";
+  if (targetContainer.dataset.delegationBound === "true") return;
+  targetContainer.dataset.delegationBound = "true";
 
-  container.addEventListener("click", (e) => {
+  targetContainer.addEventListener("click", (e) => {
     const target = (e.target as HTMLElement).closest<HTMLButtonElement>("button");
-    if (!target || !container.contains(target)) return;
+    if (!target || !targetContainer.contains(target)) return;
 
     if (target.classList.contains("btn-local-asr-install")) {
       const engine = target.dataset.installEngine;
@@ -3491,7 +3780,6 @@ function ensureLocalAsrProgressListener(): Promise<void> {
 }
 
 function updateVisibleLocalAsrProgress(engine: string, percent: number, message: string): void {
-  if (currentPage !== "settings-docker") return;
   const container = document.getElementById("localAsrContainer");
   const statusEl = container?.querySelector<HTMLElement>(
     `[data-install-engine-status="${CSS.escape(engine)}"]`,

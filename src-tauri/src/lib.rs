@@ -1378,11 +1378,14 @@ fn build_ollama_endpoint(
     url.set_query(None);
     url.set_fragment(None);
 
-    let path = format!(
-        "{}/{}",
-        url.path().trim_end_matches('/'),
-        endpoint.trim_start_matches('/')
-    );
+    let raw_path = url.path().trim_end_matches('/');
+    let base_path = raw_path.strip_suffix("/api").unwrap_or(raw_path);
+    let endpoint_clean = endpoint.trim_start_matches('/');
+    let path = if base_path.is_empty() {
+        format!("/{}", endpoint_clean)
+    } else {
+        format!("{}/{}", base_path, endpoint_clean)
+    };
     url.set_path(&path);
 
     Ok(url)
@@ -1515,6 +1518,95 @@ async fn test_connection_ollama(
         version: version.clone(),
         message: format!("接続成功（Ollama v{}）", version),
     })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallOllamaChatInput {
+    pub base_url: String,
+    pub model: String,
+    pub messages: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub format: Option<serde_json::Value>,
+    #[serde(default)]
+    pub options: Option<serde_json::Value>,
+    #[serde(default)]
+    pub think: Option<bool>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[tauri::command]
+async fn call_ollama_chat(
+    input: CallOllamaChatInput,
+) -> Result<serde_json::Value, FetchModelsError> {
+    let url = build_ollama_endpoint(&input.base_url, "api/chat")?;
+
+    let timeout_secs = input.timeout_secs.unwrap_or(120);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| FetchModelsError {
+            kind: FetchErrorKind::ConnectionError,
+            message: format!("HTTPクライアントの作成に失敗しました: {}", e),
+        })?;
+
+    let mut body = serde_json::json!({
+        "model": input.model,
+        "messages": input.messages,
+        "stream": false,
+    });
+
+    if let Some(format) = input.format {
+        body["format"] = format;
+    }
+    if let Some(options) = input.options {
+        body["options"] = options;
+    }
+    if let Some(think) = input.think {
+        body["think"] = serde_json::json!(think);
+    }
+
+    let resp = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                FetchModelsError {
+                    kind: FetchErrorKind::ConnectionError,
+                    message: format!("Ollamaリクエストがタイムアウトしました ({}秒): {}", timeout_secs, e),
+                }
+            } else {
+                FetchModelsError {
+                    kind: FetchErrorKind::ConnectionError,
+                    message: format!("Ollamaに接続できませんでした: {}", e),
+                }
+            }
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(FetchModelsError {
+            kind: if status == reqwest::StatusCode::NOT_FOUND {
+                FetchErrorKind::Unsupported
+            } else if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+                FetchErrorKind::AuthError
+            } else {
+                FetchErrorKind::ConnectionError
+            },
+            message: format!("Ollamaからエラーが返されました (HTTP {}): {}", status.as_u16(), body_text),
+        });
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| FetchModelsError {
+        kind: FetchErrorKind::ConnectionError,
+        message: format!("OllamaレスポンスのJSON解析に失敗しました: {}", e),
+    })?;
+
+    Ok(json)
 }
 
 fn is_anthropic_provider(provider_id: &str) -> bool {
@@ -4262,6 +4354,7 @@ pub fn run() {
             save_output_path,
             fetch_models,
             test_connection_ollama,
+            call_ollama_chat,
             test_llm_connection,
             get_env_var,
             google_stt_check_adc,
@@ -4645,6 +4738,53 @@ mod tests {
     fn test_build_ollama_endpoint_whitespace_url_uses_default() {
         let url = build_ollama_endpoint("   ", "api/version").unwrap();
         assert_eq!(url.as_str(), "http://localhost:11434/api/version");
+    }
+
+    #[test]
+    fn test_build_ollama_endpoint_chat() {
+        let url = build_ollama_endpoint("http://localhost:11434", "api/chat").unwrap();
+        assert_eq!(url.as_str(), "http://localhost:11434/api/chat");
+    }
+
+    #[test]
+    fn test_build_ollama_endpoint_normalizes_api_suffix() {
+        // http://localhost:11434
+        let u1 = build_ollama_endpoint("http://localhost:11434", "api/chat").unwrap();
+        assert_eq!(u1.as_str(), "http://localhost:11434/api/chat");
+
+        // http://localhost:11434/
+        let u2 = build_ollama_endpoint("http://localhost:11434/", "api/chat").unwrap();
+        assert_eq!(u2.as_str(), "http://localhost:11434/api/chat");
+
+        // http://localhost:11434/api
+        let u3 = build_ollama_endpoint("http://localhost:11434/api", "api/chat").unwrap();
+        assert_eq!(u3.as_str(), "http://localhost:11434/api/chat");
+
+        // http://localhost:11434/api/
+        let u4 = build_ollama_endpoint("http://localhost:11434/api/", "api/chat").unwrap();
+        assert_eq!(u4.as_str(), "http://localhost:11434/api/chat");
+
+        // /api/tags endpoint with /api/ base_url
+        let u5 = build_ollama_endpoint("http://localhost:11434/api/", "api/tags").unwrap();
+        assert_eq!(u5.as_str(), "http://localhost:11434/api/tags");
+    }
+
+    #[test]
+    fn test_call_ollama_chat_input_deserialization() {
+        let json = r#"{
+            "baseUrl": "http://localhost:11434",
+            "model": "qwen2.5:7b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "format": {"type": "object"},
+            "options": {"temperature": 0},
+            "timeoutSecs": 60
+        }"#;
+        let input: CallOllamaChatInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.base_url, "http://localhost:11434");
+        assert_eq!(input.model, "qwen2.5:7b");
+        assert_eq!(input.timeout_secs, Some(60));
+        assert!(input.format.is_some());
+        assert!(input.options.is_some());
     }
 
     #[test]
