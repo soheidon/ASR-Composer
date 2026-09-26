@@ -12,8 +12,13 @@ import {
   confirmDiscardChanges,
   handleOpenFile,
   setEditorInvoke,
+  getActiveProposals,
+  clearActiveProposalsForTest,
+  setActiveProposalsForTest,
+  bindEditorEvents,
 } from "./editor";
 import { deriveSegmentStatus, type TranscriptDocument } from "./transcript";
+import type { CorrectionProposal } from "./correction";
 import * as statusModule from "./status";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -418,4 +423,432 @@ describe("Canonical Editor", () => {
     expect(isEditorDirty()).toBe(true); // new unsaved document
   });
 });
+
+describe("Phase 1 LLM Correction UI Integration", () => {
+  beforeEach(() => {
+    clearActiveProposalsForTest();
+    document.body.innerHTML = "";
+  });
+
+  it("Case H: Multiple proposals for same segment - adopting 1 proposal applies text, status=edited, dirty=true, and clears all proposals for that segment", async () => {
+    const doc = createSampleDocument(1);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    const seg = getEditorDocument()!.segments[0];
+    const initialOrigText = seg.originalText;
+
+    const prop1: CorrectionProposal = {
+      id: "prop-1",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "採用された第一補正テキスト",
+      evidence: [
+        { type: "dictionary", sourceId: "d-1", description: "医学辞書" },
+      ],
+      explanation: "第一候補",
+      confidence: 0.95,
+    };
+    const prop2: CorrectionProposal = {
+      id: "prop-2",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "却下される第二補正テキスト",
+      evidence: [{ type: "context", description: "前後文脈" }],
+      explanation: "第二候補",
+      confidence: 0.8,
+    };
+
+    const map = new Map<string, CorrectionProposal[]>();
+    map.set(seg.id, [prop1, prop2]);
+    setActiveProposalsForTest(map);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const applyBtns = document.querySelectorAll<HTMLButtonElement>(".btn-apply-proposal");
+    expect(applyBtns.length).toBe(2);
+
+    // 1件目を採用クリック
+    applyBtns[0].click();
+
+    // segment.text が更新される
+    expect(seg.text).toBe("採用された第一補正テキスト");
+    // originalText は絶対に不変
+    expect(seg.originalText).toBe(initialOrigText);
+    // status は edited
+    expect(seg.status).toBe("edited");
+    // dirty は自然に true
+    expect(isEditorDirty()).toBe(true);
+    // 当該セグメントの全 proposal がクリアされていること
+    expect(getActiveProposals().has(seg.id)).toBe(false);
+    // DOM上の proposal-card も除去されていること
+    expect(document.querySelectorAll(".proposal-card").length).toBe(0);
+  });
+
+  it("Case I: Multiple proposals for same segment - rejecting 1 proposal removes only that proposal and keeps others", () => {
+    const doc = createSampleDocument(1);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+    const seg = getEditorDocument()!.segments[0];
+
+    const prop1: CorrectionProposal = {
+      id: "prop-1",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "候補1",
+      evidence: [{ type: "dictionary" }],
+      explanation: "説明1",
+    };
+    const prop2: CorrectionProposal = {
+      id: "prop-2",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "候補2",
+      evidence: [{ type: "context" }],
+      explanation: "説明2",
+    };
+
+    const map = new Map<string, CorrectionProposal[]>();
+    map.set(seg.id, [prop1, prop2]);
+    setActiveProposalsForTest(map);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const rejectBtns = document.querySelectorAll<HTMLButtonElement>(".btn-reject-proposal");
+    expect(rejectBtns.length).toBe(2);
+
+    // 1件目を却下クリック
+    rejectBtns[0].click();
+
+    // prop1 は消え、prop2 だけが維持される
+    const remaining = getActiveProposals().get(seg.id);
+    expect(remaining).toHaveLength(1);
+    expect(remaining![0].id).toBe("prop-2");
+
+    // ドキュメントは一切不変
+    expect(seg.text).toBe("これはセグメント 1 のテキストです。");
+    expect(seg.status).toBe("raw");
+    expect(isEditorDirty()).toBe(false);
+  });
+
+  it("Case J: Manual text edit in textarea marks proposal as stale and disables apply button", () => {
+    const doc = createSampleDocument(1);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+    const seg = getEditorDocument()!.segments[0];
+
+    const prop: CorrectionProposal = {
+      id: "prop-1",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "補正テキスト",
+      evidence: [{ type: "dictionary" }],
+      explanation: "説明",
+    };
+
+    const map = new Map<string, CorrectionProposal[]>();
+    map.set(seg.id, [prop]);
+    setActiveProposalsForTest(map);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const textarea = document.querySelector<HTMLTextAreaElement>(".segment-text-input")!;
+    const applyBtnBefore = document.querySelector<HTMLButtonElement>(".btn-apply-proposal")!;
+    expect(applyBtnBefore.disabled).toBe(false);
+
+    // ユーザーが手動編集
+    textarea.value = "手動で書き直した文章";
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+
+    // proposal card が再描画されて Stale 表示になり、ボタンが無効化されること
+    const staleTag = document.querySelector<HTMLElement>(".proposal-stale-tag");
+    expect(staleTag).not.toBeNull();
+    expect(staleTag!.textContent).toContain("Stale");
+
+    const applyBtnAfter = document.querySelector<HTMLButtonElement>(".btn-apply-proposal")!;
+    expect(applyBtnAfter.disabled).toBe(true);
+
+    // 無効化されたボタンをクリックしても採用されないこと
+    applyBtnAfter.click();
+    expect(seg.text).toBe("手動で書き直した文章");
+    expect(getActiveProposals().has(seg.id)).toBe(true);
+  });
+
+  it("Case L: HTML escaping - untrusted strings in proposals cannot execute or inject raw tags into DOM", () => {
+    const doc = createSampleDocument(1);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+    const seg = getEditorDocument()!.segments[0];
+
+    const xssProposal: CorrectionProposal = {
+      id: "prop-xss",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "<img src=x onerror=alert(1)>危険テキスト",
+      evidence: [
+        { type: "dictionary", sourceId: "<script>alert(2)</script>", description: "<b>危険説明</b>" },
+      ],
+      explanation: "<script>alert('xss')</script>説明文",
+    };
+
+    const map = new Map<string, CorrectionProposal[]>();
+    map.set(seg.id, [xssProposal]);
+    setActiveProposalsForTest(map);
+
+    document.body.innerHTML = renderEditorPage();
+
+    // DOM内に script タグや onerror 属性を持つ img タグが存在しないこと
+    expect(document.querySelector("script")).toBeNull();
+    expect(document.querySelector("img[onerror]")).toBeNull();
+
+    // テキストとして安全にエスケープされてレンダリングされていること
+    expect(document.body.innerHTML).toContain("&lt;script&gt;alert('xss')&lt;/script&gt;");
+    expect(document.body.innerHTML).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(document.body.innerHTML).toContain("&lt;b&gt;危険説明&lt;/b&gt;");
+  });
+
+  it("Case P: Attribute quote breakout defense - proposal.id payloads cannot create new attributes or inject handlers", () => {
+    const doc = createSampleDocument(1);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+    const seg = getEditorDocument()!.segments[0];
+
+    const breakoutProposal1: CorrectionProposal = {
+      id: 'abc" onmouseover="alert(1)',
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "安全な補正テキスト1",
+      evidence: [{ type: "dictionary" }],
+      explanation: "説明1",
+    };
+
+    const breakoutProposal2: CorrectionProposal = {
+      id: "'><img src=x onerror=alert(1)>",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "安全な補正テキスト2",
+      evidence: [{ type: "context" }],
+      explanation: "説明2",
+    };
+
+    const map = new Map<string, CorrectionProposal[]>();
+    map.set(seg.id, [breakoutProposal1, breakoutProposal2]);
+    setActiveProposalsForTest(map);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    // 1. 新規属性（onmouseover）が作られていないこと
+    const elementsWithMouseOver = document.querySelectorAll("[onmouseover]");
+    expect(elementsWithMouseOver.length).toBe(0);
+
+    // 2. img / script タグが生成されていないこと
+    expect(document.querySelector("img")).toBeNull();
+    expect(document.querySelector("script")).toBeNull();
+
+    // 3. dataset / 属性を通じて安全に proposal.id が取得でき、採用処理が正常に動作すること
+    const applyBtns = document.querySelectorAll<HTMLButtonElement>(".btn-apply-proposal");
+    expect(applyBtns.length).toBe(2);
+
+    // 1件目 (abc" onmouseover="alert(1)) の採用ボタンをクリック
+    applyBtns[0].click();
+
+    expect(seg.text).toBe("安全な補正テキスト1");
+    expect(getActiveProposals().has(seg.id)).toBe(false);
+  });
+
+  it("Case N: Lifecycle - setEditorDocument and discardEditorChanges clear active proposals, but Save preserves them", async () => {
+    const doc = createSampleDocument(1);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+    const seg = doc.segments[0];
+
+    const prop: CorrectionProposal = {
+      id: "prop-1",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "補正テキスト",
+      evidence: [{ type: "dictionary" }],
+      explanation: "説明",
+    };
+
+    const map = new Map<string, CorrectionProposal[]>();
+    map.set(seg.id, [prop]);
+    setActiveProposalsForTest(map);
+    expect(getActiveProposals().size).toBe(1);
+
+    // 1. setEditorDocument でクリアされる
+    setEditorDocument(doc, "C:\\new.asrc.json");
+    expect(getActiveProposals().size).toBe(0);
+
+    // 2. discardEditorChanges でクリアされる
+    setActiveProposalsForTest(new Map([[seg.id, [prop]]]));
+    expect(getActiveProposals().size).toBe(1);
+    discardEditorChanges();
+    expect(getActiveProposals().size).toBe(0);
+
+    // 3. 通常の保存 (Save) では保持される
+    setEditorDocument(doc, "C:\\test.asrc.json");
+    setActiveProposalsForTest(new Map([[seg.id, [prop]]]));
+
+    const mockInvoke = vi.fn().mockResolvedValue(true);
+    setEditorInvoke(mockInvoke);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const saveBtn = document.getElementById("btnEditorSave") as HTMLButtonElement;
+    saveBtn.click();
+    await Promise.resolve();
+
+    expect(getActiveProposals().size).toBe(1);
+    expect(getActiveProposals().get(seg.id)![0].id).toBe("prop-1");
+  });
+
+  it("Case O: Mock correction button in toolbar generates mock proposals and updates DOM", async () => {
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    expect(document.querySelectorAll(".proposal-card").length).toBe(0);
+
+    const mockBtn = document.getElementById("btnEditorMockCorrection") as HTMLButtonElement;
+    expect(mockBtn).not.toBeNull();
+
+    mockBtn.click();
+    await Promise.resolve();
+
+    // 提案カードがDOMにレンダリングされる
+    const proposalCards = document.querySelectorAll(".proposal-card");
+    expect(proposalCards.length).toBeGreaterThan(0);
+    expect(getActiveProposals().size).toBeGreaterThan(0);
+  });
+
+  it("Case Q: 11-step E2E Correction Workflow Scenario (Steps 1-11)", async () => {
+    // 準備: 2セグメントの保存済みドキュメント
+    const doc = createSampleDocument(2);
+    setEditorDocument(doc, "C:\\test.asrc.json");
+
+    const mockInvoke = vi.fn().mockResolvedValue(true);
+    setEditorInvoke(mockInvoke);
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    // Step 1: 正本エディターで「補正候補テスト」を押す
+    const mockBtn = document.getElementById("btnEditorMockCorrection") as HTMLButtonElement;
+    mockBtn.click();
+    await Promise.resolve();
+
+    // Step 2: 提案カードが表示される
+    const proposalCards = document.querySelectorAll(".proposal-card");
+    expect(proposalCards.length).toBeGreaterThanOrEqual(2);
+
+    // Step 3: 根拠バッジと簡易diffが見える
+    const badge = document.querySelector(".evidence-badge");
+    const diff = document.querySelector(".proposal-diff");
+    expect(badge).not.toBeNull();
+    expect(diff).not.toBeNull();
+    expect(diff!.innerHTML).toContain("diff-");
+
+    // セグメント0に2件の提案をセットして複数提案の挙動を検証
+    const seg0 = getEditorDocument()!.segments[0];
+    const seg1 = getEditorDocument()!.segments[1];
+    const initialOrigText0 = seg0.originalText;
+
+    const prop0A: CorrectionProposal = {
+      id: "prop-0A",
+      segmentId: seg0.id,
+      originalText: seg0.text,
+      correctedText: "セグメント0補正テキストA",
+      evidence: [{ type: "dictionary", description: "辞書A" }],
+      explanation: "説明A",
+    };
+    const prop0B: CorrectionProposal = {
+      id: "prop-0B",
+      segmentId: seg0.id,
+      originalText: seg0.text,
+      correctedText: "セグメント0補正テキストB",
+      evidence: [{ type: "context" }],
+      explanation: "説明B",
+    };
+    const prop1A: CorrectionProposal = {
+      id: "prop-1A",
+      segmentId: seg1.id,
+      originalText: seg1.text,
+      correctedText: "セグメント1補正テキストA",
+      evidence: [{ type: "background" }],
+      explanation: "説明1A",
+    };
+
+    setActiveProposalsForTest(new Map([
+      [seg0.id, [prop0A, prop0B]],
+      [seg1.id, [prop1A]],
+    ]));
+
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    // Step 4: 1件を採用する (prop-0A)
+    const applyBtn0A = document.querySelector<HTMLButtonElement>(`button.btn-apply-proposal[data-proposal-id="prop-0A"]`)!;
+    applyBtn0A.click();
+
+    // Step 5: segment.textが変わり、そのセグメントがedited
+    expect(seg0.text).toBe("セグメント0補正テキストA");
+    expect(seg0.originalText).toBe(initialOrigText0);
+    expect(seg0.status).toBe("edited");
+
+    // Step 6: 全体が未保存になる
+    expect(isEditorDirty()).toBe(true);
+    expect(document.getElementById("editorStatusContainer")?.textContent).toContain("未保存");
+
+    // Step 7: 同一セグメントの他proposal (prop-0B) が消える
+    expect(getActiveProposals().has(seg0.id)).toBe(false);
+    expect(document.querySelectorAll(`[data-proposal-id="prop-0B"]`).length).toBe(0);
+
+    // Step 8: 別のproposal (prop-1A) を却下して本文が変わらない
+    const initialText1 = seg1.text;
+    const rejectBtn1A = document.querySelector<HTMLButtonElement>(`button.btn-reject-proposal[data-proposal-id="prop-1A"]`)!;
+    rejectBtn1A.click();
+    expect(seg1.text).toBe(initialText1);
+    expect(getActiveProposals().has(seg1.id)).toBe(false);
+
+    // Step 9: proposal表示中に本文を手動編集してStale表示・採用不可になる
+    const propStaleTest: CorrectionProposal = {
+      id: "prop-stale-test",
+      segmentId: seg1.id,
+      originalText: seg1.text,
+      correctedText: "新しい提案",
+      evidence: [{ type: "context" }],
+      explanation: "説明",
+    };
+    setActiveProposalsForTest(new Map([[seg1.id, [propStaleTest]]]));
+    document.body.innerHTML = renderEditorPage();
+    bindEditorEvents();
+
+    const textarea1 = document.querySelectorAll<HTMLTextAreaElement>(".segment-text-input")[1];
+    textarea1.value = "手動変更した文章";
+    textarea1.dispatchEvent(new Event("input", { bubbles: true }));
+
+    const staleTag = document.querySelector(".proposal-stale-tag");
+    expect(staleTag).not.toBeNull();
+    expect(staleTag!.textContent).toContain("Stale");
+
+    const staleApplyBtn = document.querySelector<HTMLButtonElement>(`button.btn-apply-proposal[data-proposal-id="prop-stale-test"]`)!;
+    expect(staleApplyBtn.disabled).toBe(true);
+    staleApplyBtn.click();
+    expect(seg1.text).toBe("手動変更した文章"); // 上書きされない
+
+    // Step 10: 保存してもproposalが保持される
+    const saveBtn = document.getElementById("btnEditorSave") as HTMLButtonElement;
+    saveBtn.click();
+    await Promise.resolve();
+    expect(getActiveProposals().size).toBe(1);
+    expect(getActiveProposals().has(seg1.id)).toBe(true);
+
+    // Step 11: Document切替または破棄でproposalが消える
+    discardEditorChanges();
+    expect(getActiveProposals().size).toBe(0);
+  });
+});
+
 

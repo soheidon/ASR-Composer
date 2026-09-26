@@ -6,6 +6,18 @@ import {
 } from "./transcript";
 import { showAppConfirm, showAppDialog } from "./status";
 import { escapeHtml } from "./docker";
+import {
+  applyProposal,
+  rejectProposal,
+  validateProposal,
+  deriveTextChanges,
+  createCorrectionRequest,
+  MockCorrectionProvider,
+  cloneTranscriptDocument,
+  escapeAttr,
+  parseCorrectionProposals,
+  type CorrectionProposal,
+} from "./correction";
 
 // Tauri invokeラッパー型
 type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -27,11 +39,18 @@ async function invokeTauri<T>(command: string, args?: Record<string, unknown>): 
 let currentDoc: TranscriptDocument | null = null;
 let savedBaselineDoc: TranscriptDocument | null = null;
 let currentFilePath: string | null = null;
+let activeProposals = new Map<string, CorrectionProposal[]>();
 
-function cloneTranscriptDocument<T>(doc: T): T {
-  return typeof structuredClone === "function"
-    ? structuredClone(doc)
-    : (JSON.parse(JSON.stringify(doc)) as T);
+export function getActiveProposals(): Map<string, CorrectionProposal[]> {
+  return activeProposals;
+}
+
+export function clearActiveProposalsForTest(): void {
+  activeProposals.clear();
+}
+
+export function setActiveProposalsForTest(proposals: Map<string, CorrectionProposal[]>): void {
+  activeProposals = proposals;
 }
 
 export function getEditorDocument(): TranscriptDocument | null {
@@ -43,6 +62,7 @@ export function getSavedBaselineDoc(): TranscriptDocument | null {
 }
 
 export function getEditorFilePath(): string | null {
+
   return currentFilePath;
 }
 
@@ -81,6 +101,7 @@ export async function confirmDiscardChanges(): Promise<boolean> {
  * - 未保存の新規作成: エディター状態をすべて null へリセット（isDirty = false）
  */
 export function discardEditorChanges(): void {
+  activeProposals.clear();
   if (currentFilePath !== null && savedBaselineDoc !== null) {
     currentDoc = cloneTranscriptDocument(savedBaselineDoc);
   } else {
@@ -97,6 +118,7 @@ export function discardEditorChanges(): void {
  * filePath がある場合はディスクから読み込まれた保存済み状態とする。
  */
 export function setEditorDocument(doc: TranscriptDocument | null, filePath: string | null = null): void {
+  activeProposals.clear();
   if (doc === null) {
     currentDoc = null;
     savedBaselineDoc = null;
@@ -172,6 +194,10 @@ export function renderEditorPage(): string {
             <span class="material-symbols-outlined">folder_open</span>
             開く
           </button>
+          <button class="btn btn-secondary" id="btnEditorMockCorrection" type="button" title="補正候補のモックテスト (Phase 1)">
+            <span class="material-symbols-outlined">auto_fix_high</span>
+            補正候補テスト
+          </button>
           <button class="btn btn-secondary" id="btnEditorSaveAs" type="button" title="名前を付けて保存">
             <span class="material-symbols-outlined">save_as</span>
             名前を付けて保存
@@ -191,19 +217,160 @@ export function renderEditorPage(): string {
   `;
 }
 
+/**
+ * セグメントの補正候補ボックスをレンダリングする
+ * - HTML escaping: すべてのLLM由来文字列（originalText, correctedText, explanation, evidence, diff chunks）をエスケープ
+ * - Validation & Stale: 描画時に validateProposal(prop, seg) を再評価し、Stale/Warning/Invalid を判定
+ */
+export function renderProposalBox(seg: TranscriptSegment): string {
+  const proposals = activeProposals.get(seg.id);
+  if (!proposals || proposals.length === 0) return "";
+
+  const proposalItems = proposals.map((prop) => {
+    const val = validateProposal(prop, seg);
+    const isStale = prop.originalText !== seg.text;
+    const changes = deriveTextChanges(prop.originalText, prop.correctedText);
+
+    const evidenceBadges = prop.evidence.map((ev) => {
+      const typeLabel = ev.type === "dictionary" ? "辞書" : ev.type === "background" ? "背景" : "文脈";
+      const desc = ev.description ? `: ${escapeHtml(ev.description)}` : ev.sourceId ? `: ${escapeHtml(ev.sourceId)}` : "";
+      return `<span class="evidence-badge evidence-badge-${escapeAttr(ev.type)}">[${typeLabel}${desc}]</span>`;
+    }).join(" ");
+
+    const diffHtml = changes.length > 0
+      ? changes.map((ch) => {
+          const delPart = ch.from ? `<del class="diff-del">${escapeHtml(ch.from)}</del>` : "";
+          const insPart = ch.to ? `<ins class="diff-ins">${escapeHtml(ch.to)}</ins>` : "";
+          return `<span class="diff-chunk">${delPart} &rarr; ${insPart}</span>`;
+        }).join(" ")
+      : `<span class="diff-chunk">&rarr; <ins class="diff-ins">${escapeHtml(prop.correctedText)}</ins></span>`;
+
+    const warningBadges = val.warnings.map((w) => {
+      const label = w === "LARGE_CHANGE" ? "⚠️ 変更大" : "⚠️ 曖昧な置換";
+      return `<span class="proposal-warning-tag">${label}</span>`;
+    }).join(" ");
+
+    const explanationHtml = prop.explanation
+      ? `<div class="proposal-explanation">${escapeHtml(prop.explanation)}</div>`
+      : "";
+
+    const staleHtml = isStale
+      ? `<div class="proposal-stale-tag">⚠️ 本文が変更されたため無効 (Stale)</div>`
+      : "";
+
+    const applyDisabled = isStale || !val.valid ? "disabled" : "";
+
+    return `
+      <div class="proposal-card" data-proposal-id="${escapeAttr(prop.id)}">
+        <div class="proposal-header">
+          <div class="proposal-badges">
+            ${evidenceBadges}
+            ${warningBadges}
+          </div>
+          <div class="proposal-actions">
+            <button class="btn btn-sm btn-primary btn-apply-proposal" type="button" data-proposal-id="${escapeAttr(prop.id)}" data-segment-id="${escapeAttr(seg.id)}" ${applyDisabled}>採用</button>
+            <button class="btn btn-sm btn-secondary btn-reject-proposal" type="button" data-proposal-id="${escapeAttr(prop.id)}" data-segment-id="${escapeAttr(seg.id)}">却下</button>
+          </div>
+        </div>
+        <div class="proposal-diff">
+          ${diffHtml}
+        </div>
+        ${explanationHtml}
+        ${staleHtml}
+      </div>
+    `;
+  }).join("");
+
+  return `
+    <div class="segment-proposals-container">
+      <div class="segment-proposals-header">
+        <span class="material-symbols-outlined proposal-icon">tips_and_updates</span>
+        <span class="proposal-header-title">補正候補 (${proposals.length}件)</span>
+      </div>
+      <div class="segment-proposals-list">
+        ${proposalItems}
+      </div>
+    </div>
+  `;
+}
+
+function refreshSegmentCardProposal(card: HTMLElement, seg: TranscriptSegment): void {
+  const container = card.querySelector<HTMLElement>(".segment-proposals-container");
+  const newHtml = renderProposalBox(seg);
+  if (container) {
+    if (newHtml) {
+      container.outerHTML = newHtml;
+    } else {
+      container.remove();
+    }
+  } else if (newHtml) {
+    card.querySelector(".segment-card-body")?.insertAdjacentHTML("beforeend", newHtml);
+  }
+}
+
+export function renderSegmentsList(): void {
+  const list = document.getElementById("editorSegmentsList");
+  if (!list || !currentDoc) return;
+  list.innerHTML = currentDoc.segments
+    .map((seg, idx) => renderSegmentCard(seg, idx))
+    .join("");
+}
+
+export function generateMockFixturesForDoc(doc: TranscriptDocument): CorrectionProposal[] {
+  const fixtures: CorrectionProposal[] = [];
+  if (doc.segments.length > 0) {
+    const s0 = doc.segments[0];
+    const text0 = s0.text;
+    const corrected0 = text0.includes("です")
+      ? text0.replace(/です/g, "でございます")
+      : `${text0}（確認済）`;
+
+    fixtures.push({
+      id: `prop-${s0.id}-1`,
+      segmentId: s0.id,
+      originalText: text0,
+      correctedText: corrected0,
+      evidence: [
+        { type: "dictionary", sourceId: "dict-sample", description: "標準敬語辞書" },
+        { type: "context", description: "文末敬体の一貫性" },
+      ],
+      explanation: "丁寧表現および文脈に基づく補正候補（モック）",
+      confidence: 0.95,
+    });
+
+    if (doc.segments.length > 1) {
+      const s1 = doc.segments[1];
+      const text1 = s1.text;
+      fixtures.push({
+        id: `prop-${s1.id}-1`,
+        segmentId: s1.id,
+        originalText: text1,
+        correctedText: `${text1}（背景補正）`,
+        evidence: [
+          { type: "background", description: "面接概要資料" },
+        ],
+        explanation: "背景情報に基づく補正候補（モック）",
+        confidence: 0.88,
+      });
+    }
+  }
+  return fixtures;
+}
+
 function renderSegmentCard(seg: TranscriptSegment, index: number): string {
   const timeRange = `${formatTimestamp(seg.start)} - ${formatTimestamp(seg.end)}`;
   const statusLabel = seg.status === "edited" ? "編集済" : "原文";
   const statusClass = seg.status === "edited" ? "segment-status-edited" : "segment-status-raw";
   const speakerValue = seg.speaker ?? "";
+  const proposalsHtml = renderProposalBox(seg);
 
   return `
-    <div class="segment-card" data-index="${index}" data-segment-id="${seg.id}">
+    <div class="segment-card" data-index="${index}" data-segment-id="${escapeAttr(seg.id)}">
       <div class="segment-card-header">
         <div class="segment-time-wrap">
           <span class="material-symbols-outlined segment-time-icon">schedule</span>
           <span class="segment-time-text">${timeRange}</span>
-          <span class="segment-id-tag">${seg.id}</span>
+          <span class="segment-id-tag">${escapeHtml(seg.id)}</span>
         </div>
         <div class="segment-status-wrap">
           <span class="segment-status-badge ${statusClass}" data-segment-status>${statusLabel}</span>
@@ -215,7 +382,7 @@ function renderSegmentCard(seg: TranscriptSegment, index: number): string {
           <input
             type="text"
             class="segment-speaker-input"
-            value="${escapeHtml(speakerValue)}"
+            value="${escapeAttr(speakerValue)}"
             placeholder="話者名（例: SPEAKER_00）"
             data-field="speaker"
           />
@@ -229,6 +396,7 @@ function renderSegmentCard(seg: TranscriptSegment, index: number): string {
             data-field="text"
           >${escapeHtml(seg.text)}</textarea>
         </div>
+        ${proposalsHtml}
       </div>
     </div>
   `;
@@ -270,10 +438,87 @@ export function bindEditorEvents(onNavigate?: (page: any) => Promise<void>): voi
         badge.textContent = newStatus === "edited" ? "編集済" : "原文";
       }
 
+      // 補正候補の Stale 判定とボタン状態を更新
+      refreshSegmentCardProposal(card, seg);
+
       // ドキュメントのDirtyバッジ更新
       updateDirtyBadge();
     });
+
+    // 補正候補の採用・却下クリック
+    list.addEventListener("click", async (event) => {
+      const target = event.target as HTMLElement;
+      const applyBtn = target.closest<HTMLElement>(".btn-apply-proposal");
+      if (applyBtn && currentDoc) {
+        const proposalId = applyBtn.dataset.proposalId;
+        const segmentId = applyBtn.dataset.segmentId;
+        if (!proposalId || !segmentId) return;
+
+        const proposals = activeProposals.get(segmentId);
+        const prop = proposals?.find((p) => p.id === proposalId);
+        if (prop) {
+          const res = applyProposal(prop, currentDoc, activeProposals);
+          if (res.ok) {
+            renderSegmentsList();
+            updateDirtyBadge();
+          } else {
+            await showAppDialog({
+              title: "採用不可",
+              message: `補正候補を採用できませんでした: ${res.error}`,
+              type: "error",
+            });
+          }
+        }
+        return;
+      }
+
+      const rejectBtn = target.closest<HTMLElement>(".btn-reject-proposal");
+      if (rejectBtn) {
+        const proposalId = rejectBtn.dataset.proposalId;
+        const segmentId = rejectBtn.dataset.segmentId;
+        if (!proposalId || !segmentId) return;
+
+        rejectProposal(proposalId, segmentId, activeProposals);
+        renderSegmentsList();
+        return;
+      }
+    });
   }
+
+  // 補正候補テストボタン (Phase 1 Mock)
+  document.getElementById("btnEditorMockCorrection")?.addEventListener("click", async () => {
+    if (!currentDoc || currentDoc.segments.length === 0) {
+      await showAppDialog({
+        title: "情報",
+        message: "補正対象のセグメントがありません。",
+        type: "info",
+      });
+      return;
+    }
+
+    const mockFixtures = generateMockFixturesForDoc(currentDoc);
+    const provider = new MockCorrectionProvider(mockFixtures);
+    const request = createCorrectionRequest(currentDoc);
+    const rawProposals = await provider.correct(request);
+
+    // ランタイム shape validation を適用
+    const { proposals: parsedProposals, discardedCount } = parseCorrectionProposals(rawProposals);
+    if (discardedCount > 0) {
+      console.warn(`不正な形式の補正候補を ${discardedCount} 件破棄しました`);
+    }
+
+    activeProposals.clear();
+    for (const p of parsedProposals) {
+      const seg = currentDoc.segments.find((s) => s.id === p.segmentId);
+      const val = validateProposal(p, seg);
+      if (val.valid) {
+        const existing = activeProposals.get(p.segmentId) || [];
+        existing.push(p);
+        activeProposals.set(p.segmentId, existing);
+      }
+    }
+    renderSegmentsList();
+  });
 
   // 保存ボタン
   document.getElementById("btnEditorSave")?.addEventListener("click", async () => {
