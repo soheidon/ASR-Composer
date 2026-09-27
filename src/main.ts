@@ -47,6 +47,7 @@ import {
 } from "./correction-settings";
 import {
   runCorrectionForDocument,
+  formatCorrectionProgress,
   type CorrectionProposal,
   type CorrectionMode,
 } from "./correction";
@@ -571,6 +572,10 @@ const transcribePage = `
         <h3 class="section-header">
           <span class="section-title">文字起こし結果</span>
           <span id="correctionStatusBadge" style="margin-left: 12px; font-size: 13px; font-weight: normal; color: var(--color-primary, #2563eb); display: none;"></span>
+          <button class="btn btn-secondary btn-sm" id="btnCancelAutoCorrection" type="button" style="display: none; margin-left: 8px; font-size: 12px; padding: 2px 8px; height: 26px;">
+            <span class="material-symbols-outlined" style="font-size: 16px;">cancel</span>
+            キャンセル
+          </button>
         </h3>
         <textarea class="result-textarea" id="resultText" readonly rows="15"></textarea>
         <div class="saved-files-info" id="savedFilesInfo" style="display:none"></div>
@@ -2507,6 +2512,10 @@ export function getLastTranscriptionDocumentForTest(): TranscriptDocument | null
   return lastTranscriptionDocument;
 }
 
+export function bindResultButtonsForTest(): void {
+  bindResultButtons();
+}
+
 function isCurrentAutoCorrectionRun(
   correctionRunId: string,
   generation: number,
@@ -2533,10 +2542,15 @@ export async function runAsrAutoCorrection(
   activeAutoCorrectionGeneration = generation;
 
   const badgeEl = document.getElementById("correctionStatusBadge");
+  const cancelAutoBtn = document.getElementById("btnCancelAutoCorrection") as HTMLButtonElement | null;
+
   if (badgeEl && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
-    badgeEl.textContent = "補正候補を生成中...";
+    badgeEl.textContent = "LLM補正準備中...";
     badgeEl.style.display = "inline-block";
     badgeEl.style.color = "var(--color-primary, #2563eb)";
+  }
+  if (cancelAutoBtn && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+    cancelAutoBtn.style.display = "inline-flex";
   }
 
   try {
@@ -2549,6 +2563,9 @@ export async function runAsrAutoCorrection(
       console.warn("自動LLM補正: プロバイダーまたはモデルが解決できないためスキップします");
       if (badgeEl && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
         badgeEl.style.display = "none";
+      }
+      if (cancelAutoBtn && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+        cancelAutoBtn.style.display = "none";
       }
       return;
     }
@@ -2584,6 +2601,9 @@ export async function runAsrAutoCorrection(
         badgeEl.style.display = "inline-block";
         badgeEl.style.color = "#dc2626";
       }
+      if (cancelAutoBtn && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+        cancelAutoBtn.style.display = "none";
+      }
       return;
     }
 
@@ -2602,6 +2622,14 @@ export async function runAsrAutoCorrection(
       context,
       mode: resolved.mode,
       isCancelled: () => !isCurrentAutoCorrectionRun(correctionRunId, generation, doc),
+      onProgress: (progress) => {
+        if (!isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) return;
+        if (badgeEl) {
+          badgeEl.textContent = `LLM補正中: ${formatCorrectionProgress(progress)}`;
+          badgeEl.style.display = "inline-block";
+          badgeEl.style.color = "var(--color-primary, #2563eb)";
+        }
+      },
     });
 
     if (result.status === "cancelled" || !isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
@@ -2632,6 +2660,10 @@ export async function runAsrAutoCorrection(
         badgeEl.style.color = "#dc2626";
       }
     }
+  } finally {
+    if (cancelAutoBtn && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+      cancelAutoBtn.style.display = "none";
+    }
   }
 }
 
@@ -2645,6 +2677,10 @@ function displayTranscriptionResult(result: TranscriptionResult): void {
   if (badgeEl) {
     badgeEl.style.display = "none";
     badgeEl.textContent = "";
+  }
+  const cancelAutoBtn = document.getElementById("btnCancelAutoCorrection") as HTMLButtonElement | null;
+  if (cancelAutoBtn) {
+    cancelAutoBtn.style.display = "none";
   }
   const textArea = document.getElementById("resultText") as HTMLTextAreaElement | null;
   if (textArea) {
@@ -2703,6 +2739,22 @@ function bindResultButtons(): void {
     });
     if (path) {
       await invokeTauri("save_text_file", { path, content: textArea.value });
+    }
+  });
+
+  document.getElementById("btnCancelAutoCorrection")?.addEventListener("click", () => {
+    if (activeAutoCorrectionRunId) {
+      activeAutoCorrectionRunId = null;
+      const badgeEl = document.getElementById("correctionStatusBadge");
+      const cancelAutoBtn = document.getElementById("btnCancelAutoCorrection") as HTMLButtonElement | null;
+      if (badgeEl) {
+        badgeEl.textContent = "補正をキャンセルしました";
+        badgeEl.style.display = "inline-block";
+        badgeEl.style.color = "var(--on-surface-variant)";
+      }
+      if (cancelAutoBtn) {
+        cancelAutoBtn.style.display = "none";
+      }
     }
   });
   document.getElementById("openEditorBtn")?.addEventListener("click", async () => {

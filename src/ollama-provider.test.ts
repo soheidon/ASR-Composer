@@ -344,4 +344,99 @@ describe("OllamaCorrectionProvider", () => {
     expect(capturedSystemPrompt).toContain("【補正モード: 積極修正 (aggressive)】");
     expect(capturedSystemPrompt).not.toContain("【補正モード: 最小修正 (minimal)】");
   });
+
+  it("Test B, C, D, E, F: 31セグメント（3チャンク）の進捗通知シーケンス・対象範囲・保守的パーセンテージ検証", async () => {
+    const segs = Array.from({ length: 31 }, (_, i) => createDummySegment(`seg-${i + 1}`, `テキスト ${i + 1}`));
+    const doc = createDummyDoc(segs);
+
+    const mock = async () => ({
+      message: { role: "assistant", content: JSON.stringify({ proposals: [] }) },
+    });
+
+    const provider = new OllamaCorrectionProvider({ invokeTauri: mock as any });
+    const progressList: any[] = [];
+
+    await provider.correct(createCorrectionRequest(doc), (p) => progressList.push(p));
+
+    // 各チャンクごとに送信前(1) + 完了後(1) = 2回、計 3 chunks * 2 = 6回
+    expect(progressList).toHaveLength(6);
+
+    // Chunk 1 前: Batch 1/3, Segments 1-15, completed=0/31 -> 0%
+    expect(progressList[0]).toMatchObject({
+      phase: "running",
+      currentChunk: 1,
+      completedChunks: 0,
+      totalChunks: 3,
+      completedSegments: 0,
+      totalSegments: 31,
+      segmentStart: 1,
+      segmentEnd: 15,
+      percentage: 0,
+    });
+
+    // Chunk 1 後: Batch 1/3, completed=15/31 -> 48%
+    expect(progressList[1]).toMatchObject({
+      phase: "running",
+      currentChunk: 1,
+      completedChunks: 1,
+      totalChunks: 3,
+      completedSegments: 15,
+      totalSegments: 31,
+      segmentStart: 1,
+      segmentEnd: 15,
+      percentage: 48, // Math.floor(15/31*100) = 48
+    });
+
+    // Chunk 2 前: Batch 2/3, Segments 16-30, completed=15/31 -> 48%
+    expect(progressList[2]).toMatchObject({
+      phase: "running",
+      currentChunk: 2,
+      completedChunks: 1,
+      totalChunks: 3,
+      completedSegments: 15,
+      totalSegments: 31,
+      segmentStart: 16,
+      segmentEnd: 30,
+      percentage: 48,
+    });
+
+    // Chunk 2 後: Batch 2/3, completed=30/31 -> 96%
+    expect(progressList[3]).toMatchObject({
+      phase: "running",
+      currentChunk: 2,
+      completedChunks: 2,
+      totalChunks: 3,
+      completedSegments: 30,
+      totalSegments: 31,
+      segmentStart: 16,
+      segmentEnd: 30,
+      percentage: 96,
+    });
+
+    // Chunk 3 前: Batch 3/3, Segments 31-31, completed=30/31 -> 96%
+    expect(progressList[4]).toMatchObject({
+      phase: "running",
+      currentChunk: 3,
+      completedChunks: 2,
+      totalChunks: 3,
+      completedSegments: 30,
+      totalSegments: 31,
+      segmentStart: 31,
+      segmentEnd: 31,
+      percentage: 96,
+    });
+
+    // Chunk 3 後: Batch 3/3, completed=31/31 -> 100% (最終完了時のみ100%)
+    expect(progressList[5]).toMatchObject({
+      phase: "running",
+      currentChunk: 3,
+      completedChunks: 3,
+      totalChunks: 3,
+      completedSegments: 31,
+      totalSegments: 31,
+      segmentStart: 31,
+      segmentEnd: 31,
+      percentage: 100,
+    });
+  });
 });

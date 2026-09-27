@@ -144,7 +144,7 @@ export interface CorrectionRequest {
 export interface CorrectionProvider {
   correct(
     request: CorrectionRequest,
-    onProgress?: (completed: number, total: number) => void
+    onProgress?: CorrectionProgressCallback
   ): Promise<CorrectionProposal[]>;
 }
 
@@ -861,6 +861,100 @@ export function rejectProposal(
 }
 
 /**
+ * 補正実行の進捗フェーズ
+ */
+export type CorrectionProgressPhase = "starting" | "running" | "completed";
+
+/**
+ * 統一進捗データ構造 (Correction Execution Layer主導・Provider非依存)
+ */
+export interface CorrectionProgress {
+  /** 実行フェーズ */
+  phase: CorrectionProgressPhase;
+  /** 現在処理中のチャンク番号 (1-based, starting/completed時はnull) */
+  currentChunk: number | null;
+  /** 完了済みチャンク数 */
+  completedChunks: number;
+  /** 全チャンク数 (starting時はnull、0 segment時は0、running/completed時はProvider等の値) */
+  totalChunks: number | null;
+  /** 完了済みセグメント数 */
+  completedSegments: number;
+  /** 全補正対象セグメント数 */
+  totalSegments: number;
+  /** 進捗率 (0〜100 の整数) */
+  percentage: number;
+  /** 現在の対象セグメント開始位置 (1-based, targetSegmentsのみ、running時以外はnull) */
+  segmentStart: number | null;
+  /** 現在の対象セグメント終了位置 (1-based, targetSegmentsのみ、running時以外はnull) */
+  segmentEnd: number | null;
+}
+
+export type CorrectionProgressCallback = (progress: CorrectionProgress) => void;
+
+/**
+ * CorrectionProgress オブジェクトを安全に生成するヘルパー関数
+ */
+export function createCorrectionProgress(params: {
+  phase: CorrectionProgressPhase;
+  currentChunk?: number | null;
+  completedChunks: number;
+  totalChunks?: number | null;
+  completedSegments: number;
+  totalSegments: number;
+  segmentStart?: number | null;
+  segmentEnd?: number | null;
+}): CorrectionProgress {
+  const {
+    phase,
+    currentChunk = null,
+    completedChunks,
+    totalChunks = null,
+    completedSegments,
+    totalSegments,
+    segmentStart = null,
+    segmentEnd = null,
+  } = params;
+
+  let percentage = 0;
+  if (phase === "completed" || totalSegments === 0) {
+    percentage = 100;
+  } else if (totalSegments > 0) {
+    percentage = Math.floor((completedSegments / totalSegments) * 100);
+  }
+
+  return {
+    phase,
+    currentChunk: phase === "running" ? (currentChunk ?? null) : null,
+    completedChunks,
+    totalChunks: phase === "starting" ? (totalChunks ?? null) : (totalChunks ?? null),
+    completedSegments,
+    totalSegments,
+    percentage,
+    segmentStart: phase === "running" ? (segmentStart ?? null) : null,
+    segmentEnd: phase === "running" ? (segmentEnd ?? null) : null,
+  };
+}
+
+/**
+ * CorrectionProgress オブジェクトを人間が読みやすい文字列にフォーマットする
+ */
+export function formatCorrectionProgress(p: CorrectionProgress): string {
+  if (p.phase === "starting") {
+    return "準備中... 0%";
+  }
+  if (p.phase === "completed") {
+    return "完了 (100%)";
+  }
+  if (p.currentChunk != null && p.totalChunks != null && p.segmentStart != null && p.segmentEnd != null) {
+    return `Batch ${p.currentChunk}/${p.totalChunks} (${p.segmentStart}–${p.segmentEnd}) ${p.percentage}%`;
+  }
+  if (p.currentChunk != null && p.totalChunks != null) {
+    return `Batch ${p.currentChunk}/${p.totalChunks} ${p.percentage}%`;
+  }
+  return `${p.percentage}%`;
+}
+
+/**
  * Phase 1 Mock Provider（決定論的 fixture 返却）
  */
 export class MockCorrectionProvider implements CorrectionProvider {
@@ -870,8 +964,26 @@ export class MockCorrectionProvider implements CorrectionProvider {
     this.fixtures = fixtures;
   }
 
-  async correct(request: CorrectionRequest): Promise<CorrectionProposal[]> {
+  async correct(
+    request: CorrectionRequest,
+    onProgress?: CorrectionProgressCallback
+  ): Promise<CorrectionProposal[]> {
     const validSegmentIds = new Set(request.document.segments.map((s) => s.id));
+    const totalSegs = request.document.segments.length;
+    if (onProgress && totalSegs > 0) {
+      onProgress(
+        createCorrectionProgress({
+          phase: "running",
+          currentChunk: 1,
+          completedChunks: 1,
+          totalChunks: 1,
+          completedSegments: totalSegs,
+          totalSegments: totalSegs,
+          segmentStart: 1,
+          segmentEnd: totalSegs,
+        })
+      );
+    }
     return this.fixtures.filter((f) => validSegmentIds.has(f.segmentId));
   }
 }
@@ -883,7 +995,7 @@ export interface RunCorrectionOptions {
   context?: CorrectionContext;
   mode?: CorrectionMode;
   isCancelled?: () => boolean;
-  onProgress?: (completed: number, total: number) => void;
+  onProgress?: CorrectionProgressCallback;
 }
 
 export type RunCorrectionResult =
@@ -899,8 +1011,56 @@ export async function runCorrectionForDocument(
     return { status: "cancelled" };
   }
 
+  const totalSegments = document.segments.length;
+
+  // 0セグメントドキュメントの場合: Providerを呼ばずクリーンに即座成功
+  if (totalSegments === 0) {
+    if (onProgress && !isCancelled()) {
+      onProgress(
+        createCorrectionProgress({
+          phase: "completed",
+          completedChunks: 0,
+          totalChunks: 0,
+          completedSegments: 0,
+          totalSegments: 0,
+        })
+      );
+    }
+    const emptyMap = new Map<string, CorrectionProposal[]>();
+    if (onSuccess && !isCancelled()) {
+      onSuccess(emptyMap);
+    }
+    return { status: "success", proposals: emptyMap };
+  }
+
+  // 開始進捗通知 (phase: 'starting') - Provider固有のchunkingは推測せず totalChunks: null
+  if (onProgress && !isCancelled()) {
+    onProgress(
+      createCorrectionProgress({
+        phase: "starting",
+        completedChunks: 0,
+        totalChunks: null,
+        completedSegments: 0,
+        totalSegments,
+      })
+    );
+  }
+
+  let lastReportedTotalChunks: number | null = null;
+  let lastReportedCompletedChunks = 0;
+
+  const wrappedOnProgress: CorrectionProgressCallback | undefined = onProgress
+    ? (progress: CorrectionProgress) => {
+        if (progress.totalChunks != null) {
+          lastReportedTotalChunks = progress.totalChunks;
+        }
+        lastReportedCompletedChunks = progress.completedChunks;
+        onProgress(progress);
+      }
+    : undefined;
+
   const request = createCorrectionRequest(document, dictionary, context, mode);
-  const proposals = await provider.correct(request, onProgress);
+  const proposals = await provider.correct(request, wrappedOnProgress);
 
   if (isCancelled()) {
     return { status: "cancelled" };
@@ -921,6 +1081,20 @@ export async function runCorrectionForDocument(
 
   if (isCancelled()) {
     return { status: "cancelled" };
+  }
+
+  // 完了進捗通知 (phase: 'completed')
+  if (onProgress && !isCancelled()) {
+    const finalTotalChunks = lastReportedTotalChunks ?? (totalSegments > 0 ? 1 : 0);
+    onProgress(
+      createCorrectionProgress({
+        phase: "completed",
+        completedChunks: lastReportedCompletedChunks || finalTotalChunks,
+        totalChunks: finalTotalChunks,
+        completedSegments: totalSegments,
+        totalSegments,
+      })
+    );
   }
 
   if (onSuccess) {

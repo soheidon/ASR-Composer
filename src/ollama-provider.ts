@@ -6,6 +6,8 @@ import {
   type CorrectionContext,
   type CorrectionMode,
   DEFAULT_CORRECTION_MODE,
+  type CorrectionProgressCallback,
+  createCorrectionProgress,
   parseRawProposalCandidates,
   validateProposalCandidate,
   promoteCandidateToProposal,
@@ -227,7 +229,7 @@ export class OllamaCorrectionProvider implements CorrectionProvider {
 
   async correct(
     request: CorrectionRequest,
-    onProgress?: (completed: number, total: number) => void
+    onProgress?: CorrectionProgressCallback
   ): Promise<CorrectionProposal[]> {
     const segments = request.document.segments;
     if (segments.length === 0) {
@@ -235,6 +237,7 @@ export class OllamaCorrectionProvider implements CorrectionProvider {
     }
 
     const totalChunks = Math.ceil(segments.length / CHUNK_SIZE);
+    let completedSegments = 0;
     const allProposals: CorrectionProposal[] = [];
     const allSegmentsMap = new Map(segments.map((s) => [s.id, s]));
 
@@ -250,6 +253,22 @@ export class OllamaCorrectionProvider implements CorrectionProvider {
       const targetStart = chunkIdx * CHUNK_SIZE;
       const targetEnd = Math.min((chunkIdx + 1) * CHUNK_SIZE, segments.length);
       const targetSegments = segments.slice(targetStart, targetEnd);
+
+      // バッチ送信前の進捗通知 (phase: 'running', percentageは前バッチまでの完了率)
+      if (onProgress && !this.isCancelledFn?.()) {
+        onProgress(
+          createCorrectionProgress({
+            phase: "running",
+            currentChunk: chunkIdx + 1,
+            completedChunks: chunkIdx,
+            totalChunks,
+            completedSegments,
+            totalSegments: segments.length,
+            segmentStart: targetStart + 1, // 1-based index (targetSegmentsのみ)
+            segmentEnd: targetEnd,         // 1-based index (targetSegmentsのみ)
+          })
+        );
+      }
 
       const contextBeforeStart = Math.max(0, targetStart - CONTEXT_BEFORE);
       const contextBefore = segments.slice(contextBeforeStart, targetStart);
@@ -375,8 +394,23 @@ export class OllamaCorrectionProvider implements CorrectionProvider {
         }
       }
 
+      // バッチ成功時に completedSegments を加算
+      completedSegments += targetSegments.length;
+
+      // バッチ成功後の進捗通知 (phase: 'running')
       if (onProgress && !this.isCancelledFn?.()) {
-        onProgress(chunkIdx + 1, totalChunks);
+        onProgress(
+          createCorrectionProgress({
+            phase: "running",
+            currentChunk: chunkIdx + 1,
+            completedChunks: chunkIdx + 1,
+            totalChunks,
+            completedSegments,
+            totalSegments: segments.length,
+            segmentStart: targetStart + 1,
+            segmentEnd: targetEnd,
+          })
+        );
       }
     }
 

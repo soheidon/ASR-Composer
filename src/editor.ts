@@ -14,6 +14,7 @@ import {
   cloneTranscriptDocument,
   escapeAttr,
   runCorrectionForDocument,
+  formatCorrectionProgress,
   type CorrectionProposal,
   type CorrectionProvider,
   type CorrectionDictionaryEntry,
@@ -578,10 +579,10 @@ export async function runLlmCorrection(): Promise<void> {
         context,
         mode,
         isCancelled,
-        onProgress: (completed, total) => {
+        onProgress: (progress) => {
           if (isCancelled()) return;
           if (btnLlm && runId === currentActiveRunId) {
-            btnLlm.innerHTML = `<span class="material-symbols-outlined">sync</span> 補正中 (${completed}/${total})...`;
+            btnLlm.innerHTML = `<span class="material-symbols-outlined">sync</span> 補正中: ${formatCorrectionProgress(progress)}`;
           }
         },
       },

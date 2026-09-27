@@ -20,6 +20,7 @@ import {
   fetchCorrectionModelsForSelect,
   updateCorrectionUiState,
   navigateTo,
+  bindResultButtonsForTest,
 } from "./main";
 import {
   resolveCorrectionProvider,
@@ -1284,5 +1285,96 @@ describe("Correction Workflow Integration (Codex Final Review Cases 1 - 8)", () 
     expect(multiSegmentDoc.segments.every((s) => s.speaker === null)).toBe(true);
     expect(multiSegmentDoc.segments.every((s) => s.originalSpeaker === null)).toBe(true);
     expect(multiSegmentDoc.segments.length).toBe(3);
+  });
+
+  it("Test P & Q: 自動補正時のバッジ進捗更新と明示的キャンセルボタンによる中断・既存Staging保持の検証", async () => {
+    document.body.innerHTML = `
+      <section id="resultSection">
+        <span id="correctionStatusBadge" style="display: none;"></span>
+        <button id="btnCancelAutoCorrection" style="display: none;"></button>
+        <textarea id="resultText"></textarea>
+        <button id="openEditorBtn"></button>
+      </section>
+    `;
+    bindResultButtonsForTest();
+
+    const doc = createDoc("auto-doc", "自動補正テストセグメント");
+    setLastTranscriptionDocumentForTest(doc);
+    setAsrGenerationForTest(1);
+
+    // 既存のStagingをセット
+    const existingProp: CorrectionProposal = {
+      id: "prop-existing",
+      segmentId: doc.segments[0].id,
+      originalText: doc.segments[0].text,
+      correctedText: "既存補正テキスト",
+      evidence: [{ type: "context" }],
+      explanation: "old",
+    };
+    const existingMap = new Map([[doc.segments[0].id, [existingProp]]]);
+    setPendingCorrectionResultForTest({
+      asrRunId: "job-old",
+      document: doc,
+      proposals: existingMap,
+      correctionRunId: "old-run",
+    });
+
+    let resolveSlowCall: (res: any) => void;
+    const mockInvoke = vi.fn().mockImplementation(async (cmd: string) => {
+      if (cmd === "load_api_settings") {
+        return createMockSettings({ correction_enabled: true });
+      }
+      if (cmd === "read_correction_context_files") {
+        return { dictionary_content: null, background_content: null };
+      }
+      if (cmd === "call_ollama_chat") {
+        return new Promise((resolve) => {
+          resolveSlowCall = resolve;
+        });
+      }
+      throw new Error(`Unhandled: ${cmd}`);
+    });
+    setTauriInvokeForTest(mockInvoke);
+
+    const badgeEl = document.getElementById("correctionStatusBadge") as HTMLElement;
+    const cancelBtn = document.getElementById("btnCancelAutoCorrection") as HTMLButtonElement;
+
+    // 自動補正開始
+    const autoPromise = runAsrAutoCorrection("job-new", doc, 1);
+
+    await vi.waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("call_ollama_chat", expect.any(Object));
+      expect(badgeEl.style.display).toBe("inline-block");
+      expect(cancelBtn.style.display).toBe("inline-flex");
+    });
+
+    // キャンセルボタン押下 (in-flightリクエスト中)
+    cancelBtn.click();
+
+    expect(badgeEl.textContent).toBe("補正をキャンセルしました");
+    expect(cancelBtn.style.display).toBe("none");
+
+    // 既存の Staging は 100% 保持されている
+    expect(getPendingCorrectionResultForTest()?.proposals.get(doc.segments[0].id)![0].id).toBe("prop-existing");
+
+    // 遅延したレスポンスが後から戻っても破棄される
+    resolveSlowCall!({
+      message: {
+        content: JSON.stringify([
+          {
+            segmentId: doc.segments[0].id,
+            originalText: doc.segments[0].text,
+            correctedText: "遅延提案",
+            evidence: [{ type: "context" }],
+            explanation: "stale",
+          },
+        ]),
+      },
+    });
+
+    await autoPromise;
+
+    // 依然として既存の Staging が保持されている
+    expect(getPendingCorrectionResultForTest()?.proposals.get(doc.segments[0].id)![0].id).toBe("prop-existing");
   });
 });

@@ -2234,6 +2234,233 @@ describe("Phase 1 LLM Correction UI Integration", () => {
       expect(badges[1].textContent).toBe("候補 2/2");
     });
   });
+
+  describe("Phase 2F: LLM Correction Progress, Logical Cancellation & Clean Re-run", () => {
+    it("Test I, L & O: エディター手動補正で進捗が表示され、全完了時に新Proposalで置換され再実行可能になる", async () => {
+      const doc = createSampleDocument(2);
+      setEditorDocument(doc, "C:\\test.asrc.json");
+
+      const existingProp: CorrectionProposal = {
+        id: "prop-old",
+        segmentId: doc.segments[0].id,
+        originalText: doc.segments[0].text,
+        correctedText: "これはセグメント 1 の古い補正です。",
+        evidence: [{ type: "context" }],
+        explanation: "old",
+      };
+      setActiveProposalsForTest(new Map([[doc.segments[0].id, [existingProp]]]));
+
+      const newProp: CorrectionProposal = {
+        id: "prop-new",
+        segmentId: doc.segments[0].id,
+        originalText: doc.segments[0].text,
+        correctedText: "これはセグメント 1 の新しい補正です。",
+        evidence: [{ type: "dictionary" }],
+        explanation: "new",
+      };
+
+      const mockProvider: any = {
+        correct: async (_req: any, onProgress?: any) => {
+          if (onProgress) {
+            onProgress({
+              phase: "running",
+              currentChunk: 1,
+              completedChunks: 1,
+              totalChunks: 1,
+              completedSegments: 2,
+              totalSegments: 2,
+              segmentStart: 1,
+              segmentEnd: 2,
+              percentage: 100,
+            });
+          }
+          return [newProp];
+        },
+      };
+      setCorrectionProviderForTest(mockProvider);
+
+      document.body.innerHTML = renderEditorPage();
+      bindEditorEvents();
+
+      const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+      btnLlm.click();
+      await vi.waitFor(() => {
+        expect(getActiveProposals().get(doc.segments[0].id)![0].id).toBe("prop-new");
+      });
+
+      // UIがリセットされ再実行可能
+      expect(btnLlm.disabled).toBe(false);
+      expect(btnLlm.textContent).toContain("LLM補正");
+    });
+
+    it("Test G, H, I: キャンセル時に既存Proposalが完全維持され、UIが即座に復帰し再実行可能になる", async () => {
+      const doc = createSampleDocument(2);
+      setEditorDocument(doc, "C:\\test.asrc.json");
+
+      const existingProp: CorrectionProposal = {
+        id: "prop-preserved",
+        segmentId: doc.segments[0].id,
+        originalText: doc.segments[0].text,
+        correctedText: "これはセグメント 1 の保持される補正です。",
+        evidence: [{ type: "context" }],
+        explanation: "preserved",
+      };
+      setActiveProposalsForTest(new Map([[doc.segments[0].id, [existingProp]]]));
+
+      let resolveSlowCall: (props: CorrectionProposal[]) => void;
+      const slowProvider: any = {
+        correct: async () => {
+          return new Promise((resolve) => {
+            resolveSlowCall = resolve;
+          });
+        },
+      };
+      setCorrectionProviderForTest(slowProvider);
+
+      document.body.innerHTML = renderEditorPage();
+      bindEditorEvents();
+
+      const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+      const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+
+      // 補正開始
+      btnLlm.click();
+      expect(btnLlm.disabled).toBe(true);
+      expect(btnCancel.style.display).toBe("inline-flex");
+
+      // キャンセル実行
+      btnCancel.click();
+
+      // UIが即座に復帰
+      expect(btnLlm.disabled).toBe(false);
+      expect(btnCancel.style.display).toBe("none");
+
+      // 既存提案が100%維持
+      expect(getActiveProposals().get(doc.segments[0].id)![0].id).toBe("prop-preserved");
+
+      // 遅延応答が後から到着しても破棄され既存提案を破壊しない
+      resolveSlowCall!([
+        {
+          id: "prop-stale-discarded",
+          segmentId: doc.segments[0].id,
+          originalText: doc.segments[0].text,
+          correctedText: "これはセグメント 1 の破棄される提案です。",
+          evidence: [{ type: "context" }],
+          explanation: "discarded",
+        },
+      ]);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(getActiveProposals().get(doc.segments[0].id)![0].id).toBe("prop-preserved");
+    });
+
+    it("Test J & M: エラー発生時に既存Proposalが維持され、UIが復帰し再実行可能になる", async () => {
+      const doc = createSampleDocument(1);
+      setEditorDocument(doc, "C:\\test.asrc.json");
+
+      const existingProp: CorrectionProposal = {
+        id: "prop-safe",
+        segmentId: doc.segments[0].id,
+        originalText: doc.segments[0].text,
+        correctedText: "これはセグメント 1 の安全な補正です。",
+        evidence: [{ type: "context" }],
+        explanation: "safe",
+      };
+      setActiveProposalsForTest(new Map([[doc.segments[0].id, [existingProp]]]));
+
+      const errorProvider: any = {
+        correct: async () => {
+          throw new Error("Ollama connection timeout");
+        },
+      };
+      setCorrectionProviderForTest(errorProvider);
+
+      document.body.innerHTML = renderEditorPage();
+      bindEditorEvents();
+
+      const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+      btnLlm.click();
+
+      await vi.waitFor(() => {
+        expect(btnLlm.disabled).toBe(false);
+      });
+
+      // 既存提案が維持されている
+      expect(getActiveProposals().get(doc.segments[0].id)![0].id).toBe("prop-safe");
+    });
+
+    it("Test N: Run A キャンセル → Run B 開始 → Run A 遅延応答が Run B の状態を汚染しない", async () => {
+      const doc = createSampleDocument(1);
+      setEditorDocument(doc, "C:\\test.asrc.json");
+
+      let resolveRunA: (props: CorrectionProposal[]) => void;
+      let resolveRunB: (props: CorrectionProposal[]) => void;
+      let callCount = 0;
+
+      const stagedProvider: any = {
+        correct: async () => {
+          callCount++;
+          if (callCount === 1) {
+            return new Promise((resolve) => {
+              resolveRunA = resolve;
+            });
+          } else {
+            return new Promise((resolve) => {
+              resolveRunB = resolve;
+            });
+          }
+        },
+      };
+      setCorrectionProviderForTest(stagedProvider);
+
+      document.body.innerHTML = renderEditorPage();
+      bindEditorEvents();
+
+      const btnLlm = document.getElementById("btnEditorLlmCorrection") as HTMLButtonElement;
+      const btnCancel = document.getElementById("btnEditorCancelCorrection") as HTMLButtonElement;
+
+      // Run A 開始
+      btnLlm.click();
+      expect(callCount).toBe(1);
+
+      // Run A キャンセル
+      btnCancel.click();
+
+      // Run B 開始
+      btnLlm.click();
+      expect(callCount).toBe(2);
+
+      // Run A の遅延応答が到着
+      resolveRunA!([
+        {
+          id: "prop-run-a",
+          segmentId: doc.segments[0].id,
+          originalText: doc.segments[0].text,
+          correctedText: "これはセグメント 1 の Run A テキストです。",
+          evidence: [{ type: "context" }],
+          explanation: "Run A",
+        },
+      ]);
+      await Promise.resolve();
+
+      // Run B の応答が到着
+      resolveRunB!([
+        {
+          id: "prop-run-b",
+          segmentId: doc.segments[0].id,
+          originalText: doc.segments[0].text,
+          correctedText: "これはセグメント 1 の Run B テキストです。",
+          evidence: [{ type: "context" }],
+          explanation: "Run B",
+        },
+      ]);
+
+      await vi.waitFor(() => {
+        expect(getActiveProposals().get(doc.segments[0].id)![0].id).toBe("prop-run-b");
+      });
+    });
+  });
 });
 
 

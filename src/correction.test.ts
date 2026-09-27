@@ -20,8 +20,11 @@ import {
   parseRawProposalCandidates,
   promoteCandidateToProposal,
   runCorrectionForDocument,
+  createCorrectionProgress,
+  formatCorrectionProgress,
   type CorrectionProposal,
   type CorrectionEvidence,
+  type CorrectionProgress,
 } from "./correction";
 import type { TranscriptDocument, TranscriptSegment } from "./transcript";
 
@@ -1224,6 +1227,132 @@ describe("runCorrectionForDocument (Shared Execution Core)", () => {
 
     const reqDefault = createCorrectionRequest(doc);
     expect(reqDefault.mode).toBe(DEFAULT_CORRECTION_MODE);
+  });
+
+  it("Test A & E: 0セグメントドキュメントは Provider を呼ばずクリーンに即座成功し、不正な Batch 0/0 を出さない", async () => {
+    const doc = createDummyDocument([]); // 0 segments
+    let providerCalled = false;
+    const provider: any = {
+      correct: async () => {
+        providerCalled = true;
+        return [];
+      },
+    };
+
+    const progressList: CorrectionProgress[] = [];
+    const result = await runCorrectionForDocument({
+      document: doc,
+      provider,
+      onProgress: (p) => progressList.push(p),
+    });
+
+    expect(result.status).toBe("success");
+    expect(providerCalled).toBe(false);
+    expect(progressList).toHaveLength(1);
+    expect(progressList[0].phase).toBe("completed");
+    expect(progressList[0].percentage).toBe(100);
+    expect(progressList[0].totalChunks).toBe(0);
+    expect(progressList[0].currentChunk).toBeNull();
+    expect(formatCorrectionProgress(progressList[0])).toBe("完了 (100%)");
+  });
+
+  it("Test A & B & C & D: runCorrectionForDocument は starting (totalChunks=null) -> running (Provider固有totalChunks) -> completed の順で通知する", async () => {
+    const segments = Array.from({ length: 31 }, (_, i) =>
+      createDummySegment({ id: `seg-${i + 1}`, text: `セグメント ${i + 1}` })
+    );
+    const doc = createDummyDocument(segments);
+
+    const progressList: CorrectionProgress[] = [];
+    const provider = new MockCorrectionProvider();
+    const result = await runCorrectionForDocument({
+      document: doc,
+      provider,
+      onProgress: (p) => progressList.push(p),
+    });
+
+    expect(result.status).toBe("success");
+    expect(progressList.length).toBeGreaterThanOrEqual(3);
+
+    // Starting: phase='starting', currentChunk=null, totalChunks=null, percentage=0
+    expect(progressList[0].phase).toBe("starting");
+    expect(progressList[0].currentChunk).toBeNull();
+    expect(progressList[0].totalChunks).toBeNull(); // execution layerはProvider固有のチャンク数を推測しない
+    expect(progressList[0].percentage).toBe(0);
+    expect(progressList[0].totalSegments).toBe(31);
+    expect(formatCorrectionProgress(progressList[0])).toBe("準備中... 0%");
+
+    // Running (MockProvider): MockProvider自身のセマンティクスに従い totalChunks=1
+    expect(progressList[1].phase).toBe("running");
+    expect(progressList[1].currentChunk).toBe(1);
+    expect(progressList[1].totalChunks).toBe(1);
+    expect(progressList[1].totalSegments).toBe(31);
+    expect(formatCorrectionProgress(progressList[1])).toBe("Batch 1/1 (1–31) 100%");
+
+    // Completed: phase='completed', percentage=100, totalChunks=1
+    const last = progressList[progressList.length - 1];
+    expect(last.phase).toBe("completed");
+    expect(last.percentage).toBe(100);
+    expect(last.totalChunks).toBe(1);
+    expect(last.completedSegments).toBe(31);
+    expect(formatCorrectionProgress(last)).toBe("完了 (100%)");
+  });
+});
+
+describe("CorrectionProgress schema & formatCorrectionProgress", () => {
+  it("createCorrectionProgress: starting 状態のプロパティ検証 (currentChunk=null, totalChunks=null, percentage=0, range=null)", () => {
+    const p = createCorrectionProgress({
+      phase: "starting",
+      completedChunks: 0,
+      totalChunks: null,
+      completedSegments: 0,
+      totalSegments: 270,
+    });
+    expect(p.phase).toBe("starting");
+    expect(p.currentChunk).toBeNull();
+    expect(p.completedChunks).toBe(0);
+    expect(p.totalChunks).toBeNull();
+    expect(p.percentage).toBe(0);
+    expect(p.segmentStart).toBeNull();
+    expect(p.segmentEnd).toBeNull();
+    expect(formatCorrectionProgress(p)).toBe("準備中... 0%");
+  });
+
+  it("createCorrectionProgress: running 状態のプロパティ検証 (Batch 4/18, Segments 46-60, completedSegments=45/270 -> 16%)", () => {
+    const p = createCorrectionProgress({
+      phase: "running",
+      currentChunk: 4,
+      completedChunks: 3,
+      totalChunks: 18,
+      completedSegments: 45, // 前バッチ(3*15=45)までの完了セグメント数
+      totalSegments: 270,
+      segmentStart: 46,
+      segmentEnd: 60,
+    });
+    expect(p.phase).toBe("running");
+    expect(p.currentChunk).toBe(4);
+    expect(p.completedChunks).toBe(3);
+    expect(p.totalChunks).toBe(18);
+    expect(p.percentage).toBe(16); // Math.floor(45 / 270 * 100) = 16% (保守的計算)
+    expect(p.segmentStart).toBe(46);
+    expect(p.segmentEnd).toBe(60);
+    expect(formatCorrectionProgress(p)).toBe("Batch 4/18 (46–60) 16%");
+  });
+
+  it("createCorrectionProgress: completed 状態のプロパティ検証 (100% 完了)", () => {
+    const p = createCorrectionProgress({
+      phase: "completed",
+      completedChunks: 18,
+      totalChunks: 18,
+      completedSegments: 270,
+      totalSegments: 270,
+    });
+    expect(p.phase).toBe("completed");
+    expect(p.currentChunk).toBeNull();
+    expect(p.totalChunks).toBe(18);
+    expect(p.percentage).toBe(100);
+    expect(p.segmentStart).toBeNull();
+    expect(p.segmentEnd).toBeNull();
+    expect(formatCorrectionProgress(p)).toBe("完了 (100%)");
   });
 });
 
