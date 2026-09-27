@@ -381,6 +381,248 @@ export function deriveTextChanges(originalText: string, correctedText: string): 
   ];
 }
 
+export type DiffOpType = "equal" | "delete" | "insert";
+
+export interface DiffOp {
+  type: DiffOpType;
+  text: string;
+}
+
+export type DiffMode = "precise" | "coarse";
+
+export interface ComputeDiffResult {
+  ops: DiffOp[];
+  mode: DiffMode;
+}
+
+export interface SideBySideDiffResult {
+  originalHtml: string;
+  correctedHtml: string;
+  diffOps: DiffOp[];
+  mode: DiffMode;
+}
+
+/**
+ * LCS DP テーブルの最大セル数上限 (N * M)。
+ * 200,000セル（例: 400文字 × 500文字 程度）以下の場合のみ精密LCSを実行する。
+ * これを超える場合は同期描画のUIフリーズ・メモリ枯渇を防ぐため安全な O(N + M) フォールバックdiffに移行する。
+ */
+export const MAX_LCS_CELLS = 200_000;
+
+/**
+ * LCS DP 計算の片側最大書記素数上限。
+ * 片側が2,000文字を超える場合はセル数に関わらずフォールバックdiffに移行する。
+ */
+export const MAX_LCS_GRAPHEMES = 2_000;
+
+/**
+ * 文字列を安全なGrapheme（書記素クラスタ）配列に分割する。
+ * - Intl.Segmenter が利用可能な環境では ZWJ結合絵文字（👨‍👩‍👧‍👦）や異体字セレクタを完全保持
+ * - フォールバック（または useIntlSegmenter=false）として Array.from(text) （Unicode code point単位）を使用
+ */
+export function splitGraphemes(
+  text: string,
+  useIntlSegmenter: boolean = true
+): string[] {
+  if (
+    useIntlSegmenter &&
+    typeof Intl !== "undefined" &&
+    typeof (Intl as any).Segmenter === "function"
+  ) {
+    const segmenter = new (Intl as any).Segmenter(undefined, { granularity: "grapheme" });
+    return Array.from(segmenter.segment(text), (s: any) => s.segment);
+  }
+  return Array.from(text);
+}
+
+/**
+ * Unicode Grapheme 単位の文字シーケンスdiffを計算する。
+ * - `splitGraphemes(text)` でサロゲートペアやZWJ結合絵文字を保護
+ * - 先頭・末尾の共通部分（Common Prefix / Suffix）をO(min(n, m))でトリミングして高速化
+ * - 制限チェック（MAX_LCS_CELLS, MAX_LCS_GRAPHEMES）:
+ *   - 制限内: O(N*M) 精密LCS DPテーブルを構築し、複数箇所の離れた差分を精密抽出 (mode: "precise")
+ *   - 制限超過: DPテーブルを一切割り当てず、中央部全体を1ブロックの置換として安全にフォールバック (mode: "coarse")
+ * - 連続する同種操作（equal, delete, insert）をマージして出力
+ */
+export function computeCharacterDiff(
+  originalText: string,
+  correctedText: string,
+  options?: {
+    maxCells?: number;
+    maxGraphemes?: number;
+    useIntlSegmenter?: boolean;
+  }
+): ComputeDiffResult {
+  const maxCells = options?.maxCells ?? MAX_LCS_CELLS;
+  const maxGraphemes = options?.maxGraphemes ?? MAX_LCS_GRAPHEMES;
+  const useIntl = options?.useIntlSegmenter ?? true;
+
+  if (originalText === correctedText) {
+    return {
+      ops: originalText.length > 0 ? [{ type: "equal", text: originalText }] : [],
+      mode: "precise",
+    };
+  }
+
+  const origChars = splitGraphemes(originalText, useIntl);
+  const corrChars = splitGraphemes(correctedText, useIntl);
+
+  let prefixLen = 0;
+  while (
+    prefixLen < origChars.length &&
+    prefixLen < corrChars.length &&
+    origChars[prefixLen] === corrChars[prefixLen]
+  ) {
+    prefixLen++;
+  }
+
+  let suffixLen = 0;
+  while (
+    suffixLen < origChars.length - prefixLen &&
+    suffixLen < corrChars.length - prefixLen &&
+    origChars[origChars.length - 1 - suffixLen] === corrChars[corrChars.length - 1 - suffixLen]
+  ) {
+    suffixLen++;
+  }
+
+  const midOrig = origChars.slice(prefixLen, origChars.length - suffixLen);
+  const midCorr = corrChars.slice(prefixLen, corrChars.length - suffixLen);
+
+  const n = midOrig.length;
+  const m = midCorr.length;
+
+  const rawOps: DiffOp[] = [];
+
+  if (prefixLen > 0) {
+    rawOps.push({ type: "equal", text: origChars.slice(0, prefixLen).join("") });
+  }
+
+  let mode: DiffMode = "precise";
+
+  if (n === 0 && m > 0) {
+    rawOps.push({ type: "insert", text: midCorr.join("") });
+  } else if (m === 0 && n > 0) {
+    rawOps.push({ type: "delete", text: midOrig.join("") });
+  } else if (n > 0 && m > 0) {
+    const totalCells = n * m;
+
+    // Hard Upper Bound Check: DP 配列アロケーション前に必ず判定
+    if (n > maxGraphemes || m > maxGraphemes || totalCells > maxCells) {
+      mode = "coarse"; // 安全なフォールバック (O(N+M) メモリ)
+      rawOps.push({ type: "delete", text: midOrig.join("") });
+      rawOps.push({ type: "insert", text: midCorr.join("") });
+    } else {
+      // DP テーブルの構築 (LCS)
+      const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+
+      for (let i = 1; i <= n; i++) {
+        for (let j = 1; j <= m; j++) {
+          if (midOrig[i - 1] === midCorr[j - 1]) {
+            dp[i][j] = dp[i - 1][j - 1] + 1;
+          } else {
+            dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+          }
+        }
+      }
+
+      // バックトラックで diff シーケンスを再構築
+      let i = n;
+      let j = m;
+      const midOps: DiffOp[] = [];
+
+      while (i > 0 || j > 0) {
+        if (i > 0 && j > 0 && midOrig[i - 1] === midCorr[j - 1]) {
+          midOps.push({ type: "equal", text: midOrig[i - 1] });
+          i--;
+          j--;
+        } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+          midOps.push({ type: "insert", text: midCorr[j - 1] });
+          j--;
+        } else if (i > 0) {
+          midOps.push({ type: "delete", text: midOrig[i - 1] });
+          i--;
+        }
+      }
+
+      midOps.reverse();
+      rawOps.push(...midOps);
+    }
+  }
+
+  if (suffixLen > 0) {
+    rawOps.push({
+      type: "equal",
+      text: origChars.slice(origChars.length - suffixLen).join(""),
+    });
+  }
+
+  // 連続する同種操作をマージ
+  const mergedOps: DiffOp[] = [];
+  for (const op of rawOps) {
+    if (op.text.length === 0) continue;
+    if (mergedOps.length > 0 && mergedOps[mergedOps.length - 1].type === op.type) {
+      mergedOps[mergedOps.length - 1].text += op.text;
+    } else {
+      mergedOps.push({ ...op });
+    }
+  }
+
+  return {
+    ops: mergedOps,
+    mode,
+  };
+}
+
+/**
+ * 補正前テキスト（proposal.originalText）と補正後テキスト（proposal.correctedText）の差分を抽出し、
+ * 左右それぞれのHTML表示用文字列を生成する。
+ * - computeCharacterDiff による Bounded Unicode-safe 文字シーケンスLCS diff
+ * - 左右両方で HTML 特殊文字を厳格にエスケープ
+ * - 変更・置換部分のみを <del class="diff-del">（左）と <ins class="diff-ins">（右）でハイライト
+ * - 複数箇所の離れた変更もそれぞれの箇所で独立してハイライト
+ */
+export function renderSideBySideDiff(
+  originalText: string,
+  correctedText: string,
+  options?: {
+    maxCells?: number;
+    maxGraphemes?: number;
+    useIntlSegmenter?: boolean;
+  }
+): SideBySideDiffResult {
+  const escape = (text: string) =>
+    text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
+  const { ops: diffOps, mode } = computeCharacterDiff(originalText, correctedText, options);
+
+  let originalHtml = "";
+  let correctedHtml = "";
+
+  for (const op of diffOps) {
+    const escapedText = escape(op.text);
+    if (op.type === "equal") {
+      originalHtml += escapedText;
+      correctedHtml += escapedText;
+    } else if (op.type === "delete") {
+      originalHtml += `<del class="diff-del">${escapedText}</del>`;
+    } else if (op.type === "insert") {
+      correctedHtml += `<ins class="diff-ins">${escapedText}</ins>`;
+    }
+  }
+
+  return {
+    originalHtml,
+    correctedHtml,
+    diffOps,
+    mode,
+  };
+}
+
 const VALID_EVIDENCE_TYPES = new Set<CorrectionEvidenceType>(["dictionary", "background", "context"]);
 
 /**

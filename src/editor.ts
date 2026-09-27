@@ -10,7 +10,7 @@ import {
   applyProposal,
   rejectProposal,
   validateProposal,
-  deriveTextChanges,
+  renderSideBySideDiff,
   cloneTranscriptDocument,
   escapeAttr,
   runCorrectionForDocument,
@@ -311,15 +311,18 @@ export function renderEditorPage(): string {
  * セグメントの補正候補ボックスをレンダリングする
  * - HTML escaping: すべてのLLM由来文字列（originalText, correctedText, explanation, evidence, diff chunks）をエスケープ
  * - Validation & Stale: 描画時に validateProposal(prop, seg) を再評価し、Stale/Warning/Invalid を判定
+ * - 左右比較レビューUI (Phase 2E):
+ *   - 左カラム「補正前」: proposal.originalText (LLM投入時スナップショット) を削除部分ハイライト付きで表示
+ *   - 右カラム「LLM補正後」: proposal.correctedText を追加部分ハイライト付きで表示
  */
 export function renderProposalBox(seg: TranscriptSegment): string {
   const proposals = activeProposals.get(seg.id);
   if (!proposals || proposals.length === 0) return "";
 
-  const proposalItems = proposals.map((prop) => {
+  const proposalItems = proposals.map((prop, pIdx) => {
     const val = validateProposal(prop, seg);
     const isStale = prop.originalText !== seg.text;
-    const changes = deriveTextChanges(prop.originalText, prop.correctedText);
+    const diff = renderSideBySideDiff(prop.originalText, prop.correctedText);
 
     const evidenceBadges = prop.evidence.map((ev) => {
       const typeLabel = ev.type === "dictionary" ? "辞書" : ev.type === "background" ? "背景" : "文脈";
@@ -327,13 +330,9 @@ export function renderProposalBox(seg: TranscriptSegment): string {
       return `<span class="evidence-badge evidence-badge-${escapeAttr(ev.type)}">[${typeLabel}${desc}]</span>`;
     }).join(" ");
 
-    const diffHtml = changes.length > 0
-      ? changes.map((ch) => {
-          const delPart = ch.from ? `<del class="diff-del">${escapeHtml(ch.from)}</del>` : "";
-          const insPart = ch.to ? `<ins class="diff-ins">${escapeHtml(ch.to)}</ins>` : "";
-          return `<span class="diff-chunk">${delPart} &rarr; ${insPart}</span>`;
-        }).join(" ")
-      : `<span class="diff-chunk">&rarr; <ins class="diff-ins">${escapeHtml(prop.correctedText)}</ins></span>`;
+    const confidenceBadge = prop.confidence !== undefined
+      ? `<span class="confidence-badge">信頼度: ${Math.round(prop.confidence * 100)}%</span>`
+      : "";
 
     const warningBadges = val.warnings.map((w) => {
       const label = w === "LARGE_CHANGE" ? "⚠️ 変更大" : "⚠️ 曖昧な置換";
@@ -341,29 +340,42 @@ export function renderProposalBox(seg: TranscriptSegment): string {
     }).join(" ");
 
     const explanationHtml = prop.explanation
-      ? `<div class="proposal-explanation">${escapeHtml(prop.explanation)}</div>`
+      ? `<div class="proposal-explanation"><span class="proposal-explanation-label">💡 補正理由:</span> ${escapeHtml(prop.explanation)}</div>`
       : "";
 
     const staleHtml = isStale
-      ? `<div class="proposal-stale-tag">⚠️ 本文が変更されたため無効 (Stale)</div>`
+      ? `<div class="proposal-stale-tag">⚠️ 現在の正本文が変更されたため無効 (Stale)</div>`
       : "";
 
     const applyDisabled = isStale || !val.valid ? "disabled" : "";
+
+    const proposalNumberBadge = proposals.length > 1
+      ? `<span class="proposal-number-badge">候補 ${pIdx + 1}/${proposals.length}</span>`
+      : "";
 
     return `
       <div class="proposal-card" data-proposal-id="${escapeAttr(prop.id)}">
         <div class="proposal-header">
           <div class="proposal-badges">
+            ${proposalNumberBadge}
             ${evidenceBadges}
             ${warningBadges}
+            ${confidenceBadge}
           </div>
           <div class="proposal-actions">
             <button class="btn btn-sm btn-primary btn-apply-proposal" type="button" data-proposal-id="${escapeAttr(prop.id)}" data-segment-id="${escapeAttr(seg.id)}" ${applyDisabled}>採用</button>
             <button class="btn btn-sm btn-secondary btn-reject-proposal" type="button" data-proposal-id="${escapeAttr(prop.id)}" data-segment-id="${escapeAttr(seg.id)}">却下</button>
           </div>
         </div>
-        <div class="proposal-diff">
-          ${diffHtml}
+        <div class="proposal-side-by-side">
+          <div class="proposal-col proposal-col-before">
+            <div class="proposal-col-title">補正前</div>
+            <div class="proposal-col-text">${diff.originalHtml}</div>
+          </div>
+          <div class="proposal-col proposal-col-after">
+            <div class="proposal-col-title">LLM補正後</div>
+            <div class="proposal-col-text">${diff.correctedHtml}</div>
+          </div>
         </div>
         ${explanationHtml}
         ${staleHtml}

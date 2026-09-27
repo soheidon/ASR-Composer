@@ -2417,40 +2417,99 @@ html, body {
   border-radius: 4px;
 }
 
-.proposal-diff {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 13px;
-  padding: 6px 10px;
-  background: var(--surface-container-low, #f1f5f9);
-  border-radius: 4px;
-  margin-bottom: 6px;
-  display: flex;
-  flex-wrap: wrap;
+.proposal-number-badge {
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface-container-high, #e2e8f0);
+  color: var(--on-surface, #1e293b);
+  border: 1px solid var(--outline-variant, #cbd5e1);
 }
 
-.diff-del {
+.confidence-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #f1f5f9;
+  color: #475569;
+  border: 1px solid #cbd5e1;
+}
+
+.proposal-side-by-side {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 8px 0;
+}
+
+@media (max-width: 640px) {
+  .proposal-side-by-side {
+    grid-template-columns: 1fr;
+  }
+}
+
+.proposal-col {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-container-low, #f8fafc);
+  border: 1px solid var(--outline-variant, #e2e8f0);
+  border-radius: 6px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+
+.proposal-col-before {
+  border-left: 3px solid #f87171;
+}
+
+.proposal-col-after {
+  border-left: 3px solid #34d399;
+}
+
+.proposal-col-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--on-surface-variant, #64748b);
+  margin-bottom: 4px;
+  letter-spacing: 0.05em;
+}
+
+.proposal-col-before .proposal-col-title {
   color: #b91c1c;
-  background: #fee2e2;
-  text-decoration: line-through;
-  padding: 1px 4px;
-  border-radius: 2px;
 }
 
-.diff-ins {
+.proposal-col-after .proposal-col-title {
   color: #15803d;
-  background: #dcfce7;
-  text-decoration: none;
-  font-weight: 600;
-  padding: 1px 4px;
-  border-radius: 2px;
+}
+
+.proposal-col-text {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--on-surface, #1e293b);
+  word-break: break-word;
+  white-space: pre-wrap;
+  font-family: inherit;
 }
 
 .proposal-explanation {
   font-size: 12px;
   color: var(--on-surface-variant, #64748b);
-  line-height: 1.4;
+  line-height: 1.5;
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: var(--surface-container-low, #f8fafc);
+  border-radius: 4px;
+}
+
+.proposal-explanation-label {
+  font-weight: 600;
+  color: var(--on-surface, #334155);
 }
 
 .btn-editor-cancel-correction {

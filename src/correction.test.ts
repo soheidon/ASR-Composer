@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
   deriveTextChanges,
+  renderSideBySideDiff,
+  computeCharacterDiff,
+  splitGraphemes,
+  MAX_LCS_CELLS,
+  MAX_LCS_GRAPHEMES,
   validateProposal,
   applyProposal,
   rejectProposal,
@@ -90,6 +95,189 @@ describe("deriveTextChanges (簡易diff)", () => {
     expect(deriveTextChanges("あいうえお", "かきくけこ")).toEqual([
       { from: "あいうえお", to: "かきくけこ" },
     ]);
+  });
+});
+
+describe("renderSideBySideDiff & computeCharacterDiff (Unicode・複数箇所分離diff)", () => {
+  it("Case A: 単一置換: 変更箇所のみがマークアップされ、前後は通常テキスト", () => {
+    const res = renderSideBySideDiff("児童せいしん科", "児童精神科");
+    expect(res.originalHtml).toBe('児童<del class="diff-del">せいしん</del>科');
+    expect(res.correctedHtml).toBe('児童<ins class="diff-ins">精神</ins>科');
+  });
+
+  it("Case B: 複数離れた箇所の置換: 各変更箇所が独立して分離され、中間の共通文字列は未変更として維持される", () => {
+    const before = "このけんきゅうでは児童せいしん科について去年調べました";
+    const after = "この研究では児童精神科について昨年調べました";
+    const res = renderSideBySideDiff(before, after);
+
+    expect(res.originalHtml).toBe(
+      'この<del class="diff-del">けんきゅう</del>では児童<del class="diff-del">せいしん</del>科について<del class="diff-del">去</del>年調べました'
+    );
+    expect(res.correctedHtml).toBe(
+      'この<ins class="diff-ins">研究</ins>では児童<ins class="diff-ins">精神</ins>科について<ins class="diff-ins">昨</ins>年調べました'
+    );
+  });
+
+  it("Case C: 挿入・削除・置換の混在: 正確に各操作を分離してハイライトする", () => {
+    const before = "今日は雨でした";
+    const after = "明日は大雨でしょう";
+    const res = renderSideBySideDiff(before, after);
+
+    expect(res.originalHtml).toBe('<del class="diff-del">今</del>日は雨でし<del class="diff-del">た</del>');
+    expect(res.correctedHtml).toBe('<ins class="diff-ins">明</ins>日は<ins class="diff-ins">大</ins>雨でし<ins class="diff-ins">ょう</ins>');
+  });
+
+  it("Case D: 完全一致: ハイライトタグなしでエスケープされたテキストを返す", () => {
+    const res = renderSideBySideDiff("こんにちは世界", "こんにちは世界");
+    expect(res.originalHtml).toBe("こんにちは世界");
+    expect(res.correctedHtml).toBe("こんにちは世界");
+    expect(res.diffOps).toEqual([{ type: "equal", text: "こんにちは世界" }]);
+  });
+
+  it("Case E: 全文置換: 全体が delete と insert になる", () => {
+    const res = renderSideBySideDiff("あいうえお", "かきくけこ");
+    expect(res.originalHtml).toBe('<del class="diff-del">あいうえお</del>');
+    expect(res.correctedHtml).toBe('<ins class="diff-ins">かきくけこ</ins>');
+  });
+
+  it("Case F: 絵文字・サロゲートペア (Unicode Code Points): サロゲートペアを破壊せずに正しくdiffする", () => {
+    const before = "🙂テスト👨‍👩‍👧‍👦会議";
+    const after = "🙂試験👨‍👩‍👧‍👦総会";
+    const res = renderSideBySideDiff(before, after);
+
+    expect(res.originalHtml).toBe('🙂<del class="diff-del">テスト</del>👨‍👩‍👧‍👦会<del class="diff-del">議</del>');
+    expect(res.correctedHtml).toBe('🙂<ins class="diff-ins">試験</ins>👨‍👩‍👧‍👦<ins class="diff-ins">総</ins>会');
+  });
+
+  it("Case G: HTML特殊文字（<, >, &, \", '）が左右両方で厳格にエスケープされる", () => {
+    const res = renderSideBySideDiff("<危険&タグ>", "<安全&タグ>");
+    expect(res.originalHtml).toContain("&lt;");
+    expect(res.originalHtml).toContain("&amp;");
+    expect(res.originalHtml).toContain("&gt;");
+    expect(res.originalHtml).toContain('<del class="diff-del">危険</del>');
+    expect(res.correctedHtml).toContain('<ins class="diff-ins">安全</ins>');
+  });
+
+  it("Case H: 日本語句読点の変更: 句読点のみが差分として検出される", () => {
+    const before = "はい、わかりました。";
+    const after = "はい。了解しました！";
+    const res = renderSideBySideDiff(before, after);
+
+    expect(res.originalHtml).toBe('はい<del class="diff-del">、わかり</del>ました<del class="diff-del">。</del>');
+    expect(res.correctedHtml).toBe('はい<ins class="diff-ins">。了解し</ins>ました<ins class="diff-ins">！</ins>');
+  });
+});
+
+describe("splitGraphemes & Bounded LCS (Unicode・上限防御・フォールバック)", () => {
+  it("定数値: MAX_LCS_CELLS と MAX_LCS_GRAPHEMES がエクスポートされている", () => {
+    expect(MAX_LCS_CELLS).toBe(200_000);
+    expect(MAX_LCS_GRAPHEMES).toBe(2_000);
+  });
+
+  it("splitGraphemes: Intl.Segmenter 有効時に ZWJ 結合絵文字（👨‍👩‍👧‍👦）を1書記素クラスタとして保持する", () => {
+    const graphemes = splitGraphemes("👨‍👩‍👧‍👦", true);
+    expect(graphemes).toHaveLength(1);
+    expect(graphemes[0]).toBe("👨‍👩‍👧‍👦");
+  });
+
+  it("splitGraphemes: Intl.Segmenter 無効化時（フォールバック）でもサロゲートペア（🙂）を破壊しない", () => {
+    const chars = splitGraphemes("🙂テスト", false);
+    expect(chars).toEqual(["🙂", "テ", "ス", "ト"]);
+  });
+
+  it("Case A: 閾値未満の通常入力: mode: 'precise' で精密な部分差分を返す", () => {
+    const res = computeCharacterDiff("ABCDEF", "ABXEYF", { maxCells: 100, maxGraphemes: 50 });
+    expect(res.mode).toBe("precise");
+    expect(res.ops).toEqual([
+      { type: "equal", text: "AB" },
+      { type: "delete", text: "CD" },
+      { type: "insert", text: "X" },
+      { type: "equal", text: "E" },
+      { type: "insert", text: "Y" },
+      { type: "equal", text: "F" },
+    ]);
+  });
+
+  it("Case B: maxCells 超過時: mode: 'coarse' となり、共通prefix/suffixを保持しつつ中央部を1ブロック置換として安全に返す", () => {
+    // 中央部: 15文字 x 15文字 = 225 cells > maxCells: 100
+    const before = "START_123456789012345_END";
+    const after = "START_abcdefghijklmno_END";
+    const res = computeCharacterDiff(before, after, { maxCells: 100 });
+
+    expect(res.mode).toBe("coarse");
+    expect(res.ops).toEqual([
+      { type: "equal", text: "START_" },
+      { type: "delete", text: "123456789012345" },
+      { type: "insert", text: "abcdefghijklmno" },
+      { type: "equal", text: "_END" },
+    ]);
+  });
+
+  it("Case C: 片側文字数が maxGraphemes を超過した場合: mode: 'coarse' となる", () => {
+    const before = "START_" + "A".repeat(60) + "_END";
+    const after = "START_" + "B".repeat(10) + "_END";
+    const res = computeCharacterDiff(before, after, { maxGraphemes: 50 });
+
+    expect(res.mode).toBe("coarse");
+    expect(res.ops).toEqual([
+      { type: "equal", text: "START_" },
+      { type: "delete", text: "A".repeat(60) },
+      { type: "insert", text: "B".repeat(10) },
+      { type: "equal", text: "_END" },
+    ]);
+  });
+
+  it("Case D: 長大テキスト（5,000文字）の全文置換: フリーズせず瞬時に完了し mode: 'coarse' を返す", () => {
+    const before = "X".repeat(5000);
+    const after = "Y".repeat(5000);
+    const start = performance.now();
+    const res = computeCharacterDiff(before, after);
+    const elapsed = performance.now() - start;
+
+    expect(elapsed).toBeLessThan(50); // 50ms未満で即座に完了
+    expect(res.mode).toBe("coarse");
+    expect(res.ops).toEqual([
+      { type: "delete", text: "X".repeat(5000) },
+      { type: "insert", text: "Y".repeat(5000) },
+    ]);
+  });
+
+  it("Case E: 大規模no-diarization文章（10,000文字）: renderSideBySideDiff がフリーズせず安全に動作する", () => {
+    const before = "冒頭共通部分。" + "あ".repeat(10000) + "末尾共通部分。";
+    const after = "冒頭共通部分。" + "い".repeat(10000) + "末尾共通部分。";
+
+    const start = performance.now();
+    const res = renderSideBySideDiff(before, after);
+    const elapsed = performance.now() - start;
+
+    expect(elapsed).toBeLessThan(100);
+    expect(res.mode).toBe("coarse");
+    expect(res.originalHtml).toBe(`冒頭共通部分。<del class="diff-del">${"あ".repeat(10000)}</del>末尾共通部分。`);
+    expect(res.correctedHtml).toBe(`冒頭共通部分。<ins class="diff-ins">${"い".repeat(10000)}</ins>末尾共通部分。`);
+  });
+
+  it("Case F: フォールバック時 (coarse mode) でも HTML 特殊文字が厳格にエスケープされる", () => {
+    const before = "PREFIX_" + "<script>alert('xss')</script>".repeat(5) + "_SUFFIX";
+    const after = "PREFIX_" + "<b>安全</b>".repeat(5) + "_SUFFIX";
+    const res = renderSideBySideDiff(before, after, { maxCells: 50 });
+
+    expect(res.mode).toBe("coarse");
+    expect(res.originalHtml).not.toContain("<script>");
+    expect(res.originalHtml).toContain("&lt;script&gt;");
+    expect(res.correctedHtml).not.toContain("<b>");
+    expect(res.correctedHtml).toContain("&lt;b&gt;");
+  });
+
+  it("Case G: フォールバック時でも左右のプレーンテキスト復元性が完全に保たれる", () => {
+    const before = "HEADER_" + "変更前".repeat(20) + "_FOOTER";
+    const after = "HEADER_" + "変更後".repeat(20) + "_FOOTER";
+    const res = renderSideBySideDiff(before, after, { maxCells: 50 });
+
+    expect(res.mode).toBe("coarse");
+    // HTMLタグ（<del>, <ins>）を除去したテキストが元テキスト・補正テキストと完全一致
+    const stripHtml = (html: string) => html.replace(/<[^>]+>/g, "");
+    expect(stripHtml(res.originalHtml)).toBe(before);
+    expect(stripHtml(res.correctedHtml)).toBe(after);
   });
 });
 

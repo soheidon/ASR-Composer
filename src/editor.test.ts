@@ -777,8 +777,10 @@ describe("Phase 1 LLM Correction UI Integration", () => {
     expect(document.querySelector("img[onerror]")).toBeNull();
 
     // テキストとして安全にエスケープされてレンダリングされていること
+    expect(document.body.innerHTML).not.toContain("<img");
     expect(document.body.innerHTML).toContain("&lt;script&gt;alert('xss')&lt;/script&gt;");
-    expect(document.body.innerHTML).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(document.body.innerHTML).toContain("&lt;img");
+    expect(document.body.innerHTML).toContain("onerror=alert(1)&gt;");
     expect(document.body.innerHTML).toContain("&lt;b&gt;危険説明&lt;/b&gt;");
   });
 
@@ -972,12 +974,12 @@ describe("Phase 1 LLM Correction UI Integration", () => {
     const proposalCards = document.querySelectorAll(".proposal-card");
     expect(proposalCards.length).toBe(3);
 
-    // Step 3: 根拠バッジと簡易diffが見える
+    // Step 3: 根拠バッジと左右比較diffが見える
     const badge = document.querySelector(".evidence-badge");
-    const diff = document.querySelector(".proposal-diff");
+    const sideBySide = document.querySelector(".proposal-side-by-side");
     expect(badge).not.toBeNull();
-    expect(diff).not.toBeNull();
-    expect(diff!.innerHTML).toContain("diff-");
+    expect(sideBySide).not.toBeNull();
+    expect(sideBySide!.innerHTML).toContain("diff-");
 
     // Step 4: 1件を採用する (prop-0A)
     const applyBtn0A = document.querySelector<HTMLButtonElement>(`button.btn-apply-proposal[data-proposal-id="prop-0A"]`)!;
@@ -1861,6 +1863,359 @@ describe("Phase 1 LLM Correction UI Integration", () => {
 
       expect(getEditorDocument()!.segments[0].speaker).toBe("SPEAKER_CHANGED");
       expect(getEditorDocument()!.segments[0].status).toBe("edited");
+    });
+  });
+
+  // ---- Phase 2E: Side-by-Side (左右比較) Review UI Tests (Cases 2E-A to 2E-L) ----
+
+  describe("Phase 2E: Side-by-Side (左右比較) Proposal Review UI", () => {
+    it("Case 2E-A: 補正候補が存在する場合、補正前とLLM補正後の2カラム領域が存在する", () => {
+      const doc = createSampleDocument(1);
+      const seg0 = doc.segments[0];
+      const prop: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: seg0.id,
+        originalText: seg0.text,
+        correctedText: "補正後の正本文テキストです。",
+        evidence: [{ type: "dictionary", description: "標準用語辞書" }],
+        explanation: "誤認識の修正",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[seg0.id, [prop]]]));
+
+      document.body.innerHTML = renderEditorPage();
+
+      const colBefore = document.querySelector(".proposal-col-before");
+      const colAfter = document.querySelector(".proposal-col-after");
+
+      expect(colBefore).not.toBeNull();
+      expect(colAfter).not.toBeNull();
+      expect(colBefore?.querySelector(".proposal-col-title")?.textContent).toBe("補正前");
+      expect(colAfter?.querySelector(".proposal-col-title")?.textContent).toBe("LLM補正後");
+    });
+
+    it("Case 2E-B: 左側に proposal.originalText、右側に proposal.correctedText が表示される", () => {
+      const doc = createSampleDocument(1);
+      const seg0 = doc.segments[0];
+      seg0.text = "児童せいしん科の研究です";
+      const prop: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: seg0.id,
+        originalText: "児童せいしん科の研究です",
+        correctedText: "児童精神科の研究です",
+        evidence: [{ type: "dictionary" }],
+        explanation: "用語補正",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[seg0.id, [prop]]]));
+
+      document.body.innerHTML = renderEditorPage();
+
+      const textBefore = document.querySelector(".proposal-col-before .proposal-col-text")?.textContent;
+      const textAfter = document.querySelector(".proposal-col-after .proposal-col-text")?.textContent;
+
+      expect(textBefore).toBe("児童せいしん科の研究です");
+      expect(textAfter).toBe("児童精神科の研究です");
+    });
+
+    it("Case 2E-C: segment.originalText と proposal.originalText が異なる場合でも、左側は厳格に proposal.originalText を表示する", () => {
+      const doc = createSampleDocument(1);
+      const seg0 = doc.segments[0];
+      seg0.originalText = "ASR生の完全初期テキスト";
+      seg0.text = "ユーザーが手動で途中修正したテキスト";
+
+      const prop: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: seg0.id,
+        originalText: "ユーザーが手動で途中修正したテキスト", // 補正要求時点のsnapshot
+        correctedText: "ユーザーが手動で途中修正したテキスト（LLM補正）",
+        evidence: [{ type: "context" }],
+        explanation: "文脈補正",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[seg0.id, [prop]]]));
+
+      document.body.innerHTML = renderEditorPage();
+
+      const beforeHtml = document.querySelector(".proposal-col-before .proposal-col-text")?.innerHTML;
+      expect(beforeHtml).toBeDefined();
+      expect(beforeHtml).not.toContain("ASR生の完全初期テキスト");
+      expect(beforeHtml).toContain("ユーザーが手動で途中修正したテキスト");
+    });
+
+    it("Case 2E-D: 差分ハイライトで削除部分に <del class=\"diff-del\">、追加部分に <ins class=\"diff-ins\"> が付与され、変更箇所のみがマークアップされる", () => {
+      const doc = createSampleDocument(1);
+      const seg0 = doc.segments[0];
+      seg0.text = "児童せいしん科の研究です";
+
+      const prop: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: seg0.id,
+        originalText: "児童せいしん科の研究です",
+        correctedText: "児童精神科の研究です",
+        evidence: [{ type: "dictionary" }],
+        explanation: "テスト",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[seg0.id, [prop]]]));
+
+      document.body.innerHTML = renderEditorPage();
+
+      const beforeCol = document.querySelector(".proposal-col-before .proposal-col-text");
+      const afterCol = document.querySelector(".proposal-col-after .proposal-col-text");
+
+      expect(beforeCol?.innerHTML).toContain('<del class="diff-del">せいしん</del>');
+      expect(afterCol?.innerHTML).toContain('<ins class="diff-ins">精神</ins>');
+      // 全文がdelやinsで囲まれていないこと
+      expect(beforeCol?.innerHTML).toMatch(/^児童<del.*<\/del>科の研究です$/);
+      expect(afterCol?.innerHTML).toMatch(/^児童<ins.*<\/ins>科の研究です$/);
+    });
+
+    it("Case 2E-E: HTML特殊文字が左右両方で厳格にエスケープされ、XSSを防ぐ", () => {
+      const doc = createSampleDocument(1);
+      const seg0 = doc.segments[0];
+      seg0.text = "<script>alert('xss')</script>";
+
+      const prop: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: seg0.id,
+        originalText: "<script>alert('xss')</script>",
+        correctedText: "<b>safe & clean</b>",
+        evidence: [{ type: "context", description: "<dangerous & desc>" }],
+        explanation: "<dangerous & explanation>",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[seg0.id, [prop]]]));
+
+      document.body.innerHTML = renderEditorPage();
+
+      const cardHtml = document.querySelector(".proposal-card")?.innerHTML;
+      expect(cardHtml).toBeDefined();
+      expect(cardHtml).not.toContain("<script>");
+      expect(cardHtml).not.toContain("<b>safe");
+      expect(cardHtml).toContain("&lt;");
+      expect(cardHtml).toContain("&gt;");
+      expect(cardHtml).toContain("&amp;");
+      expect(cardHtml).toContain("&lt;dangerous &amp; desc&gt;");
+      expect(cardHtml).toContain("&lt;dangerous &amp; explanation&gt;");
+    });
+
+    it("Case 2E-F: 根拠バッジ（辞書・背景・文脈）と説明文が表示される", () => {
+      const doc = createSampleDocument(1);
+      const seg0 = doc.segments[0];
+      const prop: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: seg0.id,
+        originalText: seg0.text,
+        correctedText: "補正後",
+        evidence: [
+          { type: "dictionary", sourceId: "dict-1", description: "医学辞書" },
+          { type: "background", description: "講演概要" },
+          { type: "context", description: "文脈整合性" },
+        ],
+        explanation: "総合的な補正",
+        confidence: 0.92,
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[seg0.id, [prop]]]));
+
+      document.body.innerHTML = renderEditorPage();
+
+      expect(document.querySelector(".evidence-badge-dictionary")?.textContent).toContain("辞書: 医学辞書");
+      expect(document.querySelector(".evidence-badge-background")?.textContent).toContain("背景: 講演概要");
+      expect(document.querySelector(".evidence-badge-context")?.textContent).toContain("文脈: 文脈整合性");
+      expect(document.querySelector(".confidence-badge")?.textContent).toContain("信頼度: 92%");
+      expect(document.querySelector(".proposal-explanation")?.textContent).toContain("総合的な補正");
+    });
+
+    it("Case 2E-G: 「採用」ボタンクリックで segment.text が更新され、同セグメントの全Proposalがクリアされる", async () => {
+      const doc = createSampleDocument(1);
+      const seg0 = doc.segments[0];
+      seg0.text = "誤認識テキスト";
+
+      const prop: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: seg0.id,
+        originalText: "誤認識テキスト",
+        correctedText: "正しく補正されたテキスト",
+        evidence: [{ type: "dictionary" }],
+        explanation: "採用テスト",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[seg0.id, [prop]]]));
+
+      document.body.innerHTML = renderEditorPage();
+      bindEditorEvents();
+
+      const applyBtn = document.querySelector(".btn-apply-proposal") as HTMLButtonElement;
+      expect(applyBtn).not.toBeNull();
+      applyBtn.click();
+
+      // ドキュメントの text が更新され status が edited になること
+      const current = getEditorDocument()!;
+      expect(current.segments[0].text).toBe("正しく補正されたテキスト");
+      expect(current.segments[0].status).toBe("edited");
+
+      // 同セグメントの提案がクリアされること
+      expect(getActiveProposals().has(seg0.id)).toBe(false);
+
+      // textarea の値が更新されていること
+      const textarea = document.querySelector(".segment-text-input") as HTMLTextAreaElement;
+      expect(textarea.value).toBe("正しく補正されたテキスト");
+    });
+
+    it("Case 2E-H: 「却下」ボタンクリックで対象Proposalのみが削除され、ドキュメントは変更されない", () => {
+      const doc = createSampleDocument(1);
+      const seg0 = doc.segments[0];
+      seg0.text = "元の文章";
+
+      const prop1: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: seg0.id,
+        originalText: "元の文章",
+        correctedText: "候補1の文章",
+        evidence: [{ type: "context" }],
+        explanation: "1",
+      };
+      const prop2: CorrectionProposal = {
+        id: "prop-2",
+        segmentId: seg0.id,
+        originalText: "元の文章",
+        correctedText: "候補2の文章",
+        evidence: [{ type: "dictionary" }],
+        explanation: "2",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[seg0.id, [prop1, prop2]]]));
+
+      document.body.innerHTML = renderEditorPage();
+      bindEditorEvents();
+
+      const rejectBtns = document.querySelectorAll(".btn-reject-proposal");
+      expect(rejectBtns.length).toBe(2);
+
+      // 候補1を却下
+      (rejectBtns[0] as HTMLButtonElement).click();
+
+      // prop-1 だけが削除され、prop-2 は残る
+      const remaining = getActiveProposals().get(seg0.id)!;
+      expect(remaining.length).toBe(1);
+      expect(remaining[0].id).toBe("prop-2");
+
+      // ドキュメントの文章は不変
+      expect(getEditorDocument()!.segments[0].text).toBe("元の文章");
+    });
+
+    it("Case 2E-I: Stale Proposal は「採用」ボタンが無効化され、警告メッセージが表示される", () => {
+      const doc = createSampleDocument(1);
+      const seg0 = doc.segments[0];
+      seg0.text = "ユーザーが手動変更した最新文章";
+
+      const prop: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: seg0.id,
+        originalText: "過去の古い文章", // Stale!
+        correctedText: "過去の古い文章（補正後）",
+        evidence: [{ type: "context" }],
+        explanation: "stale",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[seg0.id, [prop]]]));
+
+      document.body.innerHTML = renderEditorPage();
+
+      const staleTag = document.querySelector(".proposal-stale-tag");
+      expect(staleTag).not.toBeNull();
+      expect(staleTag?.textContent).toContain("現在の正本文が変更されたため無効 (Stale)");
+
+      const applyBtn = document.querySelector(".btn-apply-proposal") as HTMLButtonElement;
+      expect(applyBtn.disabled).toBe(true);
+    });
+
+    it("Case 2E-J: speaker === null (話者分離なし) の場合でも左右比較UIが正常に表示される", () => {
+      const doc = createSampleDocument(1);
+      doc.segments[0].speaker = null;
+      doc.segments[0].originalSpeaker = null;
+
+      const prop: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: doc.segments[0].id,
+        originalText: doc.segments[0].text,
+        correctedText: "話者分離なし補正後",
+        evidence: [{ type: "background" }],
+        explanation: "no-diarization test",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[doc.segments[0].id, [prop]]]));
+
+      document.body.innerHTML = renderEditorPage();
+
+      // 話者欄は非表示
+      expect(document.querySelector(".segment-speaker-row")).toBeNull();
+
+      // 左右比較UIは存在
+      expect(document.querySelector(".proposal-col-before")).not.toBeNull();
+      expect(document.querySelector(".proposal-col-after")).not.toBeNull();
+    });
+
+    it("Case 2E-K: speaker !== null (話者分離あり) の場合でも左右比較UIが正常に表示される", () => {
+      const doc = createSampleDocument(1);
+      doc.segments[0].speaker = "SPEAKER_00";
+      doc.segments[0].originalSpeaker = "SPEAKER_00";
+
+      const prop: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: doc.segments[0].id,
+        originalText: doc.segments[0].text,
+        correctedText: "話者分離あり補正後",
+        evidence: [{ type: "dictionary" }],
+        explanation: "diarization test",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[doc.segments[0].id, [prop]]]));
+
+      document.body.innerHTML = renderEditorPage();
+
+      // 話者欄が存在
+      expect(document.querySelector(".segment-speaker-row")).not.toBeNull();
+
+      // 左右比較UIが存在
+      expect(document.querySelector(".proposal-col-before")).not.toBeNull();
+      expect(document.querySelector(".proposal-col-after")).not.toBeNull();
+    });
+
+    it("Case 2E-L: 同一セグメントに複数Proposalが存在する場合、候補番号バッジ（候補 1/2, 候補 2/2）が表示される", () => {
+      const doc = createSampleDocument(1);
+      const seg0 = doc.segments[0];
+
+      const prop1: CorrectionProposal = {
+        id: "prop-1",
+        segmentId: seg0.id,
+        originalText: seg0.text,
+        correctedText: "候補1テキスト",
+        evidence: [{ type: "context" }],
+        explanation: "1",
+      };
+      const prop2: CorrectionProposal = {
+        id: "prop-2",
+        segmentId: seg0.id,
+        originalText: seg0.text,
+        correctedText: "候補2テキスト",
+        evidence: [{ type: "dictionary" }],
+        explanation: "2",
+      };
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      setActiveProposalsForTest(new Map([[seg0.id, [prop1, prop2]]]));
+
+      document.body.innerHTML = renderEditorPage();
+
+      const cards = document.querySelectorAll(".proposal-card");
+      expect(cards.length).toBe(2);
+
+      const badges = document.querySelectorAll(".proposal-number-badge");
+      expect(badges.length).toBe(2);
+      expect(badges[0].textContent).toBe("候補 1/2");
+      expect(badges[1].textContent).toBe("候補 2/2");
     });
   });
 });
