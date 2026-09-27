@@ -48,6 +48,7 @@ import {
 import {
   runCorrectionForDocument,
   type CorrectionProposal,
+  type CorrectionMode,
 } from "./correction";
 import { OllamaCorrectionProvider } from "./ollama-provider";
 import {
@@ -471,6 +472,15 @@ const transcribePage = `
             <div class="engine-select-wrap" style="flex: 1; min-width: 140px;">
               <select class="engine-select" id="correctionModelSelect">
                 <option value="">（モデル一覧を取得中...）</option>
+              </select>
+              <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+            </div>
+            <label class="field-label-inline" style="margin-left: 8px; white-space: nowrap;">モード</label>
+            <div class="engine-select-wrap engine-select-wrap-mode" style="flex: 0 0 110px;">
+              <select class="engine-select" id="correctionModeSelect" title="補正モードを選択">
+                <option value="minimal">最小修正</option>
+                <option value="standard" selected>標準</option>
+                <option value="aggressive">積極修正</option>
               </select>
               <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
             </div>
@@ -1280,12 +1290,14 @@ export function setSavedCorrectionModelForTest(model: string, explicitlySelected
 export async function saveCorrectionSelection(): Promise<void> {
   const enabledCheckbox = document.getElementById("correctionEnabledCheckbox") as HTMLInputElement | null;
   const providerSelect = document.getElementById("correctionProviderSelect") as HTMLSelectElement | null;
+  const modeSelect = document.getElementById("correctionModeSelect") as HTMLSelectElement | null;
   const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
   const bgCheckbox = document.getElementById("correctionBgCheckbox") as HTMLInputElement | null;
 
   const enabled = enabledCheckbox?.checked ?? false;
   const provider = providerSelect?.value || "ollama";
   const model = correctionModelExplicitlySelected ? savedCorrectionModel : "";
+  const mode = (modeSelect?.value as CorrectionMode) || "standard";
   const useDictionary = dictCheckbox?.checked ?? true;
   const useBackground = bgCheckbox?.checked ?? true;
 
@@ -1294,6 +1306,7 @@ export async function saveCorrectionSelection(): Promise<void> {
       correction_enabled: enabled,
       correction_provider: provider,
       correction_model: model,
+      correction_mode: mode,
       correction_use_dictionary: useDictionary,
       correction_use_background: useBackground,
     }, invokeTauri);
@@ -1411,6 +1424,7 @@ export async function restoreCorrectionSelection(): Promise<void> {
   const enabledCheckbox = document.getElementById("correctionEnabledCheckbox") as HTMLInputElement | null;
   const providerSelect = document.getElementById("correctionProviderSelect") as HTMLSelectElement | null;
   const modelSelect = document.getElementById("correctionModelSelect") as HTMLSelectElement | null;
+  const modeSelect = document.getElementById("correctionModeSelect") as HTMLSelectElement | null;
   const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
   const bgCheckbox = document.getElementById("correctionBgCheckbox") as HTMLInputElement | null;
 
@@ -1419,6 +1433,9 @@ export async function restoreCorrectionSelection(): Promise<void> {
   }
   if (providerSelect) {
     providerSelect.value = settings.correction_provider || "ollama";
+  }
+  if (modeSelect) {
+    modeSelect.value = (settings.correction_mode as string) || "standard";
   }
   if (dictCheckbox) {
     dictCheckbox.checked = settings.correction_use_dictionary !== false;
@@ -1443,6 +1460,7 @@ function bindCorrectionSelection(): void {
   const enabledCheckbox = document.getElementById("correctionEnabledCheckbox") as HTMLInputElement | null;
   const providerSelect = document.getElementById("correctionProviderSelect") as HTMLSelectElement | null;
   const modelSelect = document.getElementById("correctionModelSelect") as HTMLSelectElement | null;
+  const modeSelect = document.getElementById("correctionModeSelect") as HTMLSelectElement | null;
   const refreshBtn = document.getElementById("btnRefreshCorrectionModels") as HTMLButtonElement | null;
   const settingsBtn = document.getElementById("btnCorrectionSettings") as HTMLButtonElement | null;
   const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
@@ -1454,6 +1472,10 @@ function bindCorrectionSelection(): void {
   });
 
   providerSelect?.addEventListener("change", async () => {
+    await saveCorrectionSelection();
+  });
+
+  modeSelect?.addEventListener("change", async () => {
     await saveCorrectionSelection();
   });
 
@@ -2578,6 +2600,7 @@ export async function runAsrAutoCorrection(
       provider,
       dictionary,
       context,
+      mode: resolved.mode,
       isCancelled: () => !isCurrentAutoCorrectionRun(correctionRunId, generation, doc),
     });
 

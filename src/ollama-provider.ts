@@ -4,6 +4,8 @@ import {
   type CorrectionRequest,
   type CorrectionDictionaryEntry,
   type CorrectionContext,
+  type CorrectionMode,
+  DEFAULT_CORRECTION_MODE,
   parseRawProposalCandidates,
   validateProposalCandidate,
   promoteCandidateToProposal,
@@ -54,16 +56,46 @@ export const OLLAMA_PROPOSAL_SCHEMA = {
 };
 
 /**
- * ASR誤認識補正専用システムプロンプト
+ * 補正モードおよびグローバル安全ポリシーに基づくシステムプロンプトを構築する（Pure Function）。
  */
-export const OLLAMA_CORRECTION_SYSTEM_PROMPT = `あなたは音声認識（ASR）誤認識補正エンジンです。
-【対象セグメント (Target Segments)】のテキストに含まれる明らかな音声認識の誤り（同音異義語、固有名詞、専門用語の聞き間違い）のみを補正してください。
+export function buildSystemPrompt(mode: CorrectionMode = DEFAULT_CORRECTION_MODE): string {
+  const modeDirectives: Record<CorrectionMode, string> = {
+    minimal: `【補正モード: 最小修正 (minimal)】
+- 目的: 原文の構造・口語性を完全に維持し、ASRとしての明白な誤認識・固有名詞・専門用語・辞書合致語句のみを最小限修正します。
+- 許可: 明白なASR誤変換、固有名詞、専門用語、用語辞書に基づく正式表記への訂正、明白な表記誤り、最低限の句読点。
+- 禁止: 言い換え、助詞の補完、フィラーの削除、文の再構成、文体改善。`,
 
-【厳格な規則】
-1. 【参照コンテキスト (Reference Context)】のセグメントは前後の文脈理解のためだけに参照し、絶対に補正提案（proposals）を出力しないでください。
-2. 要約、文体改善、言い換え、敬体/常体の統一は行わないでください。
-3. 情報を追加・削除せず、創作しないでください。
-4. 確実な根拠がない場合は proposal を出力しないでください。
+    standard: `【補正モード: 標準 (standard)】
+- 目的: 意味と口語表現を忠実に維持しながら、前後文脈から確実性の高いASR誤認識を訂正します。
+- 許可: 最小修正の全内容、前後文脈に基づく高確度な誤認識補正、同音異義語・表記ゆれの是正、自然な句読点、ごく軽微な文法的不自然さの修正。
+- 禁止: 要約、発話外の情報の追加、積極的な書き換え、不要なフィラー削除。`,
+
+    aggressive: `【補正モード: 積極修正 (aggressive)】
+- 目的: 発話内容そのものを維持しながら、助詞の脱落や言い直し・重複を整理し、読みやすさを向上させます。
+- 許可: 標準の全内容、明白な助詞脱落の補正、重複・言い直しの整理、明白なフィラーの整理、軽微な語順整理。
+- 禁止: 新事実の生成、要約、発話外の内容補完、専門的推論による加筆、敬体/常体の全面変換。`,
+  };
+
+  const directive = modeDirectives[mode] || modeDirectives.standard;
+
+  return `あなたは音声認識（ASR）誤認識補正エンジンです。
+【対象セグメント (Target Segments)】のテキストに含まれる音声認識の誤りを補正してください。
+
+${directive}
+
+【Global Safety Rules（全モード共通・厳格遵守）】
+1. 発話内容の忠実維持: 発話に存在しない新事実・情報・推測を追加しないでください（創作・捏造・ハルシネーションの厳禁）。
+2. 要約・省略の禁止: 原文の要約や発話内容の省略を行わないでください。
+3. セグメント構造の維持: セグメントの結合・分割・ID変更を行わず、入力された segmentId と 1:1 で対応する proposal を出力してください。
+4. 話し言葉のニュアンス維持: 「〜じゃなくて」「〜なんですけど」等の口語表現を勝手に書き言葉へ変えたり、敬体/常体を全面統一しないでください。
+5. 参照コンテキストの保護: 【参照コンテキスト (Reference Context)】のセグメントは文脈理解のためだけに参照し、絶対に proposal を出力しないでください。
+6. 背景情報の扱い: 背景情報（background.txt / 話者メモ）に記載されているだけの事実を発話へ勝手に追加しないでください。
+
+【コンテキストの権威性 (Authority Hierarchy)】
+1. 対象セグメントの原文: 発話内容そのもの（最優先の正本）。
+2. 用語辞書 (dictionary): 正式表記を判断する強い補助根拠（ただし発話にない語の無差別挿入は禁止）。
+3. 背景情報 (background): 候補選択・専門領域理解のための弱い文脈情報。
+4. 参照コンテキスト (context): 前後文脈理解のみ（補正対象外）。
 
 【根拠 (evidence)】
 - dictionary: 用語辞書に合致する表記
@@ -71,6 +103,12 @@ export const OLLAMA_CORRECTION_SYSTEM_PROMPT = `あなたは音声認識（ASR�
 - context: 前後文脈から明らかな誤認識
 
 指定された JSON Schema に従った JSON オブジェクトのみを出力してください。`;
+}
+
+/**
+ * 後方互換用デフォルトシステムプロンプト
+ */
+export const OLLAMA_CORRECTION_SYSTEM_PROMPT = buildSystemPrompt("standard");
 
 /**
  * チャンク単位のユーザープロンプトを構築する
@@ -85,7 +123,7 @@ export function buildChunkUserPrompt(
   const parts: string[] = [];
 
   if (dictionary && dictionary.length > 0) {
-    parts.push("【用語辞書】");
+    parts.push("【用語辞書（正式表記の強い補助根拠・背景情報より優先）】");
     for (const entry of dictionary) {
       const vars = entry.variants.length > 0 ? ` (誤読/表記ゆれ: ${entry.variants.join(", ")})` : "";
       const note = entry.note ? ` [注記: ${entry.note}]` : "";
@@ -95,7 +133,7 @@ export function buildChunkUserPrompt(
   }
 
   if (context && context.backgroundText.trim().length > 0) {
-    parts.push("【背景情報】");
+    parts.push("【背景情報（文脈理解のみ・発話外の事実追加禁止）】");
     parts.push(context.backgroundText.trim());
     if (context.speakerNotes && Object.keys(context.speakerNotes).length > 0) {
       parts.push("【話者情報】");
@@ -200,6 +238,9 @@ export class OllamaCorrectionProvider implements CorrectionProvider {
     const allProposals: CorrectionProposal[] = [];
     const allSegmentsMap = new Map(segments.map((s) => [s.id, s]));
 
+    const mode = request.mode ?? DEFAULT_CORRECTION_MODE;
+    const systemPrompt = buildSystemPrompt(mode);
+
     for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
       // チャンク送信前のキャンセル確認
       if (this.isCancelledFn?.()) {
@@ -227,7 +268,7 @@ export class OllamaCorrectionProvider implements CorrectionProvider {
       );
 
       const messages = [
-        { role: "system", content: OLLAMA_CORRECTION_SYSTEM_PROMPT },
+        { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ];
 

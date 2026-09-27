@@ -6,6 +6,8 @@ import {
   splitGraphemes,
   MAX_LCS_CELLS,
   MAX_LCS_GRAPHEMES,
+  extractNumericTokens,
+  DEFAULT_CORRECTION_MODE,
   validateProposal,
   applyProposal,
   rejectProposal,
@@ -278,6 +280,288 @@ describe("splitGraphemes & Bounded LCS (Unicode・上限防御・フォールバ
     const stripHtml = (html: string) => html.replace(/<[^>]+>/g, "");
     expect(stripHtml(res.originalHtml)).toBe(before);
     expect(stripHtml(res.correctedHtml)).toBe(after);
+  });
+});
+
+describe("extractNumericTokens & NUMERIC_CHANGE (数値保護ガード)", () => {
+  it("extractNumericTokens: アラビア数字、小数、符号付き数値、全角数字、カンマ区切り数値を抽出・正規化する", () => {
+    expect(extractNumericTokens("3人")).toEqual(["3"]);
+    expect(extractNumericTokens("10 mg")).toEqual(["10"]);
+    expect(extractNumericTokens("0.5 mg")).toEqual(["0.5"]);
+    expect(extractNumericTokens("2025年4月1日")).toEqual(["2025", "4", "1"]);
+    expect(extractNumericTokens("-15.2度")).toEqual(["-15.2"]);
+    expect(extractNumericTokens("３人")).toEqual(["3"]); // 全角数字
+    expect(extractNumericTokens("1,000円")).toEqual(["1000"]); // 正しい桁区切りカンマ
+    expect(extractNumericTokens("12,345,678")).toEqual(["12345678"]); // 複数桁区切り
+    expect(extractNumericTokens("1,000.50")).toEqual(["1000.50"]); // 桁区切り + 小数
+    expect(extractNumericTokens("１，０００円")).toEqual(["1000"]); // 全角カンマ・全角数字
+    expect(extractNumericTokens("1,2")).toEqual(["1", "2"]); // 不正な桁区切りは結合せず分離
+    expect(extractNumericTokens("12,34")).toEqual(["12", "34"]); // 不正な桁区切りは結合せず分離
+    expect(extractNumericTokens("−5 mg")).toEqual(["-5"]); // Unicode minus (\u2212)
+    expect(extractNumericTokens("－5 mg")).toEqual(["-5"]); // 全角マイナス (\uFF0D)
+    expect(extractNumericTokens("–5 mg")).toEqual(["-5"]); // En dash (\u2013)
+    expect(extractNumericTokens("—5 mg")).toEqual(["-5"]); // Em dash (\u2014)
+    expect(extractNumericTokens("+5 mg")).toEqual(["+5"]); // ASCII plus
+    expect(extractNumericTokens("＋5 mg")).toEqual(["+5"]); // 全角プラス (\uFF0B)
+    expect(extractNumericTokens("9007199254740993")).toEqual(["9007199254740993"]); // 巨大整数
+    expect(extractNumericTokens("テキストのみで数字なし")).toEqual([]);
+  });
+
+  // A. "1,2" → "12" => NUMERIC_CHANGE
+  it("Case A: '1,2' → '12' は不正な桁区切り結合として NUMERIC_CHANGE で拒否", () => {
+    const seg = createDummySegment({ text: "選択肢1,2です" });
+    const prop: CorrectionProposal = {
+      id: "prop-a",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "選択肢12です",
+      evidence: [{ type: "context" }],
+      explanation: "結合改変",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.valid).toBe(false);
+    expect(res.errors).toContain("NUMERIC_CHANGE");
+  });
+
+  // B. "12" → "1,2" => NUMERIC_CHANGE
+  it("Case B: '12' → '1,2' は数値分割として NUMERIC_CHANGE で拒否", () => {
+    const seg = createDummySegment({ text: "番号12です" });
+    const prop: CorrectionProposal = {
+      id: "prop-b",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "番号1,2です",
+      evidence: [{ type: "context" }],
+      explanation: "分割改変",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.valid).toBe(false);
+    expect(res.errors).toContain("NUMERIC_CHANGE");
+  });
+
+  // C. "1,000" → "1000" => OK
+  it("Case C: '1,000' → '1000' は正しい桁区切り除去として許可 (OK)", () => {
+    const seg = createDummySegment({ text: "費用は1,000円です" });
+    const prop: CorrectionProposal = {
+      id: "prop-c",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "費用は1000円です",
+      evidence: [{ type: "context" }],
+      explanation: "表記統一",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.errors).not.toContain("NUMERIC_CHANGE");
+  });
+
+  // D. "12,345,678" → "12345678" => OK
+  it("Case D: '12,345,678' → '12345678' は複数桁区切り除去として許可 (OK)", () => {
+    const seg = createDummySegment({ text: "総数は12,345,678個です" });
+    const prop: CorrectionProposal = {
+      id: "prop-d",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "総数は12345678個です",
+      evidence: [{ type: "context" }],
+      explanation: "表記統一",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.errors).not.toContain("NUMERIC_CHANGE");
+  });
+
+  // E. "12,34" → "1234" => NUMERIC_CHANGE
+  it("Case E: '12,34' → '1234' は不正な桁区切り結合として NUMERIC_CHANGE で拒否", () => {
+    const seg = createDummySegment({ text: "データ12,34です" });
+    const prop: CorrectionProposal = {
+      id: "prop-e",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "データ1234です",
+      evidence: [{ type: "context" }],
+      explanation: "結合改変",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.valid).toBe(false);
+    expect(res.errors).toContain("NUMERIC_CHANGE");
+  });
+
+  // F. "9007199254740993" → "9007199254740992" => NUMERIC_CHANGE (JS Number 精度限界超えの保護)
+  it("Case F: '9007199254740993' → '9007199254740992' は parseFloat を経由せず文字列比較により NUMERIC_CHANGE で拒否", () => {
+    const seg = createDummySegment({ text: "ID: 9007199254740993 です" });
+    const prop: CorrectionProposal = {
+      id: "prop-f",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "ID: 9007199254740992 です",
+      evidence: [{ type: "context" }],
+      explanation: "末尾桁改変",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.valid).toBe(false);
+    expect(res.errors).toContain("NUMERIC_CHANGE");
+  });
+
+  // G. 非常に長い整数同士 => Number変換せず正しく比較
+  it("Case G: 任意精度の超長大整数同士（30桁）を精度落ちなく比較し NUMERIC_CHANGE で拒否", () => {
+    const seg = createDummySegment({ text: "ハッシュ値: 123456789012345678901234567890 です" });
+    const prop: CorrectionProposal = {
+      id: "prop-g",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "ハッシュ値: 123456789012345678901234567891 です",
+      evidence: [{ type: "context" }],
+      explanation: "超長大整数改変",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.valid).toBe(false);
+    expect(res.errors).toContain("NUMERIC_CHANGE");
+  });
+
+  // H. "−5 mg" → "-5 mg" => OK (Unicode minus)
+  it("Case H: '−5 mg' → '-5 mg' は Unicode minus 正規化により許可 (OK)", () => {
+    const seg = createDummySegment({ text: "温度は−5 mg/Lです" });
+    const prop: CorrectionProposal = {
+      id: "prop-h",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "温度は-5 mg/Lです",
+      evidence: [{ type: "context" }],
+      explanation: "符号半角統一",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.errors).not.toContain("NUMERIC_CHANGE");
+  });
+
+  // I. "－5 mg" → "-5 mg" => OK (全角マイナス)
+  it("Case I: '－5 mg' → '-5 mg' は全角マイナス正規化により許可 (OK)", () => {
+    const seg = createDummySegment({ text: "温度は－5 mg/Lです" });
+    const prop: CorrectionProposal = {
+      id: "prop-i",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "温度は-5 mg/Lです",
+      evidence: [{ type: "context" }],
+      explanation: "符号半角統一",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.errors).not.toContain("NUMERIC_CHANGE");
+  });
+
+  // J. "−5 mg" → "5 mg" => NUMERIC_CHANGE (符号脱落の検出)
+  it("Case J: '−5 mg' → '5 mg' は負号脱落として NUMERIC_CHANGE で拒否", () => {
+    const seg = createDummySegment({ text: "温度は−5 mg/Lです" });
+    const prop: CorrectionProposal = {
+      id: "prop-j",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "温度は5 mg/Lです",
+      evidence: [{ type: "context" }],
+      explanation: "負号脱落",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.valid).toBe(false);
+    expect(res.errors).toContain("NUMERIC_CHANGE");
+  });
+
+  // K. "-0.5 mg" → "0.5 mg" => NUMERIC_CHANGE (小数の符号脱落検出)
+  it("Case K: '-0.5 mg' → '0.5 mg' は小数の負号脱落として NUMERIC_CHANGE で拒否", () => {
+    const seg = createDummySegment({ text: "変化量は-0.5 mgです" });
+    const prop: CorrectionProposal = {
+      id: "prop-k",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "変化量は0.5 mgです",
+      evidence: [{ type: "context" }],
+      explanation: "負号脱落",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.valid).toBe(false);
+    expect(res.errors).toContain("NUMERIC_CHANGE");
+  });
+
+  // L. "30%" → "20%" => NUMERIC_CHANGE (割合改変)
+  it("Case L: '30%' → '20%' は割合改変として NUMERIC_CHANGE で拒否", () => {
+    const seg = createDummySegment({ text: "達成率は30%でした" });
+    const prop: CorrectionProposal = {
+      id: "prop-l",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "達成率は20%でした",
+      evidence: [{ type: "context" }],
+      explanation: "割合改変",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.valid).toBe(false);
+    expect(res.errors).toContain("NUMERIC_CHANGE");
+  });
+
+  // M. "10 mg" → "10mg" => OK (空白調整)
+  it("Case M: '10 mg' → '10mg' は空白調整として許可 (OK)", () => {
+    const seg = createDummySegment({ text: "10 mgを服用" });
+    const prop: CorrectionProposal = {
+      id: "prop-m",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "10mgを服用",
+      evidence: [{ type: "context" }],
+      explanation: "空白除去",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.errors).not.toContain("NUMERIC_CHANGE");
+  });
+
+  // N. "３人" → "3人" => OK (全角数字半角化)
+  it("Case N: '３人' → '3人' は全角数字の半角化として許可 (OK)", () => {
+    const seg = createDummySegment({ text: "３名が参加" });
+    const prop: CorrectionProposal = {
+      id: "prop-n",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "3名が参加",
+      evidence: [{ type: "context" }],
+      explanation: "半角化",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.errors).not.toContain("NUMERIC_CHANGE");
+  });
+
+  // O. "１，０００円" → "1000円" => OK (全角カンマ+全角数字桁区切り)
+  it("Case O: '１，０００円' → '1000円' は全角桁区切りの正規化として許可 (OK)", () => {
+    const seg = createDummySegment({ text: "価格は１，０００円です" });
+    const prop: CorrectionProposal = {
+      id: "prop-o",
+      segmentId: seg.id,
+      originalText: seg.text,
+      correctedText: "価格は1000円です",
+      evidence: [{ type: "context" }],
+      explanation: "全角桁区切り正規化",
+    };
+    const res = validateProposal(prop, seg);
+    expect(res.errors).not.toContain("NUMERIC_CHANGE");
+  });
+
+  it("Hard Error: NUMERIC_CHANGE (数値トークンの削除または追加を検出し拒否)", () => {
+    const seg1 = createDummySegment({ text: "1回3錠を服用" });
+    const propDrop: CorrectionProposal = {
+      id: "prop-drop",
+      segmentId: seg1.id,
+      originalText: seg1.text,
+      correctedText: "3錠を服用", // "1" が脱落
+      evidence: [{ type: "context" }],
+      explanation: "脱落",
+    };
+    expect(validateProposal(propDrop, seg1).errors).toContain("NUMERIC_CHANGE");
+
+    const seg2 = createDummySegment({ text: "3錠を服用" });
+    const propAdd: CorrectionProposal = {
+      id: "prop-add",
+      segmentId: seg2.id,
+      originalText: seg2.text,
+      correctedText: "1回3錠を服用", // "1" を勝手に追加
+      evidence: [{ type: "context" }],
+      explanation: "追加",
+    };
+    expect(validateProposal(propAdd, seg2).errors).toContain("NUMERIC_CHANGE");
   });
 });
 
@@ -888,6 +1172,58 @@ describe("runCorrectionForDocument (Shared Execution Core)", () => {
     expect(result.status).toBe("success");
     expect(capturedProposals).not.toBeNull();
     expect(capturedProposals!.size).toBe(1);
+  });
+
+  it("NUMERIC_CHANGE が発生した提案のみが破棄され、同バッチ内の他の有効な提案は正常にステージングされる（ジョブ全体は失敗しない）", async () => {
+    const seg1 = createDummySegment({ id: "seg-1", text: "3人が参加しました" });
+    const seg2 = createDummySegment({ id: "seg-2", text: "クロナゼパンを服用" });
+    const doc = createDummyDocument([seg1, seg2]);
+
+    const provider = new MockCorrectionProvider([
+      {
+        id: "prop-numeric-fail",
+        segmentId: "seg-1",
+        originalText: "3人が参加しました",
+        correctedText: "5人が参加しました", // NUMERIC_CHANGE -> reject
+        evidence: [{ type: "context" }],
+        explanation: "人数改変",
+      },
+      {
+        id: "prop-valid",
+        segmentId: "seg-2",
+        originalText: "クロナゼパンを服用",
+        correctedText: "クロナゼパムを服用", // valid
+        evidence: [{ type: "dictionary", sourceId: "dict-1" }],
+        explanation: "薬剤名訂正",
+      },
+    ]);
+
+    const result = await runCorrectionForDocument({
+      document: doc,
+      provider,
+      mode: "standard",
+    });
+
+    expect(result.status).toBe("success");
+    if (result.status === "success") {
+      // seg-1 は NUMERIC_CHANGE で除外される
+      expect(result.proposals.has("seg-1")).toBe(false);
+      // seg-2 は正常に保持される
+      expect(result.proposals.has("seg-2")).toBe(true);
+      expect(result.proposals.get("seg-2")![0].id).toBe("prop-valid");
+    }
+  });
+
+  it("mode オプションが createCorrectionRequest に正しく渡される", () => {
+    const doc = createDummyDocument();
+    const reqMinimal = createCorrectionRequest(doc, undefined, undefined, "minimal");
+    expect(reqMinimal.mode).toBe("minimal");
+
+    const reqAggressive = createCorrectionRequest(doc, undefined, undefined, "aggressive");
+    expect(reqAggressive.mode).toBe("aggressive");
+
+    const reqDefault = createCorrectionRequest(doc);
+    expect(reqDefault.mode).toBe(DEFAULT_CORRECTION_MODE);
   });
 });
 

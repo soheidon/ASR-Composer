@@ -54,6 +54,15 @@ export interface CorrectionProposal extends ParsedProposalCandidate {
 }
 
 /**
+ * 補正モード（Correction Mode）
+ * - minimal: 明白なASR誤認識・用語のみを最小限修正（原文構造をほぼ完全に維持）
+ * - standard: 文脈を考慮した高確度なASR誤認識補正（推奨デフォルト）
+ * - aggressive: 発話内容を維持しながら助詞脱落や言い直しの軽微な整理も行う
+ */
+export type CorrectionMode = "minimal" | "standard" | "aggressive";
+export const DEFAULT_CORRECTION_MODE: CorrectionMode = "standard";
+
+/**
  * UI表示用差分構造
  */
 export interface TextChange {
@@ -70,6 +79,7 @@ export type ValidationErrorType =
   | "TEXT_MISMATCH"          // 受信時点で segment.text と不一致
   | "EMPTY_TEXT"
   | "NO_CHANGE"              // originalText === correctedText
+  | "NUMERIC_CHANGE"         // 数値トークンのシーケンス・値改変を検出（数値保護ガード）
   | "MISSING_EVIDENCE"       // evidence が空配列または未指定
   | "BAD_EVIDENCE_TYPE"
   | "INVALID_CONFIDENCE";
@@ -125,6 +135,7 @@ export interface CorrectionRequest {
   document: TranscriptDocument; // 常に参照分離されたクローン
   dictionary?: CorrectionDictionaryEntry[];
   context?: CorrectionContext;
+  mode?: CorrectionMode;
 }
 
 /**
@@ -154,12 +165,14 @@ export function cloneTranscriptDocument<T>(doc: T): T {
 export function createCorrectionRequest(
   doc: TranscriptDocument,
   dictionary?: CorrectionDictionaryEntry[],
-  context?: CorrectionContext
+  context?: CorrectionContext,
+  mode?: CorrectionMode
 ): CorrectionRequest {
   return {
     document: cloneTranscriptDocument(doc),
     dictionary: dictionary ? cloneTranscriptDocument(dictionary) : undefined,
     context: context ? cloneTranscriptDocument(context) : undefined,
+    mode: mode ?? DEFAULT_CORRECTION_MODE,
   };
 }
 
@@ -623,6 +636,54 @@ export function renderSideBySideDiff(
   };
 }
 
+/**
+ * テキストから数値トークン列（アラビア数字・半角/全角・整数・小数・符号付き）を抽出・正規化する。
+ * - 全角数字（０-９）-> 半角 (0-9)
+ * - 全角ピリオド（．）-> 半角 (.)
+ * - 全角カンマ（，）-> 半角 (,)
+ * - 負号（－, −, –, —）-> 半角ハイフン (-)
+ * - 正号（＋）-> 半角プラス (+)
+ * - 正しい桁区切りカンマ (例: 1,000 / 12,345,678) のみ除去
+ * - 不正な桁区切り (例: 1,2 / 12,34) は個別トークンとして分離し、結合・同一視しない
+ * - parseFloat / Number 変換を一切行わず、文字列トークンとして厳密に比較（任意精度整数・小数の精度落ち防止）
+ */
+export function extractNumericTokens(text: string): string[] {
+  if (!text) return [];
+
+  // 1. 全角数字 (０-９) -> 半角 (0-9)
+  let normalized = text.replace(/[０-９]/g, (s) =>
+    String.fromCharCode(s.charCodeAt(0) - 0xfee0)
+  );
+
+  // 2. 全角ピリオド・全角カンマを半角化
+  normalized = normalized
+    .replace(/．/g, ".")
+    .replace(/，/g, ",");
+
+  // 3. 符号の正規化（ASCII '-' / '+' へ統一）
+  // 負号: － (\uFF0D), − (\u2212), – (\u2013), — (\u2014) -> '-'
+  normalized = normalized.replace(/[－−–—]/g, "-");
+  // 正号: ＋ (\uFF0B) -> '+'
+  normalized = normalized.replace(/＋/g, "+");
+
+  // 4. 数値トークンの抽出
+  // 優先順位:
+  // 1) 符号付き 正しい桁区切り整数 + オプション小数 (例: -1,000.50, +12,345,678)
+  // 2) 符号付き 通常整数 + オプション小数 (例: -123, 0.5, 9007199254740993)
+  // 3) 符号付き 小数点始まり (例: -.5, +.05)
+  const regex = /[+-]?(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)/g;
+  const matches = normalized.match(regex);
+  if (!matches) return [];
+
+  return matches.map((m) => {
+    // 正しい桁区切りカンマのみを除去して正規化文字列トークンとする
+    if (m.includes(",")) {
+      return m.replace(/,/g, "");
+    }
+    return m;
+  });
+}
+
 const VALID_EVIDENCE_TYPES = new Set<CorrectionEvidenceType>(["dictionary", "background", "context"]);
 
 /**
@@ -665,11 +726,21 @@ export function validateProposalCandidate(
     errors.push("NO_CHANGE");
   }
 
-  // 6. MISSING_EVIDENCE
+  // 6. NUMERIC_CHANGE (数値保護ガード: 値や順序が改変された提案を安全に排除)
+  const origNumeric = extractNumericTokens(candidate.originalText);
+  const corrNumeric = extractNumericTokens(candidate.correctedText);
+  if (
+    origNumeric.length !== corrNumeric.length ||
+    origNumeric.some((token, idx) => token !== corrNumeric[idx])
+  ) {
+    errors.push("NUMERIC_CHANGE");
+  }
+
+  // 7. MISSING_EVIDENCE
   if (!Array.isArray(candidate.evidence) || candidate.evidence.length === 0) {
     errors.push("MISSING_EVIDENCE");
   } else {
-    // 7. BAD_EVIDENCE_TYPE
+    // 8. BAD_EVIDENCE_TYPE
     for (const ev of candidate.evidence) {
       if (!ev || !VALID_EVIDENCE_TYPES.has(ev.type)) {
         errors.push("BAD_EVIDENCE_TYPE");
@@ -678,7 +749,7 @@ export function validateProposalCandidate(
     }
   }
 
-  // 8. INVALID_CONFIDENCE
+  // 9. INVALID_CONFIDENCE
   if (candidate.confidence !== undefined) {
     if (
       typeof candidate.confidence !== "number" ||
@@ -810,6 +881,7 @@ export interface RunCorrectionOptions {
   provider: CorrectionProvider;
   dictionary?: CorrectionDictionaryEntry[];
   context?: CorrectionContext;
+  mode?: CorrectionMode;
   isCancelled?: () => boolean;
   onProgress?: (completed: number, total: number) => void;
 }
@@ -822,12 +894,12 @@ export async function runCorrectionForDocument(
   options: RunCorrectionOptions,
   onSuccess?: (proposals: Map<string, CorrectionProposal[]>) => void,
 ): Promise<RunCorrectionResult> {
-  const { document, provider, dictionary, context, isCancelled = () => false, onProgress } = options;
+  const { document, provider, dictionary, context, mode, isCancelled = () => false, onProgress } = options;
   if (isCancelled()) {
     return { status: "cancelled" };
   }
 
-  const request = createCorrectionRequest(document, dictionary, context);
+  const request = createCorrectionRequest(document, dictionary, context, mode);
   const proposals = await provider.correct(request, onProgress);
 
   if (isCancelled()) {

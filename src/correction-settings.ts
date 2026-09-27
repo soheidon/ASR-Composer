@@ -1,4 +1,5 @@
 import type { InvokeFn } from "./ollama-provider";
+import { type CorrectionMode, DEFAULT_CORRECTION_MODE } from "./correction";
 
 export interface SavedProviderSettings {
   env_name?: string;
@@ -18,6 +19,7 @@ export interface SavedAppSettings {
   correction_enabled?: boolean;
   correction_provider?: string;
   correction_model?: string;
+  correction_mode?: CorrectionMode | string;
   correction_use_dictionary?: boolean;
   correction_use_background?: boolean;
 }
@@ -26,6 +28,7 @@ export interface SavedCorrectionSettings {
   correction_enabled: boolean;
   correction_provider: string;
   correction_model: string;
+  correction_mode?: CorrectionMode;
   correction_use_dictionary?: boolean;
   correction_use_background?: boolean;
 }
@@ -34,6 +37,7 @@ export interface ResolvedCorrectionProvider {
   providerId: "ollama";
   baseUrl: string;
   model: string;
+  mode: CorrectionMode;
   useDictionary: boolean;
   useBackground: boolean;
 }
@@ -84,10 +88,21 @@ export async function resolveCorrectionProvider(
     return null;
   }
 
+  // 3. correction_mode の解決（無効値・旧設定は "standard" にフォールバック）
+  let mode: CorrectionMode = DEFAULT_CORRECTION_MODE;
+  if (
+    settings?.correction_mode === "minimal" ||
+    settings?.correction_mode === "standard" ||
+    settings?.correction_mode === "aggressive"
+  ) {
+    mode = settings.correction_mode;
+  }
+
   return {
     providerId: "ollama",
     baseUrl,
     model: selectedModel,
+    mode,
     useDictionary: settings?.correction_use_dictionary !== false,
     useBackground: settings?.correction_use_background !== false,
   };
@@ -101,6 +116,7 @@ export async function saveCorrectionSettings(
     enabled: settings.correction_enabled,
     provider: settings.correction_provider,
     model: settings.correction_model,
+    mode: settings.correction_mode,
     useDictionary: settings.correction_use_dictionary,
     useBackground: settings.correction_use_background,
   });

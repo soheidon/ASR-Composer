@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   OllamaCorrectionProvider,
   buildChunkUserPrompt,
+  buildSystemPrompt,
   OLLAMA_PROPOSAL_SCHEMA,
   OLLAMA_CORRECTION_SYSTEM_PROMPT,
 } from "./ollama-provider";
@@ -40,7 +41,47 @@ function createDummyDoc(segments: TranscriptSegment[]): TranscriptDocument {
 }
 
 describe("OllamaCorrectionProvider", () => {
-  it("buildChunkUserPrompt: 辞書、背景情報、前後コンテキスト、対象セグメントをフォーマットする", () => {
+  describe("buildSystemPrompt & Mode Directives", () => {
+    it("minimal: 最小修正ディレクティブを含み、積極修正ディレクティブを含まない", () => {
+      const prompt = buildSystemPrompt("minimal");
+      expect(prompt).toContain("【補正モード: 最小修正 (minimal)】");
+      expect(prompt).toContain("ASRとしての明白な誤認識・固有名詞・専門用語・辞書合致語句のみを最小限修正");
+      expect(prompt).not.toContain("【補正モード: 積極修正 (aggressive)】");
+    });
+
+    it("standard: 標準補正ディレクティブを含む", () => {
+      const prompt = buildSystemPrompt("standard");
+      expect(prompt).toContain("【補正モード: 標準 (standard)】");
+      expect(prompt).toContain("前後文脈から確実性の高いASR誤認識を訂正");
+      expect(prompt).not.toContain("【補正モード: 最小修正 (minimal)】");
+    });
+
+    it("aggressive: 積極修正ディレクティブを含む", () => {
+      const prompt = buildSystemPrompt("aggressive");
+      expect(prompt).toContain("【補正モード: 積極修正 (aggressive)】");
+      expect(prompt).toContain("助詞の脱落や言い直し・重複を整理");
+      expect(prompt).not.toContain("【補正モード: 最小修正 (minimal)】");
+    });
+
+    it("Global Safety Rules & Authority Hierarchy: 全てのモードで厳格に維持される", () => {
+      for (const mode of ["minimal", "standard", "aggressive"] as const) {
+        const prompt = buildSystemPrompt(mode);
+        expect(prompt).toContain("【Global Safety Rules（全モード共通・厳格遵守）】");
+        expect(prompt).toContain("発話に存在しない新事実・情報・推測を追加しないでください");
+        expect(prompt).toContain("要約・省略の禁止");
+        expect(prompt).toContain("セグメント構造の維持");
+        expect(prompt).toContain("話し言葉のニュアンス維持");
+        expect(prompt).toContain("背景情報（background.txt / 話者メモ）に記載されているだけの事実を発話へ勝手に追加しないでください");
+        expect(prompt).toContain("【コンテキストの権威性 (Authority Hierarchy)】");
+        expect(prompt).toContain("1. 対象セグメントの原文: 発話内容そのもの（最優先の正本）");
+        expect(prompt).toContain("2. 用語辞書 (dictionary): 正式表記を判断する強い補助根拠");
+        expect(prompt).toContain("3. 背景情報 (background): 候補選択・専門領域理解のための弱い文脈情報");
+        expect(prompt).toContain("4. 参照コンテキスト (context): 前後文脈理解のみ（補正対象外）");
+      }
+    });
+  });
+
+  it("buildChunkUserPrompt: 辞書、背景情報、前後コンテキスト、対象セグメントを明示的権威性とともにフォーマットする", () => {
     const target = [createDummySegment("seg-1", "ターゲット本文")];
     const before = [createDummySegment("seg-0", "前文脈")];
     const after = [createDummySegment("seg-2", "後文脈")];
@@ -51,9 +92,9 @@ describe("OllamaCorrectionProvider", () => {
     };
 
     const prompt = buildChunkUserPrompt(target, before, after, dict, ctx);
-    expect(prompt).toContain("【用語辞書】");
+    expect(prompt).toContain("【用語辞書（正式表記の強い補助根拠・背景情報より優先）】");
     expect(prompt).toContain("アスピリン (誤読/表記ゆれ: あすぴりん) [注記: 解熱鎮痛剤]");
-    expect(prompt).toContain("【背景情報】");
+    expect(prompt).toContain("【背景情報（文脈理解のみ・発話外の事実追加禁止）】");
     expect(prompt).toContain("医療系学会議事録");
     expect(prompt).toContain("【話者情報】");
     expect(prompt).toContain("- SPEAKER_00: 医師");
@@ -274,5 +315,33 @@ describe("OllamaCorrectionProvider", () => {
     const res = await provider.correct(createCorrectionRequest(doc));
     expect(res).toEqual([]);
     expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it("Correction Mode (minimal / aggressive) がリクエストからスナップショットされ、対応する System Prompt が送信される", async () => {
+    let capturedSystemPrompt: string | null = null;
+    const mockInvoke = async (_cmd: string, args?: any) => {
+      capturedSystemPrompt = args?.input?.messages?.[0]?.content ?? null;
+      return {
+        message: {
+          role: "assistant",
+          content: JSON.stringify({ proposals: [] }),
+        },
+      };
+    };
+
+    const provider = new OllamaCorrectionProvider({ invokeTauri: mockInvoke as any });
+    const doc = createDummyDoc([createDummySegment("seg-1", "テスト")]);
+
+    // minimal
+    const reqMinimal = createCorrectionRequest(doc, undefined, undefined, "minimal");
+    await provider.correct(reqMinimal);
+    expect(capturedSystemPrompt).toContain("【補正モード: 最小修正 (minimal)】");
+    expect(capturedSystemPrompt).not.toContain("【補正モード: 積極修正 (aggressive)】");
+
+    // aggressive
+    const reqAggressive = createCorrectionRequest(doc, undefined, undefined, "aggressive");
+    await provider.correct(reqAggressive);
+    expect(capturedSystemPrompt).toContain("【補正モード: 積極修正 (aggressive)】");
+    expect(capturedSystemPrompt).not.toContain("【補正モード: 最小修正 (minimal)】");
   });
 });

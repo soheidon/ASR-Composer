@@ -46,6 +46,10 @@ fn default_correction_provider() -> String {
     "ollama".to_string()
 }
 
+fn default_correction_mode() -> String {
+    "standard".to_string()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -71,6 +75,8 @@ pub struct AppSettings {
     pub correction_provider: String,
     #[serde(default)]
     pub correction_model: String,
+    #[serde(default = "default_correction_mode")]
+    pub correction_mode: String, // "minimal" | "standard" | "aggressive"
     #[serde(default = "default_true")]
     pub correction_use_dictionary: bool,
     #[serde(default = "default_true")]
@@ -90,6 +96,7 @@ impl Default for AppSettings {
             correction_enabled: false,
             correction_provider: "ollama".to_string(),
             correction_model: String::new(),
+            correction_mode: "standard".to_string(),
             correction_use_dictionary: true,
             correction_use_background: true,
         }
@@ -303,6 +310,7 @@ fn save_correction_settings(
     enabled: bool,
     provider: String,
     model: String,
+    mode: Option<String>,
     use_dictionary: Option<bool>,
     use_background: Option<bool>,
 ) -> Result<(), String> {
@@ -311,6 +319,13 @@ fn save_correction_settings(
     settings.correction_enabled = enabled;
     settings.correction_provider = provider;
     settings.correction_model = model;
+    if let Some(m) = mode {
+        if m == "minimal" || m == "standard" || m == "aggressive" {
+            settings.correction_mode = m;
+        } else {
+            settings.correction_mode = "standard".to_string();
+        }
+    }
     if let Some(ud) = use_dictionary {
         settings.correction_use_dictionary = ud;
     }

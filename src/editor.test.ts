@@ -617,7 +617,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
       id: "prop-1",
       segmentId: seg.id,
       originalText: seg.text,
-      correctedText: "採用された第一補正テキスト",
+      correctedText: "これはセグメント 1 の第一補正テキストです。",
       evidence: [
         { type: "dictionary", sourceId: "d-1", description: "医学辞書" },
       ],
@@ -628,7 +628,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
       id: "prop-2",
       segmentId: seg.id,
       originalText: seg.text,
-      correctedText: "却下される第二補正テキスト",
+      correctedText: "これはセグメント 1 の第二補正テキストです。",
       evidence: [{ type: "context", description: "前後文脈" }],
       explanation: "第二候補",
       confidence: 0.8,
@@ -648,7 +648,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
     applyBtns[0].click();
 
     // segment.text が更新される
-    expect(seg.text).toBe("採用された第一補正テキスト");
+    expect(seg.text).toBe("これはセグメント 1 の第一補正テキストです。");
     // originalText は絶対に不変
     expect(seg.originalText).toBe(initialOrigText);
     // status は edited
@@ -716,7 +716,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
       id: "prop-1",
       segmentId: seg.id,
       originalText: seg.text,
-      correctedText: "補正テキスト",
+      correctedText: "これはセグメント 1 の補正テキストです。",
       evidence: [{ type: "dictionary" }],
       explanation: "説明",
     };
@@ -936,7 +936,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
       id: "prop-0A",
       segmentId: seg0.id,
       originalText: seg0.text,
-      correctedText: "セグメント0補正テキストA",
+      correctedText: "これはセグメント 1 の補正テキストAです。",
       evidence: [{ type: "dictionary", description: "辞書A" }],
       explanation: "説明A",
     };
@@ -944,7 +944,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
       id: "prop-0B",
       segmentId: seg0.id,
       originalText: seg0.text,
-      correctedText: "セグメント0補正テキストB",
+      correctedText: "これはセグメント 1 の補正テキストBです。",
       evidence: [{ type: "context" }],
       explanation: "説明B",
     };
@@ -952,7 +952,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
       id: "prop-1A",
       segmentId: seg1.id,
       originalText: seg1.text,
-      correctedText: "セグメント1補正テキストA",
+      correctedText: "これはセグメント 2 の補正テキストAです。",
       evidence: [{ type: "background" }],
       explanation: "説明1A",
     };
@@ -986,7 +986,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
     applyBtn0A.click();
 
     // Step 5: segment.textが変わり、そのセグメントがedited
-    expect(seg0.text).toBe("セグメント0補正テキストA");
+    expect(seg0.text).toBe("これはセグメント 1 の補正テキストAです。");
     expect(seg0.originalText).toBe(initialOrigText0);
     expect(seg0.status).toBe("edited");
 
@@ -1257,7 +1257,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
       id: "prop-new",
       segmentId: seg0.id,
       originalText: seg0.text,
-      correctedText: "新バージョンの補正候補",
+      correctedText: "これはセグメント 1 の新バージョンの補正候補です。",
       evidence: [{ type: "dictionary" }],
       explanation: "新",
     };
@@ -1277,7 +1277,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
     const props = getActiveProposals().get(seg0.id)!;
     expect(props).toHaveLength(1);
     expect(props[0].id).toBe("prop-new");
-    expect(props[0].correctedText).toBe("新バージョンの補正候補");
+    expect(props[0].correctedText).toBe("これはセグメント 1 の新バージョンの補正候補です。");
 
     setCorrectionProviderForTest(null);
   });
@@ -1332,7 +1332,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
         id: "prop-run-A",
         segmentId: doc.segments[0].id,
         originalText: doc.segments[0].text,
-        correctedText: "Run A の遅延提案",
+        correctedText: "これはセグメント 1 の Run A の遅延提案です。",
         evidence: [{ type: "context" }],
         explanation: "A",
       },
@@ -1349,7 +1349,7 @@ describe("Phase 1 LLM Correction UI Integration", () => {
         id: "prop-run-B",
         segmentId: doc.segments[0].id,
         originalText: doc.segments[0].text,
-        correctedText: "Run B の正当提案",
+        correctedText: "これはセグメント 1 の Run B の正当提案です。",
         evidence: [{ type: "dictionary" }],
         explanation: "B",
       },
@@ -1376,6 +1376,14 @@ describe("Phase 1 LLM Correction UI Integration", () => {
         callCount++;
         return new Promise((resolve) => {
           resolveSettings = resolve;
+        });
+      }
+      if (cmd === "read_context_files") {
+        return Promise.resolve({
+          dictionary_csv: null,
+          background_txt: null,
+          dictionary_error: null,
+          background_error: null,
         });
       }
       if (cmd === "call_ollama_chat") {
@@ -1436,6 +1444,14 @@ describe("Phase 1 LLM Correction UI Integration", () => {
       if (cmd === "load_api_settings") {
         return new Promise((resolve) => {
           resolveSettings = resolve;
+        });
+      }
+      if (cmd === "read_context_files") {
+        return Promise.resolve({
+          dictionary_csv: null,
+          background_txt: null,
+          dictionary_error: null,
+          background_error: null,
         });
       }
       if (cmd === "call_ollama_chat") {

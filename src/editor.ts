@@ -18,6 +18,7 @@ import {
   type CorrectionProvider,
   type CorrectionDictionaryEntry,
   type CorrectionContext,
+  type CorrectionMode,
 } from "./correction";
 import { OllamaCorrectionProvider } from "./ollama-provider";
 import { resolveCorrectionProvider } from "./correction-settings";
@@ -506,6 +507,7 @@ export async function runLlmCorrection(): Promise<void> {
     let provider: CorrectionProvider;
     let dictionary: CorrectionDictionaryEntry[] | undefined;
     let context: CorrectionContext | undefined;
+    let mode: CorrectionMode | undefined;
 
     if (customCorrectionProvider) {
       provider = customCorrectionProvider;
@@ -524,6 +526,8 @@ export async function runLlmCorrection(): Promise<void> {
         });
         return;
       }
+
+      mode = resolved.mode;
 
       provider = new OllamaCorrectionProvider({
         baseUrl: resolved.baseUrl,
@@ -572,6 +576,7 @@ export async function runLlmCorrection(): Promise<void> {
         provider,
         dictionary,
         context,
+        mode,
         isCancelled,
         onProgress: (completed, total) => {
           if (isCancelled()) return;
