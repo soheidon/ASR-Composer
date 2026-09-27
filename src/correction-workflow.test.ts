@@ -1174,4 +1174,115 @@ describe("Correction Workflow Integration (Codex Final Review Cases 1 - 8)", () 
     );
     expect(editorDoc.segments[0].text).toBe("エディタ文章保護");
   });
+
+  it("Test K: 話者分離OFF時（複数ネイティブセグメントかつ speaker/originalSpeaker=null）でもLLM補正・ステージング・正本エディター適用が正常完走する", async () => {
+    document.body.innerHTML = `
+      <input type="checkbox" id="correctionEnabledCheckbox" checked />
+      <input type="checkbox" id="correctionDictCheckbox" />
+      <input type="checkbox" id="correctionBgCheckbox" />
+      <span id="correctionStatusBadge"></span>
+    `;
+
+    // 複数セグメント（speaker: null / originalSpeaker: null）のTranscriptDocument
+    const multiSegmentDoc: TranscriptDocument = {
+      schemaVersion: 1,
+      mediaPath: "/path/to/test.wav",
+      mediaFileName: "test.wav",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      language: "ja",
+      sourceEngine: "test-engine",
+      sourceRunId: "run-no-diar",
+      segments: [
+        {
+          id: "seg-000001",
+          start: 0.0,
+          end: 4.2,
+          speaker: null,
+          originalSpeaker: null,
+          text: "本日は、晴天なり。",
+          originalText: "本日は、晴天なり。",
+          sourceEngine: "test-engine",
+          sourceSegmentId: "1",
+          sourceRunId: "run-no-diar",
+          status: "raw",
+        },
+        {
+          id: "seg-000002",
+          start: 4.5,
+          end: 8.8,
+          speaker: null,
+          originalSpeaker: null,
+          text: "音声認識のテストを行っております。",
+          originalText: "音声認識のテストを行っております。",
+          sourceEngine: "test-engine",
+          sourceSegmentId: "2",
+          sourceRunId: "run-no-diar",
+          status: "raw",
+        },
+        {
+          id: "seg-000003",
+          start: 9.0,
+          end: 12.5,
+          speaker: null,
+          originalSpeaker: null,
+          text: "どうぞよろしくお願いいたします。",
+          originalText: "どうぞよろしくお願いいたします。",
+          sourceEngine: "test-engine",
+          sourceSegmentId: "3",
+          sourceRunId: "run-no-diar",
+          status: "raw",
+        },
+      ],
+    };
+
+    setLastTranscriptionDocumentForTest(multiSegmentDoc);
+    setAsrGenerationForTest(1);
+
+    const mockInvoke = vi.fn().mockImplementation(async (cmd: string) => {
+      if (cmd === "load_api_settings") {
+        return createMockSettings({
+          correction_enabled: true,
+          correction_use_dictionary: false,
+          correction_use_background: false,
+        });
+      }
+      if (cmd === "read_correction_context_files") {
+        return { dictionary_content: null, background_content: null };
+      }
+      if (cmd === "call_ollama_chat") {
+        // seg-000002 を補正
+        return {
+          message: {
+            content: JSON.stringify([
+              {
+                segmentId: "seg-000002",
+                originalText: "音声認識のテストを行っております。",
+                correctedText: "音声認識のテストを行なっています。",
+                evidence: [{ type: "context" }],
+                explanation: "より自然な表現への修正",
+              },
+            ]),
+          },
+        };
+      }
+      throw new Error(`Unhandled: ${cmd}`);
+    });
+
+    setTauriInvokeForTest(mockInvoke);
+
+    await runAsrAutoCorrection("job-no-diar", multiSegmentDoc, 1);
+
+    const result = getPendingCorrectionResultForTest();
+    expect(result).not.toBeNull();
+    const seg2Proposals = result?.proposals.get("seg-000002");
+    expect(seg2Proposals).toBeDefined();
+    expect(seg2Proposals?.length).toBe(1);
+    expect(seg2Proposals?.[0].correctedText).toBe("音声認識のテストを行なっています。");
+
+    // 全セグメントのspeakerがnullのままであることを検証
+    expect(multiSegmentDoc.segments.every((s) => s.speaker === null)).toBe(true);
+    expect(multiSegmentDoc.segments.every((s) => s.originalSpeaker === null)).toBe(true);
+    expect(multiSegmentDoc.segments.length).toBe(3);
+  });
 });

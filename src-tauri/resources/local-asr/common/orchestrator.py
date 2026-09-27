@@ -22,14 +22,39 @@ def main():
     os.makedirs(WORK_OUTPUT, exist_ok=True)
     os.makedirs(WORK_TMP, exist_ok=True)
 
+    enable_diarization = os.environ.get("ENABLE_DIARIZATION", "1") == "1"
+    wav_path = os.path.join(WORK_TMP, "input_16k.wav")
+
     # 1. 話者分離
-    print("[1/4] 話者分離中...", flush=True)
-    subprocess.run([
-        f"{VENV}/bin/python", "/app/diarize.py",
-        "--input", input_path,
-        "--output", segments_json,
-        "--tmp", WORK_TMP,
-    ], check=True)
+    if enable_diarization:
+        print("[1/4] 話者分離中...", flush=True)
+        subprocess.run([
+            f"{VENV}/bin/python", "/app/diarize.py",
+            "--input", input_path,
+            "--output", segments_json,
+            "--tmp", WORK_TMP,
+        ], check=True)
+    else:
+        # 話者分離スキップ: 音声を16kHz mono WAVに変換し、単一セグメント（speaker: None）としてASRを実行
+        # ※ ReazonSpeech ESPnet はセグメント単位の認識モデルのため、
+        #   diarizationなし時は音声全体 [0, duration] を1セグメント fallback として処理する。
+        print("[1/4] 話者分離スキップ（音声変換中）...", flush=True)
+        subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-ar", "16000", "-ac", "1", wav_path
+        ], check=True, capture_output=True)
+
+        from pydub import AudioSegment
+        audio = AudioSegment.from_wav(wav_path)
+        duration_sec = len(audio) / 1000.0
+
+        single_segment = [{
+            "speaker": None,
+            "start": 0.0,
+            "end": duration_sec,
+        }]
+        with open(segments_json, "w", encoding="utf-8") as f:
+            json.dump(single_segment, f, ensure_ascii=False, indent=2)
 
     # 2. 音声認識
     print("[2/4] 音声認識中...", flush=True)

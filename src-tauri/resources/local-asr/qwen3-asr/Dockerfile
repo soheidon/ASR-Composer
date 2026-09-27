@@ -1,6 +1,6 @@
 FROM asr-composer-base:cu126
 LABEL com.asr-composer.engine="qwen3-asr"
-LABEL com.asr-composer.environment-version="1.0.0"
+LABEL com.asr-composer.environment-version="1.1.0"
 LABEL com.asr-composer.asr-model="Qwen/Qwen3-ASR-1.7B"
 
 ENV DEBIAN_FRONTEND=noninteractive \

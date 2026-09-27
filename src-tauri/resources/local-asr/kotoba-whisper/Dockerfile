@@ -1,6 +1,6 @@
 FROM asr-composer-base:cu126
 LABEL com.asr-composer.engine="kotoba-whisper"
-LABEL com.asr-composer.environment-version="1.0.0"
+LABEL com.asr-composer.environment-version="1.1.0"
 LABEL com.asr-composer.asr-model="kotoba-tech/kotoba-whisper-v2.2"
 
 ENV DEBIAN_FRONTEND=noninteractive \

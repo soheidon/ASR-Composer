@@ -1017,11 +1017,11 @@ async function populateCloudEngines(select: HTMLSelectElement): Promise<void> {
 
 async function populateLocalEngines(select: HTMLSelectElement): Promise<void> {
   const statuses = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status");
-  const installed = statuses.filter((status) => status.installed);
-  if (installed.length === 0) {
+  const available = statuses.filter((status) => status.installed && !status.needsUpdate);
+  if (available.length === 0) {
     select.innerHTML = `
       <option value="" selected disabled>
-        インストール済みのローカルASRがありません
+        利用可能なローカルASRがありません（要インストールまたは更新）
       </option>
     `;
     select.value = "";
@@ -1029,10 +1029,16 @@ async function populateLocalEngines(select: HTMLSelectElement): Promise<void> {
   }
   select.innerHTML = statuses
     .map((status) => {
-      const label = status.installed
-        ? status.displayName
-        : `${status.displayName}（未インストール）`;
-      const disabled = status.installed ? "" : "disabled";
+      let label = status.displayName;
+      let isSelectable = false;
+      if (!status.installed) {
+        label = `${status.displayName}（未インストール）`;
+      } else if (status.needsUpdate) {
+        label = `${status.displayName}（更新が必要）`;
+      } else {
+        isSelectable = true;
+      }
+      const disabled = isSelectable ? "" : "disabled";
       return (
         `<option value="${escapeHtml(status.engine)}" ${disabled}>` +
         `${escapeHtml(label)}` +
@@ -4380,7 +4386,7 @@ function updateVisibleLocalAsrProgress(engine: string, percent: number, message:
 
 function reconcileConfirmedInstalls(statuses: LocalAsrEngineStatus[]): void {
   for (const status of statuses) {
-    if (status.installed && localAsrInstallStates.get(status.engine)?.status === "succeeded") {
+    if (status.installed && !status.needsUpdate && localAsrInstallStates.get(status.engine)?.status === "succeeded") {
       localAsrInstallStates.delete(status.engine);
     }
   }
@@ -4454,7 +4460,7 @@ async function confirmLocalAsrInstalled(engine: string): Promise<boolean> {
   for (let i = 0; i < 5; i++) {
     try {
       const status = await fetchLocalAsrEngineStatus(engine);
-      if (status.installed) return true;
+      if (status.installed && !status.needsUpdate) return true;
       // daemon-unavailableやinspect-errorは即時終了
       if (status.errorKind && status.errorKind !== "timeout") return false;
     } catch { /* retry */ }

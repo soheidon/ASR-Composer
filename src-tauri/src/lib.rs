@@ -619,10 +619,9 @@ fn validate_transcribe_settings(settings: &AppSettings) -> Result<(), String> {
     }
     let engine = settings.asr_engine.as_str();
     validate_asr_engine(engine)?;
-    if !settings.speaker_diarization {
-        return Err("話者分離「しない」は現在実装中です。今しばらくお待ちください。".to_string());
+    if settings.speaker_diarization {
+        validate_num_speakers(&settings.num_speakers)?;
     }
-    validate_num_speakers(&settings.num_speakers)?;
     let language_code = settings.asr_languages.get(engine).map(|s| s.as_str()).unwrap_or("ja");
     validate_language_for_engine(engine, language_code)?;
     Ok(())
@@ -648,11 +647,21 @@ fn build_transcribe_env_vars(
         ("WORK_OUTPUT".to_string(), "/work/output".to_string()),
         ("WORK_TMP".to_string(), "/work/tmp".to_string()),
         ("OUTPUT_FORMATS".to_string(), output_formats.join(",")),
+        (
+            "ENABLE_DIARIZATION".to_string(),
+            if settings.speaker_diarization {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            },
+        ),
     ];
-    // 話者数（auto時は渡さない）
-    let num = &settings.num_speakers;
-    if num != "auto" && !num.is_empty() {
-        vars.push(("NUM_SPEAKERS".to_string(), num.clone()));
+    // 話者数（話者分離ONかつautoでない時のみ渡す）
+    if settings.speaker_diarization {
+        let num = &settings.num_speakers;
+        if num != "auto" && !num.is_empty() {
+            vars.push(("NUM_SPEAKERS".to_string(), num.clone()));
+        }
     }
     // エンジン固有
     match engine {
@@ -872,6 +881,43 @@ fn resolve_output_dir(output_path: &str) -> Result<std::path::PathBuf, String> {
     }
 }
 
+/// エンジンのLocalAsrEngineStatusから文字起こし実行可能性を判定する純粋関数（テスト可能）。
+fn validate_engine_status_for_transcribe(status: &LocalAsrEngineStatus) -> Result<(), String> {
+    if !status.docker_running {
+        return Err("Docker Desktopが起動していません".to_string());
+    }
+    if !status.installed {
+        return Err(format!(
+            "選択したASRエンジン（{}）がインストールされていません。設定 > ローカルASR環境 からインストールしてください。",
+            status.display_name
+        ));
+    }
+    if status.needs_update {
+        return Err(format!(
+            "選択したASRエンジン（{}）の更新が必要です。設定 > ローカルASR環境 から更新してください。",
+            status.display_name
+        ));
+    }
+    Ok(())
+}
+
+/// 文字起こし開始前のエンジン状態確認（preflight guard）。
+/// 共通の LocalAsrEngineDef および evaluate_engine_image_status を再利用して判定する。
+fn validate_transcribe_engine_status(engine: &str) -> Result<(), String> {
+    let def = local_asr_engine_defs()
+        .into_iter()
+        .find(|d| d.engine == engine)
+        .ok_or_else(|| format!("未対応のASRエンジンです: {}", engine))?;
+
+    let docker_path = match find_docker_cli() {
+        Some(p) => p,
+        None => return Err("Dockerがインストールされていません".to_string()),
+    };
+
+    let status = get_single_engine_status_fast(&docker_path, "", &def);
+    validate_engine_status_for_transcribe(&status)
+}
+
 #[tauri::command]
 async fn local_asr_transcribe(
     app: tauri::AppHandle,
@@ -898,6 +944,9 @@ async fn local_asr_transcribe(
 
     let settings = load_settings(&app);
     let engine = settings.asr_engine.clone();
+
+    // エンジンイメージのインストールおよび更新状態を事前確認（Docker起動やディレクトリ作成より前に拒否）
+    validate_transcribe_engine_status(&engine)?;
 
     // 保存先ディレクトリ解決
     let save_dir = resolve_output_dir(&output_path)?;
@@ -936,8 +985,12 @@ async fn local_asr_transcribe(
     // 環境変数構築
     let env_vars = build_transcribe_env_vars(&engine, &settings, &input_filename, &output_formats)?;
 
-    // HF_TOKEN取得（話者分離ON前提、Phase A）
-    let hf_token = get_hf_token_value()?;
+    // HF_TOKEN取得（話者分離ON時のみ必須・コンテナへ渡す）
+    let hf_token = if settings.speaker_diarization {
+        Some(get_hf_token_value()?)
+    } else {
+        None
+    };
 
     // Docker image名解決
     let image_name = resolve_asr_image_name(&engine)?;
@@ -951,7 +1004,7 @@ async fn local_asr_transcribe(
         image_name,
         &work_dir,
         env_vars,
-        Some(&hf_token),
+        hf_token.as_deref(),
     )
     .await;
 
@@ -3405,9 +3458,11 @@ pub struct LocalAsrEngineStatus {
     pub engine: String,
     pub display_name: String,
     pub installed: bool,
+    pub needs_update: bool,
     pub image_name: String,
     pub image_id: Option<String>,
     pub environment_version: Option<String>,
+    pub expected_environment_version: Option<String>,
     pub model_name: Option<String>,
     pub docker_available: bool,
     pub docker_running: bool,
@@ -3419,6 +3474,7 @@ struct LocalAsrEngineDef {
     engine: &'static str,
     display_name: &'static str,
     image_name: &'static str,
+    expected_environment_version: &'static str,
 }
 
 fn local_asr_engine_defs() -> Vec<LocalAsrEngineDef> {
@@ -3427,16 +3483,19 @@ fn local_asr_engine_defs() -> Vec<LocalAsrEngineDef> {
             engine: "reazonspeech",
             display_name: "ReazonSpeech",
             image_name: "asr-composer-reazonspeech:cu126",
+            expected_environment_version: "2.1.0",
         },
         LocalAsrEngineDef {
             engine: "kotoba-whisper",
             display_name: "Kotoba Whisper v2.2",
             image_name: "asr-composer-kotoba-whisper:cu126",
+            expected_environment_version: "1.1.0",
         },
         LocalAsrEngineDef {
             engine: "qwen3-asr",
             display_name: "Qwen3 ASR",
             image_name: "asr-composer-qwen3-asr:cu126",
+            expected_environment_version: "1.1.0",
         },
     ]
 }
@@ -3521,6 +3580,88 @@ fn parse_docker_image_inspect(stdout: &str) -> Result<DockerImageInfo, DockerIma
     })
 }
 
+/// Dockerイメージの存在有無とラベル情報から、エンジンのインストール状態および更新要否を判定する純粋関数。
+fn evaluate_engine_image_status(
+    inspect_result: DockerImageInspectResult,
+    def: &LocalAsrEngineDef,
+    docker_available: bool,
+    docker_running: bool,
+) -> LocalAsrEngineStatus {
+    match inspect_result {
+        DockerImageInspectResult::Found(info) => {
+            let env_ver = info
+                .labels
+                .get("com.asr-composer.environment-version")
+                .cloned();
+            let model = info.labels.get("com.asr-composer.asr-model").cloned();
+            let needs_update = match &env_ver {
+                Some(v) => v.trim() != def.expected_environment_version,
+                None => true,
+            };
+            LocalAsrEngineStatus {
+                engine: def.engine.to_string(),
+                display_name: def.display_name.to_string(),
+                installed: true,
+                needs_update,
+                image_name: def.image_name.to_string(),
+                image_id: Some(info.image_id),
+                environment_version: env_ver,
+                expected_environment_version: Some(def.expected_environment_version.to_string()),
+                model_name: model,
+                docker_available,
+                docker_running,
+                error_kind: None,
+                error_message: None,
+            }
+        }
+        DockerImageInspectResult::NotFound => LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            needs_update: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            expected_environment_version: Some(def.expected_environment_version.to_string()),
+            model_name: None,
+            docker_available,
+            docker_running,
+            error_kind: None,
+            error_message: None,
+        },
+        DockerImageInspectResult::DaemonUnavailable => LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            needs_update: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            expected_environment_version: Some(def.expected_environment_version.to_string()),
+            model_name: None,
+            docker_available,
+            docker_running: false,
+            error_kind: Some("daemon-unavailable".to_string()),
+            error_message: Some("Docker Engineへ接続できませんでした".to_string()),
+        },
+        DockerImageInspectResult::InspectFailed => LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            needs_update: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            expected_environment_version: Some(def.expected_environment_version.to_string()),
+            model_name: None,
+            docker_available,
+            docker_running,
+            error_kind: Some("inspect-error".to_string()),
+            error_message: Some("Dockerイメージの状態を確認できませんでした".to_string()),
+        },
+    }
+}
+
 /// `docker --context <ctx> image inspect <image_name>` を実行し、イメージ情報を取得する。
 /// contextが空の場合は--contextを付けない（後方互換）。
 fn inspect_docker_image_with_context(
@@ -3594,82 +3735,16 @@ fn get_single_engine_status(
     def: &LocalAsrEngineDef,
 ) -> LocalAsrEngineStatus {
     if !docker_running {
-        return LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            model_name: None,
-            docker_available: true,
-            docker_running: false,
-            error_kind: None,
-            error_message: None,
-        };
+        return evaluate_engine_image_status(
+            DockerImageInspectResult::DaemonUnavailable,
+            def,
+            true,
+            false,
+        );
     }
 
-    match inspect_docker_image(docker_path, def.image_name) {
-        DockerImageInspectResult::Found(info) => {
-            let env_ver = info
-                .labels
-                .get("com.asr-composer.environment-version")
-                .cloned();
-            let model = info.labels.get("com.asr-composer.asr-model").cloned();
-            LocalAsrEngineStatus {
-                engine: def.engine.to_string(),
-                display_name: def.display_name.to_string(),
-                installed: true,
-                image_name: def.image_name.to_string(),
-                image_id: Some(info.image_id),
-                environment_version: env_ver,
-                model_name: model,
-                docker_available: true,
-                docker_running: true,
-                error_kind: None,
-                error_message: None,
-            }
-        }
-        DockerImageInspectResult::NotFound => LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            model_name: None,
-            docker_available: true,
-            docker_running: true,
-            error_kind: None,
-            error_message: None,
-        },
-        DockerImageInspectResult::DaemonUnavailable => LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            model_name: None,
-            docker_available: true,
-            docker_running: true,
-            error_kind: Some("daemon-unavailable".to_string()),
-            error_message: Some("Docker Engineへ接続できませんでした".to_string()),
-        },
-        DockerImageInspectResult::InspectFailed => LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            model_name: None,
-            docker_available: true,
-            docker_running: true,
-            error_kind: Some("inspect-error".to_string()),
-            error_message: Some("Dockerイメージの状態を確認できませんでした".to_string()),
-        },
-    }
+    let inspect_result = inspect_docker_image(docker_path, def.image_name);
+    evaluate_engine_image_status(inspect_result, def, true, true)
 }
 
 fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
@@ -3680,19 +3755,12 @@ fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
     if !docker_available {
         return defs
             .iter()
-            .map(|d| LocalAsrEngineStatus {
-                engine: d.engine.to_string(),
-                display_name: d.display_name.to_string(),
-                installed: false,
-                image_name: d.image_name.to_string(),
-                image_id: None,
-                environment_version: None,
-                model_name: None,
-                docker_available: false,
-                docker_running: false,
-                error_kind: None,
-                error_message: None,
-            })
+            .map(|d| evaluate_engine_image_status(
+                DockerImageInspectResult::NotFound,
+                d,
+                false,
+                false,
+            ))
             .collect();
     }
 
@@ -3727,19 +3795,12 @@ fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
 fn unavailable_local_asr_statuses() -> Vec<LocalAsrEngineStatus> {
     local_asr_engine_defs()
         .iter()
-        .map(|d| LocalAsrEngineStatus {
-            engine: d.engine.to_string(),
-            display_name: d.display_name.to_string(),
-            installed: false,
-            image_name: d.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            model_name: None,
-            docker_available: false,
-            docker_running: false,
-            error_kind: None,
-            error_message: None,
-        })
+        .map(|d| evaluate_engine_image_status(
+            DockerImageInspectResult::NotFound,
+            d,
+            false,
+            false,
+        ))
         .collect()
 }
 
@@ -3830,9 +3891,7 @@ async fn inspect_docker_image_by_id_async(
     docker_path: std::path::PathBuf,
     docker_context: &str,
     image_id: String,
-    image_name: String,
-    engine: String,
-    display_name: String,
+    def: &LocalAsrEngineDef,
 ) -> LocalAsrEngineStatus {
     use tokio::process::Command;
 
@@ -3850,12 +3909,14 @@ async fn inspect_docker_image_by_id_async(
         Ok(c) => c,
         Err(e) => {
             return LocalAsrEngineStatus {
-                engine,
-                display_name,
+                engine: def.engine.to_string(),
+                display_name: def.display_name.to_string(),
                 installed: false,
-                image_name,
+                needs_update: false,
+                image_name: def.image_name.to_string(),
                 image_id: None,
                 environment_version: None,
+                expected_environment_version: Some(def.expected_environment_version.to_string()),
                 model_name: None,
                 docker_available: true,
                 docker_running: true,
@@ -3876,115 +3937,47 @@ async fn inspect_docker_image_by_id_async(
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let inspect_result = classify_docker_inspect_failure(&stderr);
-                match inspect_result {
-                    DockerImageInspectResult::NotFound => LocalAsrEngineStatus {
-                        engine,
-                        display_name,
-                        installed: false,
-                        image_name,
-                        image_id: None,
-                        environment_version: None,
-                        model_name: None,
-                        docker_available: true,
-                        docker_running: true,
-                        error_kind: None,
-                        error_message: None,
-                    },
-                    DockerImageInspectResult::DaemonUnavailable => LocalAsrEngineStatus {
-                        engine,
-                        display_name,
-                        installed: false,
-                        image_name,
-                        image_id: None,
-                        environment_version: None,
-                        model_name: None,
-                        docker_available: true,
-                        docker_running: false,
-                        error_kind: Some("daemon-unavailable".to_string()),
-                        error_message: Some("Docker Engineへ接続できませんでした".to_string()),
-                    },
-                    _ => LocalAsrEngineStatus {
-                        engine,
-                        display_name,
-                        installed: false,
-                        image_name,
-                        image_id: None,
-                        environment_version: None,
-                        model_name: None,
-                        docker_available: true,
-                        docker_running: true,
-                        error_kind: Some("inspect-error".to_string()),
-                        error_message: Some("Dockerイメージの状態を確認できませんでした".to_string()),
-                    },
-                }
+                let docker_running = !matches!(inspect_result, DockerImageInspectResult::DaemonUnavailable);
+                evaluate_engine_image_status(inspect_result, def, true, docker_running)
             } else {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                match parse_docker_image_inspect(&stdout) {
-                    Ok(info) => {
-                        let env_ver = info.labels.get("com.asr-composer.environment-version").cloned();
-                        let model = info.labels.get("com.asr-composer.asr-model").cloned();
-                        LocalAsrEngineStatus {
-                            engine,
-                            display_name,
-                            installed: true,
-                            image_name,
-                            image_id: Some(info.image_id),
-                            environment_version: env_ver,
-                            model_name: model,
-                            docker_available: true,
-                            docker_running: true,
-                            error_kind: None,
-                            error_message: None,
-                        }
-                    }
-                    Err(_) => LocalAsrEngineStatus {
-                        engine,
-                        display_name,
-                        installed: false,
-                        image_name,
-                        image_id: None,
-                        environment_version: None,
-                        model_name: None,
-                        docker_available: true,
-                        docker_running: true,
-                        error_kind: Some("inspect-error".to_string()),
-                        error_message: Some("Dockerイメージの状態を確認できませんでした".to_string()),
-                    },
-                }
+                let inspect_result = match parse_docker_image_inspect(&stdout) {
+                    Ok(info) => DockerImageInspectResult::Found(info),
+                    Err(res) => res,
+                };
+                evaluate_engine_image_status(inspect_result, def, true, true)
             }
         }
-        Ok(Err(e)) => {
-            // wait_with_output失敗
-            LocalAsrEngineStatus {
-                engine,
-                display_name,
-                installed: false,
-                image_name,
-                image_id: None,
-                environment_version: None,
-                model_name: None,
-                docker_available: true,
-                docker_running: true,
-                error_kind: Some("inspect-error".to_string()),
-                error_message: Some(format!("Docker実行エラー: {e}")),
-            }
-        }
-        Err(_) => {
-            // タイムアウト — kill_on_drop(true)で子プロセスは自動終了
-            LocalAsrEngineStatus {
-                engine,
-                display_name,
-                installed: false,
-                image_name,
-                image_id: None,
-                environment_version: None,
-                model_name: None,
-                docker_available: true,
-                docker_running: true,
-                error_kind: Some("timeout".to_string()),
-                error_message: Some("Docker応答がタイムアウトしました（5秒）".to_string()),
-            }
-        }
+        Ok(Err(e)) => LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            needs_update: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            expected_environment_version: Some(def.expected_environment_version.to_string()),
+            model_name: None,
+            docker_available: true,
+            docker_running: true,
+            error_kind: Some("inspect-error".to_string()),
+            error_message: Some(format!("Docker実行エラー: {e}")),
+        },
+        Err(_) => LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            needs_update: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            expected_environment_version: Some(def.expected_environment_version.to_string()),
+            model_name: None,
+            docker_available: true,
+            docker_running: true,
+            error_kind: Some("timeout".to_string()),
+            error_message: Some("Docker応答がタイムアウトしました（5秒）".to_string()),
+        },
     }
 }
 
@@ -4027,27 +4020,18 @@ async fn local_asr_get_status_fast() -> Vec<LocalAsrEngineStatus> {
                     docker_path.clone(),
                     &docker_context,
                     image_id.clone(),
-                    def.image_name.to_string(),
-                    def.engine.to_string(),
-                    def.display_name.to_string(),
+                    &def,
                 )
                 .await;
                 results.push(status);
             }
             None => {
-                results.push(LocalAsrEngineStatus {
-                    engine: def.engine.to_string(),
-                    display_name: def.display_name.to_string(),
-                    installed: false,
-                    image_name: def.image_name.to_string(),
-                    image_id: None,
-                    environment_version: None,
-                    model_name: None,
-                    docker_available: true,
-                    docker_running: true,
-                    error_kind: None,
-                    error_message: None,
-                });
+                results.push(evaluate_engine_image_status(
+                    DockerImageInspectResult::NotFound,
+                    &def,
+                    true,
+                    true,
+                ));
             }
         }
     }
@@ -4063,9 +4047,11 @@ fn error_statuses(
             engine: d.engine.to_string(),
             display_name: d.display_name.to_string(),
             installed: false,
+            needs_update: false,
             image_name: d.image_name.to_string(),
             image_id: None,
             environment_version: None,
+            expected_environment_version: Some(d.expected_environment_version.to_string()),
             model_name: None,
             docker_available: true,
             docker_running: false,
@@ -4081,64 +4067,8 @@ fn get_single_engine_status_fast(
     docker_context: &str,
     def: &LocalAsrEngineDef,
 ) -> LocalAsrEngineStatus {
-    match inspect_docker_image_with_context(docker_path, docker_context, def.image_name) {
-        DockerImageInspectResult::Found(info) => {
-            let env_ver = info.labels.get("com.asr-composer.environment-version").cloned();
-            let model = info.labels.get("com.asr-composer.asr-model").cloned();
-            LocalAsrEngineStatus {
-                engine: def.engine.to_string(),
-                display_name: def.display_name.to_string(),
-                installed: true,
-                image_name: def.image_name.to_string(),
-                image_id: Some(info.image_id),
-                environment_version: env_ver,
-                model_name: model,
-                docker_available: true,
-                docker_running: true,
-                error_kind: None,
-                error_message: None,
-            }
-        }
-        DockerImageInspectResult::NotFound => LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            model_name: None,
-            docker_available: true,
-            docker_running: true,
-            error_kind: None,
-            error_message: None,
-        },
-        DockerImageInspectResult::DaemonUnavailable => LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            model_name: None,
-            docker_available: true,
-            docker_running: false,
-            error_kind: Some("daemon-unavailable".to_string()),
-            error_message: Some("Docker Engineへ接続できませんでした".to_string()),
-        },
-        DockerImageInspectResult::InspectFailed => LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            model_name: None,
-            docker_available: true,
-            docker_running: true,
-            error_kind: Some("inspect-error".to_string()),
-            error_message: Some("Dockerイメージの状態を確認できませんでした".to_string()),
-        },
-    }
+    let inspect_result = inspect_docker_image_with_context(docker_path, docker_context, def.image_name);
+    evaluate_engine_image_status(inspect_result, def, true, true)
 }
 
 fn local_asr_get_engine_status_sync(engine: &str) -> Result<LocalAsrEngineStatus, String> {
@@ -4150,19 +4080,12 @@ fn local_asr_get_engine_status_sync(engine: &str) -> Result<LocalAsrEngineStatus
     let docker_path = match find_docker_cli() {
         Some(path) => path,
         None => {
-            return Ok(LocalAsrEngineStatus {
-                engine: def.engine.to_string(),
-                display_name: def.display_name.to_string(),
-                installed: false,
-                image_name: def.image_name.to_string(),
-                image_id: None,
-                environment_version: None,
-                model_name: None,
-                docker_available: false,
-                docker_running: false,
-                error_kind: None,
-                error_message: None,
-            });
+            return Ok(evaluate_engine_image_status(
+                DockerImageInspectResult::NotFound,
+                &def,
+                false,
+                false,
+            ));
         }
     };
 
@@ -4419,6 +4342,14 @@ async fn local_asr_install(
         return Err(format!(
             "{}環境を構築しましたが、Dockerイメージを確認できませんでした",
             def.display_name
+        ));
+    }
+    if status.needs_update {
+        return Err(format!(
+            "{}環境を構築しましたが、環境バージョンが一致しません（期待: {}、実際: {:?}）",
+            def.display_name,
+            def.expected_environment_version,
+            status.environment_version
         ));
     }
 
@@ -7176,9 +7107,11 @@ mod tests {
             engine: "reazonspeech".to_string(),
             display_name: "ReazonSpeech".to_string(),
             installed: true,
+            needs_update: false,
             image_name: "asr-composer-reazonspeech:cu126".to_string(),
             image_id: Some("sha256:abc123".to_string()),
-            environment_version: Some("1.0.0".to_string()),
+            environment_version: Some("2.1.0".to_string()),
+            expected_environment_version: Some("2.1.0".to_string()),
             model_name: Some("reazon-research/reazonspeech-espnet-v2".to_string()),
             docker_available: true,
             docker_running: true,
@@ -7190,11 +7123,248 @@ mod tests {
         assert!(json.contains("imageName"));
         assert!(json.contains("imageId"));
         assert!(json.contains("environmentVersion"));
+        assert!(json.contains("expectedEnvironmentVersion"));
+        assert!(json.contains("needsUpdate"));
         assert!(json.contains("modelName"));
         assert!(json.contains("dockerAvailable"));
         assert!(json.contains("dockerRunning"));
         assert!(!json.contains("display_name"));
         assert!(!json.contains("image_name"));
+        assert!(!json.contains("needs_update"));
+        assert!(!json.contains("expected_environment_version"));
+    }
+
+    #[test]
+    fn test_evaluate_engine_image_status_missing_image() {
+        let def = LocalAsrEngineDef {
+            engine: "reazonspeech",
+            display_name: "ReazonSpeech",
+            image_name: "asr-composer-reazonspeech:cu126",
+            expected_environment_version: "2.1.0",
+        };
+        let status = evaluate_engine_image_status(
+            DockerImageInspectResult::NotFound,
+            &def,
+            true,
+            true,
+        );
+        assert!(!status.installed);
+        assert!(!status.needs_update);
+        assert_eq!(status.expected_environment_version, Some("2.1.0".to_string()));
+        assert_eq!(status.environment_version, None);
+    }
+
+    #[test]
+    fn test_evaluate_engine_image_status_matching_version() {
+        let def = LocalAsrEngineDef {
+            engine: "reazonspeech",
+            display_name: "ReazonSpeech",
+            image_name: "asr-composer-reazonspeech:cu126",
+            expected_environment_version: "2.1.0",
+        };
+        let mut labels = HashMap::new();
+        labels.insert("com.asr-composer.environment-version".to_string(), "2.1.0".to_string());
+        labels.insert("com.asr-composer.asr-model".to_string(), "reazon-research/reazonspeech-espnet-v2".to_string());
+        let info = DockerImageInfo {
+            image_id: "sha256:12345".to_string(),
+            labels,
+        };
+        let status = evaluate_engine_image_status(
+            DockerImageInspectResult::Found(info),
+            &def,
+            true,
+            true,
+        );
+        assert!(status.installed);
+        assert!(!status.needs_update);
+        assert_eq!(status.environment_version.as_deref(), Some("2.1.0"));
+        assert_eq!(status.expected_environment_version.as_deref(), Some("2.1.0"));
+    }
+
+    #[test]
+    fn test_evaluate_engine_image_status_older_version() {
+        let def = LocalAsrEngineDef {
+            engine: "reazonspeech",
+            display_name: "ReazonSpeech",
+            image_name: "asr-composer-reazonspeech:cu126",
+            expected_environment_version: "2.1.0",
+        };
+        let mut labels = HashMap::new();
+        labels.insert("com.asr-composer.environment-version".to_string(), "2.0.0".to_string());
+        let info = DockerImageInfo {
+            image_id: "sha256:12345".to_string(),
+            labels,
+        };
+        let status = evaluate_engine_image_status(
+            DockerImageInspectResult::Found(info),
+            &def,
+            true,
+            true,
+        );
+        assert!(status.installed);
+        assert!(status.needs_update);
+        assert_eq!(status.environment_version.as_deref(), Some("2.0.0"));
+        assert_eq!(status.expected_environment_version.as_deref(), Some("2.1.0"));
+    }
+
+    #[test]
+    fn test_evaluate_engine_image_status_mismatch_version() {
+        let def = LocalAsrEngineDef {
+            engine: "kotoba-whisper",
+            display_name: "Kotoba Whisper v2.2",
+            image_name: "asr-composer-kotoba-whisper:cu126",
+            expected_environment_version: "1.1.0",
+        };
+        let mut labels = HashMap::new();
+        labels.insert("com.asr-composer.environment-version".to_string(), "9.9.9".to_string());
+        let info = DockerImageInfo {
+            image_id: "sha256:kotoba123".to_string(),
+            labels,
+        };
+        let status = evaluate_engine_image_status(
+            DockerImageInspectResult::Found(info),
+            &def,
+            true,
+            true,
+        );
+        assert!(status.installed);
+        assert!(status.needs_update);
+        assert_eq!(status.environment_version.as_deref(), Some("9.9.9"));
+        assert_eq!(status.expected_environment_version.as_deref(), Some("1.1.0"));
+    }
+
+    #[test]
+    fn test_evaluate_engine_image_status_no_label() {
+        let def = LocalAsrEngineDef {
+            engine: "qwen3-asr",
+            display_name: "Qwen3 ASR",
+            image_name: "asr-composer-qwen3-asr:cu126",
+            expected_environment_version: "1.1.0",
+        };
+        let info = DockerImageInfo {
+            image_id: "sha256:qwen123".to_string(),
+            labels: HashMap::new(),
+        };
+        let status = evaluate_engine_image_status(
+            DockerImageInspectResult::Found(info),
+            &def,
+            true,
+            true,
+        );
+        assert!(status.installed);
+        assert!(status.needs_update);
+        assert_eq!(status.environment_version, None);
+        assert_eq!(status.expected_environment_version.as_deref(), Some("1.1.0"));
+    }
+
+    // ---- validate_engine_status_for_transcribe (preflight tests) ----
+
+    #[test]
+    fn test_validate_engine_status_for_transcribe_current_ok() {
+        let def = LocalAsrEngineDef {
+            engine: "reazonspeech",
+            display_name: "ReazonSpeech",
+            image_name: "asr-composer-reazonspeech:cu126",
+            expected_environment_version: "2.1.0",
+        };
+        let mut labels = HashMap::new();
+        labels.insert("com.asr-composer.environment-version".to_string(), "2.1.0".to_string());
+        let info = DockerImageInfo {
+            image_id: "sha256:current123".to_string(),
+            labels,
+        };
+        let status = evaluate_engine_image_status(
+            DockerImageInspectResult::Found(info),
+            &def,
+            true,
+            true,
+        );
+        assert!(validate_engine_status_for_transcribe(&status).is_ok());
+    }
+
+    #[test]
+    fn test_validate_engine_status_for_transcribe_outdated_rejected() {
+        let def = LocalAsrEngineDef {
+            engine: "reazonspeech",
+            display_name: "ReazonSpeech",
+            image_name: "asr-composer-reazonspeech:cu126",
+            expected_environment_version: "2.1.0",
+        };
+        let mut labels = HashMap::new();
+        labels.insert("com.asr-composer.environment-version".to_string(), "2.0.0".to_string());
+        let info = DockerImageInfo {
+            image_id: "sha256:old123".to_string(),
+            labels,
+        };
+        let status = evaluate_engine_image_status(
+            DockerImageInspectResult::Found(info),
+            &def,
+            true,
+            true,
+        );
+        let err = validate_engine_status_for_transcribe(&status).unwrap_err();
+        assert!(err.contains("ReazonSpeech"));
+        assert!(err.contains("更新が必要"));
+    }
+
+    #[test]
+    fn test_validate_engine_status_for_transcribe_missing_label_rejected() {
+        let def = LocalAsrEngineDef {
+            engine: "qwen3-asr",
+            display_name: "Qwen3 ASR",
+            image_name: "asr-composer-qwen3-asr:cu126",
+            expected_environment_version: "1.1.0",
+        };
+        let info = DockerImageInfo {
+            image_id: "sha256:nolabel123".to_string(),
+            labels: HashMap::new(),
+        };
+        let status = evaluate_engine_image_status(
+            DockerImageInspectResult::Found(info),
+            &def,
+            true,
+            true,
+        );
+        let err = validate_engine_status_for_transcribe(&status).unwrap_err();
+        assert!(err.contains("Qwen3 ASR"));
+        assert!(err.contains("更新が必要"));
+    }
+
+    #[test]
+    fn test_validate_engine_status_for_transcribe_not_installed_rejected() {
+        let def = LocalAsrEngineDef {
+            engine: "kotoba-whisper",
+            display_name: "Kotoba Whisper v2.2",
+            image_name: "asr-composer-kotoba-whisper:cu126",
+            expected_environment_version: "1.1.0",
+        };
+        let status = evaluate_engine_image_status(
+            DockerImageInspectResult::NotFound,
+            &def,
+            true,
+            true,
+        );
+        let err = validate_engine_status_for_transcribe(&status).unwrap_err();
+        assert!(err.contains("Kotoba Whisper v2.2"));
+        assert!(err.contains("インストールされていません"));
+    }
+
+    #[test]
+    fn test_validate_engine_status_for_transcribe_docker_stopped_rejected() {
+        let def = LocalAsrEngineDef {
+            engine: "reazonspeech",
+            display_name: "ReazonSpeech",
+            image_name: "asr-composer-reazonspeech:cu126",
+            expected_environment_version: "2.1.0",
+        };
+        let status = evaluate_engine_image_status(
+            DockerImageInspectResult::DaemonUnavailable,
+            &def,
+            true,
+            false,
+        );
+        let err = validate_engine_status_for_transcribe(&status).unwrap_err();
+        assert!(err.contains("Docker Desktopが起動していません"));
     }
 
     // ---- local_asr_engine_defs ----
@@ -7952,9 +8122,45 @@ mod tests {
         settings.asr_mode = "local".to_string();
         settings.asr_engine = "qwen3-asr".to_string();
         settings.speaker_diarization = false;
+        settings.asr_languages.insert("qwen3-asr".to_string(), "ja".to_string());
         let result = validate_transcribe_settings(&settings);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("話者分離"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_transcribe_settings_speaker_off_ignores_num_speakers() {
+        let mut settings = AppSettings::default();
+        settings.asr_mode = "local".to_string();
+        settings.asr_engine = "reazonspeech".to_string();
+        settings.speaker_diarization = false;
+        // 無効な話者数（"9" や "invalid"）が残っていても、話者分離OFFならバリデーションを通過する
+        settings.num_speakers = "9".to_string();
+        let result = validate_transcribe_settings(&settings);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_transcribe_env_vars_speaker_off() {
+        let mut settings = AppSettings::default();
+        settings.speaker_diarization = false;
+        settings.num_speakers = "2".to_string();
+        let formats = vec!["txt".to_string(), "srt".to_string()];
+        let vars = build_transcribe_env_vars("reazonspeech", &settings, "test.wav", &formats).unwrap();
+        let map: std::collections::HashMap<String, String> = vars.into_iter().collect();
+        assert_eq!(map.get("ENABLE_DIARIZATION").map(|s| s.as_str()), Some("0"));
+        assert_eq!(map.get("NUM_SPEAKERS"), None);
+    }
+
+    #[test]
+    fn test_build_transcribe_env_vars_speaker_on() {
+        let mut settings = AppSettings::default();
+        settings.speaker_diarization = true;
+        settings.num_speakers = "2".to_string();
+        let formats = vec!["txt".to_string()];
+        let vars = build_transcribe_env_vars("kotoba-whisper", &settings, "test.wav", &formats).unwrap();
+        let map: std::collections::HashMap<String, String> = vars.into_iter().collect();
+        assert_eq!(map.get("ENABLE_DIARIZATION").map(|s| s.as_str()), Some("1"));
+        assert_eq!(map.get("NUM_SPEAKERS").map(|s| s.as_str()), Some("2"));
     }
 
     #[test]

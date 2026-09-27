@@ -294,6 +294,7 @@ describe("getLocalAsrUiState", () => {
     engine: "reazonspeech",
     displayName: "ReazonSpeech",
     installed: false,
+    needsUpdate: false,
     imageName: "asr-composer-reazonspeech:cu126",
     imageId: null,
     environmentVersion: null,
@@ -306,6 +307,10 @@ describe("getLocalAsrUiState", () => {
 
   it("null status returns 'loading'", () => {
     expect(getLocalAsrUiState(null)).toBe("loading");
+  });
+
+  it("installed=true, needsUpdate=true returns 'needs-update'", () => {
+    expect(getLocalAsrUiState({ ...baseEngine, dockerAvailable: true, dockerRunning: true, installed: true, needsUpdate: true })).toBe("needs-update");
   });
 
   it("dockerAvailable:false → 'no-docker'", () => {
@@ -383,6 +388,7 @@ describe("renderLocalAsrSection", () => {
     engine: "reazonspeech",
     displayName: "ReazonSpeech",
     installed: false,
+    needsUpdate: false,
     imageName: "asr-composer-reazonspeech:cu126",
     imageId: null,
     environmentVersion: null,
@@ -537,6 +543,27 @@ describe("renderLocalAsrSection", () => {
     expect(btn).toBeTruthy();
     expect(btn!.textContent).toContain("削除");
     expect(btn!.getAttribute("data-uninstall-engine")).toBe("reazonspeech");
+  });
+
+  it("needs-update state shows update button and warning message", () => {
+    const html = renderLocalAsrSection({ kind: "engines", statuses: [{
+      ...baseEngine,
+      dockerAvailable: true,
+      dockerRunning: true,
+      installed: true,
+      needsUpdate: true,
+      environmentVersion: "2.0.0",
+      expectedEnvironmentVersion: "2.1.0",
+    }] });
+    document.body.innerHTML = html;
+    expect(document.body.textContent).toContain("更新が必要");
+    expect(document.body.textContent).toContain("現在のバージョン: 2.0.0");
+    expect(document.body.textContent).toContain("必要バージョン: 2.1.0");
+    const updateBtn = document.querySelector<HTMLButtonElement>("[data-install-engine='reazonspeech']");
+    expect(updateBtn).toBeTruthy();
+    expect(updateBtn!.textContent).toContain("更新");
+    const uninstallBtn = document.querySelector<HTMLButtonElement>("[data-uninstall-engine='reazonspeech']");
+    expect(uninstallBtn).toBeTruthy();
   });
 
   it("not-installed state does not show uninstall button", () => {

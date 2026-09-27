@@ -215,9 +215,11 @@ export interface LocalAsrEngineStatus {
   engine: string;
   displayName: string;
   installed: boolean;
+  needsUpdate: boolean;
   imageName: string;
   imageId: string | null;
   environmentVersion: string | null;
+  expectedEnvironmentVersion?: string | null;
   modelName: string | null;
   dockerAvailable: boolean;
   dockerRunning: boolean;
@@ -235,6 +237,7 @@ export type LocalAsrUiState =
   | "install-succeeded"
   | "install-failed"
   | "not-installed"
+  | "needs-update"
   | "installed";
 
 export interface LocalAsrInstallState {
@@ -263,13 +266,14 @@ export function getLocalAsrUiState(
   // インストール状態（loading より優先）
   if (installState?.status === "installing") return "installing";
   if (installState?.status === "succeeded") {
-    return status?.installed ? "installed" : "install-succeeded";
+    return status?.installed && !status.needsUpdate ? "installed" : "install-succeeded";
   }
   if (installState?.status === "failed") return "install-failed";
 
   // 通常判定
   if (!status) return "loading";
   if (!status.installed) return "not-installed";
+  if (status.needsUpdate) return "needs-update";
   return "installed";
 }
 
@@ -525,6 +529,32 @@ export function renderLocalAsrEngineCard(e: LocalAsrEngineStatus, installState?:
           </button>
         </div>`;
       break;
+    case "needs-update": {
+      const details: string[] = [];
+      if (e.environmentVersion) details.push(`現在のバージョン: ${escapeHtml(e.environmentVersion)}`);
+      if (e.expectedEnvironmentVersion) details.push(`必要バージョン: ${escapeHtml(e.expectedEnvironmentVersion)}`);
+      if (e.modelName) details.push(`モデル: ${escapeHtml(e.modelName)}`);
+      statusHtml = `
+        <div class="docker-status-row">
+          <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-warning, #f59e0b);">update</span>
+          <span>更新が必要</span>
+        </div>
+        ${details.length > 0 ? `<div class="local-asr-details">${details.map(d => `<p class="docker-detail-item">${d}</p>`).join("")}</div>` : ""}
+        <div class="docker-status-actions">
+          <button class="btn-docker-start btn-local-asr-install" type="button" data-install-engine="${escapeHtml(e.engine)}">
+            <span class="material-symbols-outlined">update</span>
+            更新
+          </button>
+          <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
+            <span class="material-symbols-outlined">refresh</span>
+            状態を再確認
+          </button>
+          <button class="btn-danger-outline" type="button" data-uninstall-engine="${escapeHtml(e.engine)}">
+            削除
+          </button>
+        </div>`;
+      break;
+    }
     case "installed": {
       const details: string[] = [];
       if (e.environmentVersion) details.push(`環境バージョン: ${escapeHtml(e.environmentVersion)}`);

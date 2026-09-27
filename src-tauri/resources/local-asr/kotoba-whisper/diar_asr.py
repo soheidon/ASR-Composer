@@ -377,58 +377,64 @@ log("[OK] 変換完了")
 # ================================
 # Diarization
 # ================================
-dia = None
-log("[STEP] 話者分離モデルをロード...")
-try:
-    dia = Pipeline.from_pretrained(MODEL_DIAR, use_auth_token=hf_token)
-    if dia is None:
-        raise RuntimeError("Pipelineのロードに失敗しました。モデル名やHF_TOKENの権限を確認してください。")
-    
-    if device == 0:
-        dia.to(torch.device("cuda"))
-        
-    if hasattr(dia, "embedding_batch_size"):
-        dia.embedding_batch_size = 1
-except Exception as e:
-    log(f"[FATAL ERROR] モデルロード中に例外発生:\n{traceback.format_exc()}")
-    raise
+ENABLE_DIARIZATION = os.getenv("ENABLE_DIARIZATION", "1") == "1"
+segments = []
 
-log("[STEP] 話者分離を実行...")
-t0 = time.time()
-try:
-    if device == 0:
-        log(f"[VRAM] Allocated before DIAR: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-
-    if NUM_SPEAKERS is None:
-        diar = dia(str(wav16))
-    else:
-        diar = dia(
-            str(wav16), 
-            num_speakers=int(NUM_SPEAKERS), 
-            min_speakers=int(NUM_SPEAKERS), 
-            max_speakers=int(NUM_SPEAKERS)
-        )
-
-    segments = list(diar.itertracks(yield_label=True))
-    log(f"[OK] 話者分離: {len(segments)} セグメント ({time.time()-t0:.2f}s)")
-
-    labels = sorted({lbl for _, _, lbl in segments})
-    log(f"[DIAR] labels={labels} N={len(labels)}")
-
-except Exception as e:
-    log(f"[FATAL ERROR] 話者分離の実行中に例外発生:\n{traceback.format_exc()}")
-    try:
-        if dia is not None:
-            dia = None
-        _release_gpu_memory(device, log)
-    except Exception:
-        pass
-    raise
-
-# 話者分離終了後、ASR 開始前に GPU メモリを解放
-if dia is not None:
+if ENABLE_DIARIZATION:
     dia = None
-_release_gpu_memory(device, log)
+    log("[STEP] 話者分離モデルをロード...")
+    try:
+        dia = Pipeline.from_pretrained(MODEL_DIAR, use_auth_token=hf_token)
+        if dia is None:
+            raise RuntimeError("Pipelineのロードに失敗しました。モデル名やHF_TOKENの権限を確認してください。")
+        
+        if device == 0:
+            dia.to(torch.device("cuda"))
+            
+        if hasattr(dia, "embedding_batch_size"):
+            dia.embedding_batch_size = 1
+    except Exception as e:
+        log(f"[FATAL ERROR] モデルロード中に例外発生:\n{traceback.format_exc()}")
+        raise
+
+    log("[STEP] 話者分離を実行...")
+    t0 = time.time()
+    try:
+        if device == 0:
+            log(f"[VRAM] Allocated before DIAR: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+
+        if NUM_SPEAKERS is None:
+            diar = dia(str(wav16))
+        else:
+            diar = dia(
+                str(wav16), 
+                num_speakers=int(NUM_SPEAKERS), 
+                min_speakers=int(NUM_SPEAKERS), 
+                max_speakers=int(NUM_SPEAKERS)
+            )
+
+        segments = list(diar.itertracks(yield_label=True))
+        log(f"[OK] 話者分離: {len(segments)} セグメント ({time.time()-t0:.2f}s)")
+
+        labels = sorted({lbl for _, _, lbl in segments})
+        log(f"[DIAR] labels={labels} N={len(labels)}")
+
+    except Exception as e:
+        log(f"[FATAL ERROR] 話者分離の実行中に例外発生:\n{traceback.format_exc()}")
+        try:
+            if dia is not None:
+                dia = None
+            _release_gpu_memory(device, log)
+        except Exception:
+            pass
+        raise
+
+    # 話者分離終了後、ASR 開始前に GPU メモリを解放
+    if dia is not None:
+        dia = None
+    _release_gpu_memory(device, log)
+else:
+    log("[STEP] 話者分離スキップ（ASR直接実行）")
 
 # ================================
 # 辞書読み込み（オプション: USE_LAYER_A / USE_LAYER_B で有効化）
@@ -497,73 +503,114 @@ if glossary_entries and USE_LAYER_A:
     else:
         log("[DICT][Layer A] prompt_ids 生成失敗。Layer A なしで継続します")
 
-log("[STEP] セグメントごとにASR中...")
-
 tmp_seg_dir = tempfile.mkdtemp(prefix="seg_", dir=str(WORK_TMP))
 results = []
 
 try:
-    for idx, (turn, _, spk) in enumerate(tqdm(segments, desc="ASR", leave=True), 1):
-        st, ed = float(turn.start), float(turn.end)
-        if ed <= st:
-            continue
+    if ENABLE_DIARIZATION:
+        log("[STEP] セグメントごとにASR中...")
+        for idx, (turn, _, spk) in enumerate(tqdm(segments, desc="ASR", leave=True), 1):
+            st, ed = float(turn.start), float(turn.end)
+            if ed <= st:
+                continue
 
-        seg = audio16[int(st * 1000) : int(ed * 1000)]
-        seg_path = Path(tmp_seg_dir) / f"seg_{idx:04d}.wav"
-        seg.export(str(seg_path), format="wav")
+            seg = audio16[int(st * 1000) : int(ed * 1000)]
+            seg_path = Path(tmp_seg_dir) / f"seg_{idx:04d}.wav"
+            seg.export(str(seg_path), format="wav")
 
-        # prompt_ids は transformers Whisper の正式パラメータ。
-        # initial_prompt（文字列）は model_kwargs で弾かれるため使用しない。
+            # prompt_ids は transformers Whisper の正式パラメータ。
+            # initial_prompt（文字列）は model_kwargs で弾かれるため使用しない。
+            gen_kw = dict(LANG_KW)
+            if pre_asr_prompt_ids is not None:
+                gen_kw["prompt_ids"] = pre_asr_prompt_ids
+            try:
+                out = asr(str(seg_path), return_timestamps=True, generate_kwargs=gen_kw)
+            except Exception as e_asr:
+                error_msg = str(e_asr)
+                is_prompt_error = any(
+                    kw in error_msg
+                    for kw in [
+                        "prompt_ids",
+                        "max_target_positions",
+                        "decoder_input_ids",
+                        "model_kwargs",
+                    ]
+                )
+                if (
+                    pre_asr_prompt_ids is not None
+                    and is_prompt_error
+                    and LAYER_A_FALLBACK
+                ):
+                    log(
+                        f"\n[WARN] ASR推論でプロンプト長起因と思われるエラー発生。"
+                        f"Layer Aを無効化して再試行します。"
+                    )
+                    if dict_log_fn is not None:
+                        dict_log_fn(
+                            f"[DICT][Layer A] fallback_at_segment={idx} "
+                            f"reason={error_msg[:200]}"
+                        )
+                    pre_asr_prompt_ids = None  # type: ignore
+                    gen_kw_retry = dict(LANG_KW)
+                    out = asr(
+                        str(seg_path),
+                        return_timestamps=True,
+                        generate_kwargs=gen_kw_retry,
+                    )
+                else:
+                    raise e_asr
+            text = (out.get("text") or "").strip()
+            if glossary_entries and USE_LAYER_B:
+                text = apply_glossary_correction(
+                    text,
+                    glossary_entries,
+                    log,
+                    seg_idx=idx,
+                    speaker=spk,
+                    dict_log_fn=dict_log_fn,
+                )
+            results.append({"speaker": spk, "start": st, "end": ed, "text": text})
+    else:
+        # 話者分離OFF: Whisperネイティブのタイムスタンプ付きchunksを取得
+        log("[STEP] 音声全体のWhisper認識中（ネイティブタイムスタンプ抽出）...")
         gen_kw = dict(LANG_KW)
         if pre_asr_prompt_ids is not None:
             gen_kw["prompt_ids"] = pre_asr_prompt_ids
-        try:
-            out = asr(str(seg_path), return_timestamps=True, generate_kwargs=gen_kw)
-        except Exception as e_asr:
-            error_msg = str(e_asr)
-            is_prompt_error = any(
-                kw in error_msg
-                for kw in [
-                    "prompt_ids",
-                    "max_target_positions",
-                    "decoder_input_ids",
-                    "model_kwargs",
-                ]
-            )
-            if (
-                pre_asr_prompt_ids is not None
-                and is_prompt_error
-                and LAYER_A_FALLBACK
-            ):
-                log(
-                    f"\n[WARN] ASR推論でプロンプト長起因と思われるエラー発生。"
-                    f"Layer Aを無効化して再試行します。"
-                )
-                if dict_log_fn is not None:
-                    dict_log_fn(
-                        f"[DICT][Layer A] fallback_at_segment={idx} "
-                        f"reason={error_msg[:200]}"
+        out = asr(str(wav16), return_timestamps=True, generate_kwargs=gen_kw)
+        chunks = out.get("chunks")
+        duration_sec = len(audio16) / 1000.0
+
+        if chunks:
+            log(f"[OK] Whisperネイティブchunks抽出: {len(chunks)} 件")
+            for idx, chunk in enumerate(chunks, 1):
+                ts = chunk.get("timestamp") or (0.0, duration_sec)
+                st = float(ts[0]) if ts[0] is not None else 0.0
+                ed = float(ts[1]) if ts[1] is not None else duration_sec
+                text = (chunk.get("text") or "").strip()
+                if glossary_entries and USE_LAYER_B:
+                    text = apply_glossary_correction(
+                        text,
+                        glossary_entries,
+                        log,
+                        seg_idx=idx,
+                        speaker=None,
+                        dict_log_fn=dict_log_fn,
                     )
-                pre_asr_prompt_ids = None  # type: ignore
-                gen_kw_retry = dict(LANG_KW)
-                out = asr(
-                    str(seg_path),
-                    return_timestamps=True,
-                    generate_kwargs=gen_kw_retry,
+                results.append({"speaker": None, "start": st, "end": ed, "text": text})
+        else:
+            # フォールバック: chunks が取得できない場合のみ音声全体を1セグメントとする
+            log("[WARN] Whisper chunksが取得できませんでした。音声全体を1セグメントとして処理します。")
+            text = (out.get("text") or "").strip()
+            if glossary_entries and USE_LAYER_B:
+                text = apply_glossary_correction(
+                    text,
+                    glossary_entries,
+                    log,
+                    seg_idx=1,
+                    speaker=None,
+                    dict_log_fn=dict_log_fn,
                 )
-            else:
-                raise e_asr
-        text = (out.get("text") or "").strip()
-        if glossary_entries and USE_LAYER_B:
-            text = apply_glossary_correction(
-                text,
-                glossary_entries,
-                log,
-                seg_idx=idx,
-                speaker=spk,
-                dict_log_fn=dict_log_fn,
-            )
-        results.append({"speaker": spk, "start": st, "end": ed, "text": text})
+            results.append({"speaker": None, "start": 0.0, "end": duration_sec, "text": text})
 except Exception as e:
     log(f"[FATAL ERROR] ASR推論中に例外発生:\n{traceback.format_exc()}")
     raise

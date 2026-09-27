@@ -25,20 +25,28 @@ def fmt_ts_srt(seconds):
 
 
 def write_txt(results, path):
-    """[SPEAKER_XX] text 形式のTXTを出力"""
+    """[SPEAKER_XX] text 形式のTXTを出力（話者なし時は本文のみ）"""
     with open(path, "w", encoding="utf-8") as f:
         for r in results:
-            f.write(f"[{r['speaker']}] {r['text']}\n")
+            spk = r.get("speaker")
+            if spk:
+                f.write(f"[{spk}] {r['text']}\n")
+            else:
+                f.write(f"{r['text']}\n")
 
 
 def write_vtt(results, path):
-    """WebVTT形式で出力"""
+    """WebVTT形式で出力（話者なし時は<v>タグなし）"""
     with open(path, "w", encoding="utf-8") as f:
         f.write("WEBVTT\n\n")
         for i, r in enumerate(results, 1):
             f.write(f"{i}\n")
             f.write(f"{fmt_ts(r['start'])} --> {fmt_ts(r['end'])}\n")
-            f.write(f"<v {r['speaker']}>{r['text']}</v>\n\n")
+            spk = r.get("speaker")
+            if spk:
+                f.write(f"<v {spk}>{r['text']}</v>\n\n")
+            else:
+                f.write(f"{r['text']}\n\n")
 
 
 def write_json(results, path):
@@ -48,31 +56,40 @@ def write_json(results, path):
 
 
 def write_markdown(results, path):
-    """Markdown形式で出力"""
+    """Markdown形式で出力（話者なし時は見出しに話者名を付与しない）"""
     with open(path, "w", encoding="utf-8") as f:
         f.write("# 文字起こし\n\n")
         for r in results:
             ts_range = f"{fmt_ts(r['start'])}–{fmt_ts(r['end'])}"
-            f.write(f"## {ts_range} — {r['speaker']}\n\n")
+            spk = r.get("speaker")
+            if spk:
+                f.write(f"## {ts_range} — {spk}\n\n")
+            else:
+                f.write(f"## {ts_range}\n\n")
             f.write(f"{r['text']}\n\n")
 
 
 def write_srt(results, path):
-    """SRT形式で出力"""
+    """SRT形式で出力（話者なし時は[SPEAKER]なし）"""
     with open(path, "w", encoding="utf-8") as f:
         for i, r in enumerate(results, 1):
             f.write(f"{i}\n")
             f.write(f"{fmt_ts_srt(r['start'])} --> {fmt_ts_srt(r['end'])}\n")
-            f.write(f"[{r['speaker']}] {r['text']}\n\n")
+            spk = r.get("speaker")
+            if spk:
+                f.write(f"[{spk}] {r['text']}\n\n")
+            else:
+                f.write(f"{r['text']}\n\n")
 
 
 def write_csv(results, path):
-    """CSV形式で出力（UTF-8 BOM付き）"""
+    """CSV形式で出力（UTF-8 BOM付き、話者なし時は空欄）"""
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["start", "end", "speaker", "text"])
         for r in results:
-            writer.writerow([fmt_ts(r['start']), fmt_ts(r['end']), r['speaker'], r['text']])
+            spk = r.get("speaker") or ""
+            writer.writerow([fmt_ts(r['start']), fmt_ts(r['end']), spk, r['text']])
 
 
 def parse_output_formats(raw_formats: str) -> set:

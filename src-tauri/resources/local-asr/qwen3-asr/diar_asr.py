@@ -119,24 +119,30 @@ def main() -> None:
     os.environ.setdefault("TEMP", str(work_tmp))
     os.environ.setdefault("TMP", str(work_tmp))
 
+    enable_diarization = os.getenv("ENABLE_DIARIZATION", "1") == "1"
+
     # ================================
-    # HF login（未設定時は明示的に終了）
+    # HF login（話者分離ON時のみ必須）
     # ================================
     from huggingface_hub import login, HfApi
 
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
-        log("[FATAL] 環境変数 HF_TOKEN が未設定です。初回実行時は必須です。")
-        log("  docker run に -e HF_TOKEN=$env:HF_TOKEN を付けるか、Windows のユーザー環境変数に HF_TOKEN を設定してください。")
-        sys.exit(1)
-    login(token=hf_token)
-
-    try:
-        who = HfApi().whoami(token=hf_token)
-        who_str = who.get("name") or who.get("email") or who.get("username") or "Unknown"
-        log(f"[OK] HF login: {who_str}")
-    except Exception:
-        log("[WARN] whoami 取得に失敗。すでに認証済みであれば問題ありません。")
+        if enable_diarization:
+            log("[FATAL] 環境変数 HF_TOKEN が未設定です。話者分離実行時は必須です。")
+            log("  docker run に -e HF_TOKEN=$env:HF_TOKEN を付けるか、Windows のユーザー環境変数に HF_TOKEN を設定してください。")
+            import sys
+            sys.exit(1)
+        else:
+            log("[INFO] HF_TOKEN 未設定（話者分離OFFのため継続）")
+    else:
+        login(token=hf_token)
+        try:
+            who = HfApi().whoami(token=hf_token)
+            who_str = who.get("name") or who.get("email") or who.get("username") or "Unknown"
+            log(f"[OK] HF login: {who_str}")
+        except Exception:
+            log("[WARN] whoami 取得に失敗。すでに認証済みであれば問題ありません。")
 
     # ================================
     # Settings
@@ -210,50 +216,56 @@ def main() -> None:
     # ================================
     # Diarization
     # ================================
-    dia = None
-    log("[STEP] 話者分離モデルをロード...")
-    try:
-        # TODO: 将来的に pyannote が token= を標準化したら use_auth_token から移行する
-        dia = Pipeline.from_pretrained(model_diar, use_auth_token=hf_token)
-        if dia is None:
-            raise RuntimeError("Pipelineのロードに失敗しました。モデル名やHF_TOKENの権限を確認してください。")
-        if device == 0:
-            dia.to(torch.device("cuda"))
-        if hasattr(dia, "embedding_batch_size"):
-            dia.embedding_batch_size = 1
-    except Exception:
-        log(f"[FATAL ERROR] モデルロード中に例外発生:\n{traceback.format_exc()}")
-        raise
+    enable_diarization = os.getenv("ENABLE_DIARIZATION", "1") == "1"
+    segments = []
 
-    log("[STEP] 話者分離を実行...")
-    t0 = time.time()
-    try:
-        if device == 0:
-            log(f"[VRAM] Allocated before DIAR: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-        if num_speakers is None:
-            diar = dia(str(wav16))
-        else:
-            diar = dia(
-                str(wav16),
-                num_speakers=int(num_speakers),
-                min_speakers=int(num_speakers),
-                max_speakers=int(num_speakers),
-            )
-        segments = list(diar.itertracks(yield_label=True))
-        log(f"[OK] 話者分離: {len(segments)} セグメント ({time.time()-t0:.2f}s)")
-        labels = sorted({lbl for _, _, lbl in segments})
-        log(f"[DIAR] labels={labels} N={len(labels)}")
-    except Exception:
-        log(f"[FATAL ERROR] 話者分離の実行中に例外発生:\n{traceback.format_exc()}")
+    if enable_diarization:
+        dia = None
+        log("[STEP] 話者分離モデルをロード...")
+        try:
+            # TODO: 将来的に pyannote が token= を標準化したら use_auth_token から移行する
+            dia = Pipeline.from_pretrained(model_diar, use_auth_token=hf_token)
+            if dia is None:
+                raise RuntimeError("Pipelineのロードに失敗しました。モデル名やHF_TOKENの権限を確認してください。")
+            if device == 0:
+                dia.to(torch.device("cuda"))
+            if hasattr(dia, "embedding_batch_size"):
+                dia.embedding_batch_size = 1
+        except Exception:
+            log(f"[FATAL ERROR] モデルロード中に例外発生:\n{traceback.format_exc()}")
+            raise
+
+        log("[STEP] 話者分離を実行...")
+        t0 = time.time()
+        try:
+            if device == 0:
+                log(f"[VRAM] Allocated before DIAR: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            if num_speakers is None:
+                diar = dia(str(wav16))
+            else:
+                diar = dia(
+                    str(wav16),
+                    num_speakers=int(num_speakers),
+                    min_speakers=int(num_speakers),
+                    max_speakers=int(num_speakers),
+                )
+            segments = list(diar.itertracks(yield_label=True))
+            log(f"[OK] 話者分離: {len(segments)} セグメント ({time.time()-t0:.2f}s)")
+            labels = sorted({lbl for _, _, lbl in segments})
+            log(f"[DIAR] labels={labels} N={len(labels)}")
+        except Exception:
+            log(f"[FATAL ERROR] 話者分離の実行中に例外発生:\n{traceback.format_exc()}")
+            if dia is not None:
+                dia = None
+            _release_gpu_memory(device, log)
+            raise
+
+        # 話者分離終了後、ASR 開始前に GPU メモリを解放
         if dia is not None:
             dia = None
         _release_gpu_memory(device, log)
-        raise
-
-    # 話者分離終了後、ASR 開始前に GPU メモリを解放
-    if dia is not None:
-        dia = None
-    _release_gpu_memory(device, log)
+    else:
+        log("[STEP] 話者分離スキップ（ASR直接実行）")
 
     # ================================
     # Qwen3-ASR ロード（pyannote 解放後に GPU メモリを空けてから読み込む）
@@ -274,34 +286,50 @@ def main() -> None:
         raise
 
     # ================================
-    # セグメント単位 ASR
+    # ASR 実行
     # ================================
-    log("[STEP] セグメントごとにASR中...")
     tmp_seg_dir = tempfile.mkdtemp(prefix="seg_", dir=str(work_tmp))
     results = []
 
     try:
-        for idx, (turn, _, spk) in enumerate(tqdm(segments, desc="ASR", leave=True), 1):
-            st, ed = float(turn.start), float(turn.end)
-            if ed <= st:
-                continue
+        if enable_diarization:
+            log("[STEP] セグメントごとにASR中...")
+            for idx, (turn, _, spk) in enumerate(tqdm(segments, desc="ASR", leave=True), 1):
+                st, ed = float(turn.start), float(turn.end)
+                if ed <= st:
+                    continue
 
-            seg = audio16[int(st * 1000) : int(ed * 1000)]
-            seg_path = Path(tmp_seg_dir) / f"seg_{idx:04d}.wav"
-            seg.export(str(seg_path), format="wav")
+                seg = audio16[int(st * 1000) : int(ed * 1000)]
+                seg_path = Path(tmp_seg_dir) / f"seg_{idx:04d}.wav"
+                seg.export(str(seg_path), format="wav")
 
-            # ASR 失敗時は空文字のまま結果に含める（セグメントはスキップしない。後段の突合・補正で扱いやすい）
+                # ASR 失敗時は空文字のまま結果に含める（セグメントはスキップしない。後段の突合・補正で扱いやすい）
+                try:
+                    out_list = asr_model.transcribe(
+                        audio=str(seg_path),
+                        language=asr_language,
+                    )
+                    text = (out_list[0].text or "").strip() if out_list else ""
+                except Exception as e_asr:
+                    log(f"[WARN] セグメント {idx} ASR 失敗: {e_asr}")
+                    text = ""
+
+                results.append({"speaker": spk, "start": st, "end": ed, "text": text})
+        else:
+            # 話者分離OFF: Qwen3-ASR はタイムスタンプなしの全文テキスト出力のため、
+            # 音声全体 [0, duration] を1セグメント fallback として処理する（speaker: None）
+            log("[STEP] 音声全体のQwen3-ASR認識中...")
+            duration_sec = len(audio16) / 1000.0
             try:
                 out_list = asr_model.transcribe(
-                    audio=str(seg_path),
+                    audio=str(wav16),
                     language=asr_language,
                 )
                 text = (out_list[0].text or "").strip() if out_list else ""
             except Exception as e_asr:
-                log(f"[WARN] セグメント {idx} ASR 失敗: {e_asr}")
+                log(f"[WARN] Qwen3-ASR 認識失敗: {e_asr}")
                 text = ""
-
-            results.append({"speaker": spk, "start": st, "end": ed, "text": text})
+            results.append({"speaker": None, "start": 0.0, "end": duration_sec, "text": text})
     except Exception:
         log(f"[FATAL ERROR] ASR推論中に例外発生:\n{traceback.format_exc()}")
         raise

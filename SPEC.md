@@ -1628,8 +1628,38 @@ Stitchでは、まず以下の6画面を作成する。
 - ReazonSpeech（orchestrator.py → output_writer.py方式）
 - Kotoba Whisper（diar_asr.py → output_writer.py方式）
 - Qwen3 ASR（diar_asr.py → output_writer.py方式）
+
+#### 話者分離「しない」（Diarization OFF）の挙動
+- **概要**: pyannote（話者分離モデル）をスキップし、ASRのみを直接実行する。
+- **HF_TOKEN 非依存**: 話者分離OFF時は `HF_TOKEN` の存在確認・取得・Dockerコンテナへの注入を行わない（未設定でも実行可能）。
+- **ネイティブセグメンテーション維持**:
+  - **Kotoba-Whisper**: Whisperの `return_timestamps=True` によるネイティブなタイムスタンプ付きchunksをそのままセグメントとして保持。
+  - **Qwen3-ASR**: 全文テキスト出力モデルのため、音声全体 `[0.0, duration]` を1セグメント fallback として `speaker: null` で出力。
+  - **ReazonSpeech**: ESPnetセグメント単位モデルのため、diarizationスキップ時は音声全体 `[0.0, duration]` を1セグメント fallback として `speaker: null` で出力。
+- **TranscriptDocument / 出力形式**:
+  - `speaker` および `originalSpeaker` はすべて `null`（架空の "Speaker 1" を付与しない）。
+  - TXT / SRT は `[SPEAKER]` プレフィックスなし、VTT は `<v>` タグなし、Markdown は `## {ts_range}` のみ、CSV は speaker 列空欄、JSON は `"speaker": null` で出力。
 - Dockerイメージの状態検出（image ls + ID inspect方式）
 - Docker context対応
+- **Docker環境バージョン・更新管理（Environment Version & NeedsUpdate）**:
+  - **イメージラベル**: 各Dockerイメージは `LABEL com.asr-composer.environment-version="<version>"` を保持する。
+  - **期待バージョン定義**: アプリケーション（`LocalAsrEngineDef`）側でエンジンごとに期待バージョン（`expected_environment_version`）を定義する。
+    - ReazonSpeech: `2.1.0`
+    - Kotoba Whisper: `1.1.0`
+    - Qwen3 ASR: `1.1.0`
+  - **状態判定（`evaluate_engine_image_status`）**:
+    - バージョン一致: `installed: true`, `needsUpdate: false`（最新・利用可能）
+    - バージョン不一致（古い/新しい）またはラベル欠落: `installed: true`, `needsUpdate: true`（更新が必要）
+    - イメージ未存在: `installed: false`, `needsUpdate: false`（未インストール）
+  - **二重防御（Double Defense）アーキテクチャ**:
+    1. **フロントエンド（UI層）**:
+       - 文字起こし画面（`#engineSelect`）: `needsUpdate === true` のエンジンは `（更新が必要）` と表示され `<option disabled>` として選択不可。
+       - 設定画面（ローカルASR環境）: 「更新が必要」バッジ（`update` アイコン）、現在バージョンおよび必要バージョンを表示し、「更新」ボタン（再ビルド呼び出し）を提供。
+    2. **バックエンド（Rust層 / 最終防壁）**:
+       - `local_asr_transcribe` 実行時、設定ロード直後・ワークディレクトリ作成・入力ファイルコピー・`HF_TOKEN`取得・Dockerコンテナ起動より前に `validate_transcribe_engine_status`（Preflight Guard）を実行。
+       - `installed == false` または `needs_update == true` の場合はコンテナを一切起動せずに即時エラーを返却（UIを迂回した不正呼出や以前の保存済み設定に対しても安全性を保証）。
+  - **インストール・更新成功条件**:
+    - バックエンド（`local_asr_install`）およびフロントエンド（`confirmLocalAsrInstalled` / `reconcileConfirmedInstalls`）の双方が `installed === true && needsUpdate === false` を満たすことを検証。
 - インストール / アンインストール
 - 進捗バー表示
 - エンジン削除確認モーダル（エンジン名動的表示）

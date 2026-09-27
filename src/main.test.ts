@@ -1662,6 +1662,66 @@ describe("Persistent Workspace DOM Retention", () => {
     await expect(navigateTo("transcribe")).rejects.toThrow();
     expect(pageMounts.has("workspace:transcribe")).toBe(false);
   });
+
+  it("Case PW-O: Outdated local ASR engine (needsUpdate === true) is disabled in #engineSelect", async () => {
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          asr_mode: "local",
+        };
+      }
+      if (command === "local_asr_get_status" || command === "local_asr_get_status_fast") {
+        return [
+          {
+            engine: "reazonspeech",
+            displayName: "ReazonSpeech",
+            installed: true,
+            needsUpdate: true,
+            imageName: "asr-composer-reazonspeech:cu126",
+            imageId: "sha256:old123",
+            environmentVersion: "2.0.0",
+            expectedEnvironmentVersion: "2.1.0",
+            modelName: "reazon-research/reazonspeech-espnet-v2",
+            dockerAvailable: true,
+            dockerRunning: true,
+            errorKind: null,
+            errorMessage: null,
+          },
+          {
+            engine: "kotoba-whisper",
+            displayName: "Kotoba Whisper v2.2",
+            installed: true,
+            needsUpdate: false,
+            imageName: "asr-composer-kotoba-whisper:cu126",
+            imageId: "sha256:current123",
+            environmentVersion: "1.1.0",
+            expectedEnvironmentVersion: "1.1.0",
+            modelName: "kotoba-tech/kotoba-whisper-v2.2",
+            dockerAvailable: true,
+            dockerRunning: true,
+            errorKind: null,
+            errorMessage: null,
+          },
+        ];
+      }
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    expect(engineSelect).toBeTruthy();
+
+    const options = Array.from(engineSelect.options);
+    const reazonOpt = options.find((o) => o.value === "reazonspeech");
+    expect(reazonOpt).toBeTruthy();
+    expect(reazonOpt!.disabled).toBe(true);
+    expect(reazonOpt!.textContent).toContain("（更新が必要）");
+
+    const kotobaOpt = options.find((o) => o.value === "kotoba-whisper");
+    expect(kotobaOpt).toBeTruthy();
+    expect(kotobaOpt!.disabled).toBe(false);
+  });
 });
 
 

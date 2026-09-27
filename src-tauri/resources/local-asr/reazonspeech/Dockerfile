@@ -1,6 +1,6 @@
 FROM asr-composer-base:cu126
 LABEL com.asr-composer.engine="reazonspeech"
-LABEL com.asr-composer.environment-version="2.0.0"
+LABEL com.asr-composer.environment-version="2.1.0"
 LABEL com.asr-composer.asr-model="reazon-research/reazonspeech-espnet-v2"
 
 # pip/setuptools/wheel をビルド時に固定
