@@ -605,8 +605,22 @@ function renderSegmentCard(seg: TranscriptSegment, index: number): string {
   const timeRange = `${formatTimestamp(seg.start)} - ${formatTimestamp(seg.end)}`;
   const statusLabel = seg.status === "edited" ? "編集済" : "原文";
   const statusClass = seg.status === "edited" ? "segment-status-edited" : "segment-status-raw";
-  const speakerValue = seg.speaker ?? "";
   const proposalsHtml = renderProposalBox(seg);
+
+  const speakerRowHtml =
+    seg.speaker !== null
+      ? `
+        <div class="segment-speaker-row">
+          <label class="segment-field-label">話者</label>
+          <input
+            type="text"
+            class="segment-speaker-input"
+            value="${escapeAttr(seg.speaker)}"
+            placeholder="話者名（例: SPEAKER_00）"
+            data-field="speaker"
+          />
+        </div>`
+      : "";
 
   return `
     <div class="segment-card" data-index="${index}" data-segment-id="${escapeAttr(seg.id)}">
@@ -621,16 +635,7 @@ function renderSegmentCard(seg: TranscriptSegment, index: number): string {
         </div>
       </div>
       <div class="segment-card-body">
-        <div class="segment-speaker-row">
-          <label class="segment-field-label">話者</label>
-          <input
-            type="text"
-            class="segment-speaker-input"
-            value="${escapeAttr(speakerValue)}"
-            placeholder="話者名（例: SPEAKER_00）"
-            data-field="speaker"
-          />
-        </div>
+        ${speakerRowHtml}
         <div class="segment-text-row">
           <label class="segment-field-label">正本文</label>
           <textarea

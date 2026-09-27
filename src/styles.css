@@ -2090,7 +2090,7 @@ html, body {
   border-radius: 12px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
   position: sticky;
-  top: 64px;
+  top: 0;
   z-index: 10;
 }
 

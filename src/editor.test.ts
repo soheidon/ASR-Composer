@@ -1693,6 +1693,176 @@ describe("Phase 1 LLM Correction UI Integration", () => {
     expect(btnLlm.innerHTML).toContain("LLM補正");
     expect(btnCancel.style.display).toBe("none");
   });
+
+  // ---- Cases ND-1 to ND-5: No-Diarization (speaker === null) Rendering & Events ----
+
+  describe("No-Diarization (speaker === null) and Diarization Layout Rendering", () => {
+    it("Case ND-1: speaker === null (1 segment) -> no speaker row, metadata and text intact", () => {
+      const doc: TranscriptDocument = {
+        schemaVersion: 1,
+        mediaPath: "C:\\audio\\test-tts.wav",
+        mediaFileName: "test-tts.wav",
+        createdAt: "2026-09-27T00:00:00Z",
+        updatedAt: "2026-09-27T00:00:00Z",
+        language: "ja",
+        sourceEngine: "reazonspeech",
+        sourceRunId: "job-reazon-001",
+        segments: [
+          {
+            id: "seg-000001",
+            start: 0.0,
+            end: 22.48,
+            speaker: null,
+            originalSpeaker: null,
+            text: "米中首脳会談を終え歓迎式典でスピーチしたトランプ大統領",
+            originalText: "米中首脳会談を終え歓迎式典でスピーチしたトランプ大統領",
+            sourceEngine: "reazonspeech",
+            sourceSegmentId: "1",
+            sourceRunId: "job-reazon-001",
+            status: "raw",
+          },
+        ],
+      };
+
+      setEditorDocument(doc, "C:\\test-tts.asrc.json");
+      document.body.innerHTML = renderEditorPage();
+
+      const card = document.querySelector(".segment-card") as HTMLElement;
+      expect(card).not.toBeNull();
+
+      // 話者行・入力欄が一切描画されないこと
+      expect(card.querySelector(".segment-speaker-row")).toBeNull();
+      expect(card.querySelector('[data-field="speaker"]')).toBeNull();
+
+      // メタデータ（時刻、ID、ステータス）が完全であること
+      const timeWrap = card.querySelector(".segment-time-wrap");
+      expect(timeWrap?.textContent).toContain("00:00:00.000 - 00:00:22.480");
+      expect(timeWrap?.textContent).toContain("seg-000001");
+
+      const statusBadge = card.querySelector(".segment-status-badge");
+      expect(statusBadge?.textContent).toBe("原文");
+
+      // 正本文textareaが存在すること
+      const textarea = card.querySelector(".segment-text-input") as HTMLTextAreaElement;
+      expect(textarea).not.toBeNull();
+      expect(textarea.value).toContain("米中首脳会談を終え");
+    });
+
+    it("Case ND-2: speaker === null (multi-segment - Kotoba Whisper shape) -> all segments omit speaker row", () => {
+      const doc: TranscriptDocument = {
+        schemaVersion: 1,
+        mediaPath: "C:\\audio\\test-tts.wav",
+        mediaFileName: "test-tts.wav",
+        createdAt: "2026-09-27T00:00:00Z",
+        updatedAt: "2026-09-27T00:00:00Z",
+        language: "ja",
+        sourceEngine: "kotoba-whisper",
+        sourceRunId: "job-kotoba-001",
+        segments: Array.from({ length: 5 }, (_, i) => ({
+          id: `seg-${(i + 1).toString().padStart(6, "0")}`,
+          start: i * 4.0,
+          end: (i + 1) * 4.0,
+          speaker: null,
+          originalSpeaker: null,
+          text: `セグメント ${i + 1} の文章です。`,
+          originalText: `セグメント ${i + 1} の文章です。`,
+          sourceEngine: "kotoba-whisper",
+          sourceSegmentId: (i + 1).toString(),
+          sourceRunId: "job-kotoba-001",
+          status: "raw",
+        })),
+      };
+
+      setEditorDocument(doc, "C:\\test-tts-multi.asrc.json");
+      document.body.innerHTML = renderEditorPage();
+
+      const cards = document.querySelectorAll(".segment-card");
+      expect(cards.length).toBe(5);
+
+      const speakerRows = document.querySelectorAll(".segment-speaker-row");
+      expect(speakerRows.length).toBe(0);
+
+      const speakerInputs = document.querySelectorAll('[data-field="speaker"]');
+      expect(speakerInputs.length).toBe(0);
+
+      cards.forEach((card, idx) => {
+        const timeWrap = card.querySelector(".segment-time-wrap");
+        expect(timeWrap?.textContent).toContain(`seg-${(idx + 1).toString().padStart(6, "0")}`);
+        const textarea = card.querySelector(".segment-text-input") as HTMLTextAreaElement;
+        expect(textarea.value).toBe(`セグメント ${idx + 1} の文章です。`);
+      });
+    });
+
+    it("Case ND-3: speaker !== null (Diarized transcript) -> speaker row is preserved", () => {
+      const doc = createSampleDocument(1);
+      doc.segments[0].speaker = "SPEAKER_00";
+      doc.segments[0].originalSpeaker = "SPEAKER_00";
+
+      setEditorDocument(doc, "C:\\diarized.asrc.json");
+      document.body.innerHTML = renderEditorPage();
+
+      const card = document.querySelector(".segment-card") as HTMLElement;
+      expect(card).not.toBeNull();
+
+      const speakerRow = card.querySelector(".segment-speaker-row");
+      expect(speakerRow).not.toBeNull();
+
+      const speakerInput = card.querySelector('[data-field="speaker"]') as HTMLInputElement;
+      expect(speakerInput).not.toBeNull();
+      expect(speakerInput.value).toBe("SPEAKER_00");
+    });
+
+    it("Case ND-4: Mixed document -> only segments with speaker !== null render speaker row", () => {
+      const doc = createSampleDocument(2);
+      doc.segments[0].speaker = "SPEAKER_01";
+      doc.segments[0].originalSpeaker = "SPEAKER_01";
+      doc.segments[1].speaker = null;
+      doc.segments[1].originalSpeaker = null;
+
+      setEditorDocument(doc, "C:\\mixed.asrc.json");
+      document.body.innerHTML = renderEditorPage();
+
+      const cards = document.querySelectorAll(".segment-card");
+      expect(cards.length).toBe(2);
+
+      expect(cards[0].querySelector(".segment-speaker-row")).not.toBeNull();
+      expect((cards[0].querySelector('[data-field="speaker"]') as HTMLInputElement).value).toBe("SPEAKER_01");
+
+      expect(cards[1].querySelector(".segment-speaker-row")).toBeNull();
+      expect(cards[1].querySelector('[data-field="speaker"]')).toBeNull();
+    });
+
+    it("Case ND-5: Event delegation and dirty tracking work correctly for speaker=null and speaker!==null", () => {
+      const doc = createSampleDocument(2);
+      doc.segments[0].speaker = "SPEAKER_01";
+      doc.segments[0].originalSpeaker = "SPEAKER_01";
+      doc.segments[1].speaker = null;
+      doc.segments[1].originalSpeaker = null;
+
+      setEditorDocument(doc, "C:\\test.asrc.json");
+      document.body.innerHTML = renderEditorPage();
+      bindEditorEvents();
+
+      const cards = document.querySelectorAll(".segment-card");
+
+      // 1. speaker=null セグメントの text を編集
+      const textarea1 = cards[1].querySelector(".segment-text-input") as HTMLTextAreaElement;
+      textarea1.value = "本文を書き換えました";
+      textarea1.dispatchEvent(new Event("input", { bubbles: true }));
+
+      expect(getEditorDocument()!.segments[1].text).toBe("本文を書き換えました");
+      expect(getEditorDocument()!.segments[1].status).toBe("edited");
+      expect(isEditorDirty()).toBe(true);
+
+      // 2. speaker!==null セグメントの speaker を編集
+      const speakerInput0 = cards[0].querySelector('[data-field="speaker"]') as HTMLInputElement;
+      speakerInput0.value = "SPEAKER_CHANGED";
+      speakerInput0.dispatchEvent(new Event("input", { bubbles: true }));
+
+      expect(getEditorDocument()!.segments[0].speaker).toBe("SPEAKER_CHANGED");
+      expect(getEditorDocument()!.segments[0].status).toBe("edited");
+    });
+  });
 });
 
 
