@@ -12,6 +12,7 @@ import {
   parseCorrectionProposals,
   parseRawProposalCandidates,
   promoteCandidateToProposal,
+  runCorrectionForDocument,
   type CorrectionProposal,
   type CorrectionEvidence,
 } from "./correction";
@@ -578,5 +579,129 @@ describe("Phase 2: parseRawProposalCandidates & promoteCandidateToProposal", () 
     expect(val.errors).toContain("TARGET_SEGMENT_MISMATCH");
   });
 });
+
+describe("runCorrectionForDocument (Shared Execution Core)", () => {
+  it("正常系: 有効な提案がセグメントIDごとにグルーピングされ返却される", async () => {
+    const seg1 = createDummySegment({ id: "seg-1", text: "テスト文章1" });
+    const seg2 = createDummySegment({ id: "seg-2", text: "テスト文章2" });
+    const doc = createDummyDocument([seg1, seg2]);
+
+    const proposals: CorrectionProposal[] = [
+      {
+        id: "prop-1",
+        segmentId: "seg-1",
+        originalText: "テスト文章1",
+        correctedText: "テスト文章1（補正済）",
+        evidence: [{ type: "context", description: "文脈" }],
+        explanation: "テスト補正",
+        confidence: 0.9,
+      },
+      {
+        id: "prop-2",
+        segmentId: "seg-2",
+        originalText: "テスト文章2",
+        correctedText: "テスト文章2（補正済）",
+        evidence: [{ type: "dictionary", description: "辞書一致" }],
+        explanation: "辞書補正",
+        confidence: 0.95,
+      },
+    ];
+
+    const provider = new MockCorrectionProvider(proposals);
+    const result = await runCorrectionForDocument({
+      document: doc,
+      provider,
+    });
+
+    expect(result.status).toBe("success");
+    if (result.status === "success") {
+      expect(result.proposals.size).toBe(2);
+      expect(result.proposals.get("seg-1")![0].id).toBe("prop-1");
+      expect(result.proposals.get("seg-2")![0].id).toBe("prop-2");
+    }
+  });
+
+  it("isCancelled が true の場合は status: 'cancelled' を返す", async () => {
+    const seg1 = createDummySegment({ id: "seg-1", text: "テスト" });
+    const doc = createDummyDocument([seg1]);
+
+    const provider = new MockCorrectionProvider([
+      {
+        id: "prop-1",
+        segmentId: "seg-1",
+        originalText: "テスト",
+        correctedText: "テスト（補正）",
+        evidence: [{ type: "context" }],
+        explanation: "テスト",
+      },
+    ]);
+
+    const result = await runCorrectionForDocument({
+      document: doc,
+      provider,
+      isCancelled: () => true,
+    });
+
+    expect(result.status).toBe("cancelled");
+  });
+
+  it("不整合な提案（存在しないセグメントID・原文不一致）は除外され、有効な提案0件でも status: 'success' となる", async () => {
+    const seg1 = createDummySegment({ id: "seg-1", text: "現在の文章" });
+    const doc = createDummyDocument([seg1]);
+
+    const provider = new MockCorrectionProvider([
+      {
+        id: "prop-stale",
+        segmentId: "seg-1",
+        originalText: "過去の不一致文章",
+        correctedText: "補正後",
+        evidence: [{ type: "context" }],
+        explanation: "不一致",
+      },
+    ]);
+
+    const result = await runCorrectionForDocument({
+      document: doc,
+      provider,
+    });
+
+    expect(result.status).toBe("success");
+    if (result.status === "success") {
+      expect(result.proposals.size).toBe(0);
+    }
+  });
+
+  it("onSuccess コールバックが指定された場合、完了時に検証済み提案を受け取れる", async () => {
+    const seg1 = createDummySegment({ id: "seg-1", text: "テスト" });
+    const doc = createDummyDocument([seg1]);
+
+    const provider = new MockCorrectionProvider([
+      {
+        id: "prop-1",
+        segmentId: "seg-1",
+        originalText: "テスト",
+        correctedText: "テスト（補正）",
+        evidence: [{ type: "context" }],
+        explanation: "テスト",
+      },
+    ]);
+
+    let capturedProposals: Map<string, CorrectionProposal[]> | null = null;
+    const result = await runCorrectionForDocument(
+      {
+        document: doc,
+        provider,
+      },
+      (proposals) => {
+        capturedProposals = proposals;
+      },
+    );
+
+    expect(result.status).toBe("success");
+    expect(capturedProposals).not.toBeNull();
+    expect(capturedProposals!.size).toBe(1);
+  });
+});
+
 
 

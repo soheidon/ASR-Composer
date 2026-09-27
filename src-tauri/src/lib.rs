@@ -6,6 +6,7 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -41,7 +42,15 @@ fn default_speaker_diarization() -> bool {
     true
 }
 
-#[derive(Serialize, Deserialize)]
+fn default_correction_provider() -> String {
+    "ollama".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct AppSettings {
     pub providers: HashMap<String, ProviderSettings>,
     #[serde(default)]
@@ -56,6 +65,16 @@ pub struct AppSettings {
     pub num_speakers: String, // "auto" or numeric string like "2"
     #[serde(default)]
     pub output_path: String, // last selected output folder path
+    #[serde(default)]
+    pub correction_enabled: bool,
+    #[serde(default = "default_correction_provider")]
+    pub correction_provider: String,
+    #[serde(default)]
+    pub correction_model: String,
+    #[serde(default = "default_true")]
+    pub correction_use_dictionary: bool,
+    #[serde(default = "default_true")]
+    pub correction_use_background: bool,
 }
 
 impl Default for AppSettings {
@@ -68,6 +87,11 @@ impl Default for AppSettings {
             speaker_diarization: true,
             num_speakers: "auto".to_string(),
             output_path: String::new(),
+            correction_enabled: false,
+            correction_provider: "ollama".to_string(),
+            correction_model: String::new(),
+            correction_use_dictionary: true,
+            correction_use_background: true,
         }
     }
 }
@@ -271,6 +295,168 @@ fn save_output_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
     settings.output_path = path;
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     fs::write(&settings_path, json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_correction_settings(
+    app: tauri::AppHandle,
+    enabled: bool,
+    provider: String,
+    model: String,
+    use_dictionary: Option<bool>,
+    use_background: Option<bool>,
+) -> Result<(), String> {
+    let path = settings_path(&app);
+    let mut settings = load_settings(&app);
+    settings.correction_enabled = enabled;
+    settings.correction_provider = provider;
+    settings.correction_model = model;
+    if let Some(ud) = use_dictionary {
+        settings.correction_use_dictionary = ud;
+    }
+    if let Some(ub) = use_background {
+        settings.correction_use_background = ub;
+    }
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CorrectionContextPaths {
+    pub dir: String,
+    pub dictionary_path: String,
+    pub background_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CorrectionContextFiles {
+    pub dictionary_content: Option<String>,
+    pub background_content: Option<String>,
+}
+
+fn get_correction_context_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("アプリデータディレクトリの取得に失敗: {e}"))?;
+    let dir = app_data.join("correction");
+    fs::create_dir_all(&dir).map_err(|e| format!("correctionディレクトリの作成に失敗: {e}"))?;
+    Ok(dir)
+}
+
+#[tauri::command]
+fn get_correction_context_paths(app: tauri::AppHandle) -> Result<CorrectionContextPaths, String> {
+    let dir = get_correction_context_dir(&app)?;
+    Ok(CorrectionContextPaths {
+        dir: dir.to_string_lossy().to_string(),
+        dictionary_path: dir.join("dictionary.csv").to_string_lossy().to_string(),
+        background_path: dir.join("background.txt").to_string_lossy().to_string(),
+    })
+}
+
+fn ensure_initial_context_file(path: &std::path::Path, initial_content: &str) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            file.write_all(initial_content.as_bytes())
+                .map_err(|e| format!("初期ファイルへの書き込みに失敗: {e}"))?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // 既存ファイルが存在する場合は絶対に truncate / 上書きせず保持
+            Ok(())
+        }
+        Err(e) => Err(format!("初期ファイルの作成に失敗: {e}")),
+    }
+}
+
+#[tauri::command]
+fn open_correction_folder(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = get_correction_context_dir(&app)?;
+    let dir_str = dir.to_string_lossy().to_string();
+    app.opener()
+        .open_path(&dir_str, None::<&str>)
+        .map_err(|e| format!("フォルダのオープンに失敗: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn open_correction_file(app: tauri::AppHandle, file_type: String) -> Result<(), String> {
+    let dir = get_correction_context_dir(&app)?;
+    let target_path = match file_type.as_str() {
+        "dictionary" => {
+            let p = dir.join("dictionary.csv");
+            ensure_initial_context_file(&p, "canonical,variants,category,note\n")
+                .map_err(|e| format!("dictionary.csv 初期ファイル作成に失敗: {e}"))?;
+            p
+        }
+        "background" => {
+            let p = dir.join("background.txt");
+            ensure_initial_context_file(&p, "")
+                .map_err(|e| format!("background.txt 初期ファイル作成に失敗: {e}"))?;
+            p
+        }
+        other => return Err(format!("不正なファイル種別です: {other}")),
+    };
+    let target_str = target_path.to_string_lossy().to_string();
+    app.opener()
+        .open_path(&target_str, None::<&str>)
+        .map_err(|e| format!("ファイルのオープンに失敗: {e}"))?;
+    Ok(())
+}
+
+fn read_context_files_from_dir(
+    dir: &std::path::Path,
+    use_dict: bool,
+    use_bg: bool,
+) -> Result<CorrectionContextFiles, String> {
+    let dictionary_content = if use_dict {
+        let dict_p = dir.join("dictionary.csv");
+        match fs::read_to_string(&dict_p) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("dictionary.csv の読み込みに失敗しました: {e}")),
+        }
+    } else {
+        None
+    };
+
+    let background_content = if use_bg {
+        let bg_p = dir.join("background.txt");
+        match fs::read_to_string(&bg_p) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("background.txt の読み込みに失敗しました: {e}")),
+        }
+    } else {
+        None
+    };
+
+    Ok(CorrectionContextFiles {
+        dictionary_content,
+        background_content,
+    })
+}
+
+#[tauri::command]
+fn read_correction_context_files(
+    app: tauri::AppHandle,
+    use_dictionary: Option<bool>,
+    use_background: Option<bool>,
+) -> Result<CorrectionContextFiles, String> {
+    let use_dict = use_dictionary.unwrap_or(true);
+    let use_bg = use_background.unwrap_or(true);
+
+    if !use_dict && !use_bg {
+        return Ok(CorrectionContextFiles {
+            dictionary_content: None,
+            background_content: None,
+        });
+    }
+
+    let dir = get_correction_context_dir(&app)?;
+    read_context_files_from_dir(&dir, use_dict, use_bg)
 }
 
 // ---- Local ASR Transcription ----
@@ -4352,6 +4538,7 @@ pub fn run() {
             save_provider_secret,
             save_asr_selection,
             save_output_path,
+            save_correction_settings,
             fetch_models,
             test_connection_ollama,
             call_ollama_chat,
@@ -4377,7 +4564,11 @@ pub fn run() {
             cancel_transcription,
             save_text_file,
             save_transcript_document,
-            load_transcript_document
+            load_transcript_document,
+            get_correction_context_paths,
+            open_correction_folder,
+            open_correction_file,
+            read_correction_context_files
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -7774,5 +7965,126 @@ mod tests {
         settings.speaker_diarization = true;
         settings.asr_languages.insert("qwen3-asr".to_string(), "ja".to_string());
         assert!(validate_transcribe_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn test_app_settings_correction_defaults() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.correction_enabled, false);
+        assert_eq!(settings.correction_provider, "ollama");
+        assert_eq!(settings.correction_model, "");
+    }
+
+    #[test]
+    fn test_app_settings_correction_backward_compatibility() {
+        // JSON without correction fields or with legacy extra fields
+        let legacy_json = r#"{
+            "providers": {},
+            "asr_mode": "local",
+            "asr_engine": "reazonspeech",
+            "speaker_diarization": true,
+            "num_speakers": "auto",
+            "output_path": "",
+            "correction_auto_run": true
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(legacy_json).expect("should deserialize");
+        assert_eq!(parsed.correction_enabled, false);
+        assert_eq!(parsed.correction_provider, "ollama");
+        assert_eq!(parsed.correction_model, "");
+    }
+
+    #[test]
+    fn test_app_settings_correction_roundtrip() {
+        let mut settings = AppSettings::default();
+        settings.correction_enabled = true;
+        settings.correction_provider = "ollama".to_string();
+        settings.correction_model = "maternion/mimo-v2.6:9b".to_string();
+
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let restored: AppSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.correction_enabled, true);
+        assert_eq!(restored.correction_provider, "ollama");
+        assert_eq!(restored.correction_model, "maternion/mimo-v2.6:9b");
+    }
+
+    #[test]
+    fn test_correction_context_files_serialization() {
+        let files = CorrectionContextFiles {
+            dictionary_content: Some("canonical,variants,category,note\n".to_string()),
+            background_content: Some("医学背景情報".to_string()),
+        };
+        let json = serde_json::to_string(&files).expect("serialize");
+        let restored: CorrectionContextFiles = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.dictionary_content, Some("canonical,variants,category,note\n".to_string()));
+        assert_eq!(restored.background_content, Some("医学背景情報".to_string()));
+    }
+
+    #[test]
+    fn test_correction_context_paths_serialization() {
+        let paths = CorrectionContextPaths {
+            dir: "/app/correction".to_string(),
+            dictionary_path: "/app/correction/dictionary.csv".to_string(),
+            background_path: "/app/correction/background.txt".to_string(),
+        };
+        let json = serde_json::to_string(&paths).expect("serialize");
+        let restored: CorrectionContextPaths = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.dir, "/app/correction");
+        assert_eq!(restored.dictionary_path, "/app/correction/dictionary.csv");
+        assert_eq!(restored.background_path, "/app/correction/background.txt");
+    }
+
+    #[test]
+    fn test_ensure_initial_context_file_exclusive_creation() {
+        let dir = std::env::temp_dir().join(format!("asr_test_ctx_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        let test_file = dir.join("test_dict.csv");
+
+        // 1. 初回生成: ファイルが存在しない場合は初期内容で作成される
+        ensure_initial_context_file(&test_file, "header1,header2\n").expect("initial creation");
+        let content1 = fs::read_to_string(&test_file).expect("read");
+        assert_eq!(content1, "header1,header2\n");
+
+        // 2. ユーザーがファイルを編集
+        fs::write(&test_file, "custom,data,line1\ncustom,data,line2\n").expect("write custom data");
+
+        // 3. 2回目の生成要求: 既存ファイルが存在する場合、絶対に上書きやtruncateされず保持される
+        ensure_initial_context_file(&test_file, "header1,header2\n").expect("second call");
+        let content2 = fs::read_to_string(&test_file).expect("read after second call");
+        assert_eq!(content2, "custom,data,line1\ncustom,data,line2\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_context_files_from_dir_selective() {
+        let dir = std::env::temp_dir().join(format!("asr_test_read_ctx_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        let dict_p = dir.join("dictionary.csv");
+        let bg_p = dir.join("background.txt");
+
+        fs::write(&dict_p, "canonical,variants\nAI,人工知能\n").expect("write dict");
+        fs::write(&bg_p, "医療背景情報テキスト").expect("write bg");
+
+        // 1. Both enabled
+        let res_both = read_context_files_from_dir(&dir, true, true).expect("read both");
+        assert_eq!(res_both.dictionary_content.as_deref(), Some("canonical,variants\nAI,人工知能\n"));
+        assert_eq!(res_both.background_content.as_deref(), Some("医療背景情報テキスト"));
+
+        // 2. Dict ON, Background OFF
+        let res_dict_only = read_context_files_from_dir(&dir, true, false).expect("read dict only");
+        assert_eq!(res_dict_only.dictionary_content.as_deref(), Some("canonical,variants\nAI,人工知能\n"));
+        assert_eq!(res_dict_only.background_content, None);
+
+        // 3. Dict OFF, Background ON
+        let res_bg_only = read_context_files_from_dir(&dir, false, true).expect("read bg only");
+        assert_eq!(res_bg_only.dictionary_content, None);
+        assert_eq!(res_bg_only.background_content.as_deref(), Some("医療背景情報テキスト"));
+
+        // 4. Both OFF
+        let res_none = read_context_files_from_dir(&dir, false, false).expect("read none");
+        assert_eq!(res_none.dictionary_content, None);
+        assert_eq!(res_none.background_content, None);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

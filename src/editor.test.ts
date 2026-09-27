@@ -1213,6 +1213,9 @@ describe("Phase 1 LLM Correction UI Integration", () => {
           },
         } as unknown as T;
       }
+      if (cmd === "read_correction_context_files") {
+        return { dictionary_content: null, background_content: null } as unknown as T;
+      }
       if (cmd === "call_ollama_chat") {
         capturedChatInput = args;
         return {

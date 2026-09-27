@@ -11,13 +11,17 @@ import {
   rejectProposal,
   validateProposal,
   deriveTextChanges,
-  createCorrectionRequest,
   cloneTranscriptDocument,
   escapeAttr,
+  runCorrectionForDocument,
   type CorrectionProposal,
   type CorrectionProvider,
+  type CorrectionDictionaryEntry,
+  type CorrectionContext,
 } from "./correction";
 import { OllamaCorrectionProvider } from "./ollama-provider";
+import { resolveCorrectionProvider } from "./correction-settings";
+import { loadCorrectionContext } from "./correction-context";
 
 // Tauri invokeラッパー型
 type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -159,20 +163,57 @@ export function discardEditorChanges(): void {
  * 入力Documentは独立してディープクローンされ、参照共有を防止する。
  * filePath が null の場合は新規作成（未保存状態）、
  * filePath がある場合はディスクから読み込まれた保存済み状態とする。
+ * initialProposals が渡された場合、新ドキュメントのセグメントに適合する提案のみを atomic に activeProposals へ投入する。
  */
-export function setEditorDocument(doc: TranscriptDocument | null, filePath: string | null = null): void {
-  activeProposals.clear();
-  editorDocumentSessionId++;
-  cancelActiveCorrection();
+export function setEditorDocument(
+  doc: TranscriptDocument | null,
+  filePath: string | null = null,
+  initialProposals?: Map<string, CorrectionProposal[]> | null,
+): void {
   if (doc === null) {
+    activeProposals.clear();
+    editorDocumentSessionId++;
+    cancelActiveCorrection();
     currentDoc = null;
     savedBaselineDoc = null;
     currentFilePath = null;
     return;
   }
-  currentDoc = cloneTranscriptDocument(doc);
+
+  const newDoc = cloneTranscriptDocument(doc);
+  const newBaseline = filePath !== null ? cloneTranscriptDocument(doc) : null;
+  const newProposals = new Map<string, CorrectionProposal[]>();
+
+  if (initialProposals && initialProposals.size > 0) {
+    for (const [segId, props] of initialProposals.entries()) {
+      const seg = newDoc.segments.find((s) => s.id === segId);
+      if (seg) {
+        const validProps = props.filter((p) => validateProposal(p, seg).valid);
+        if (validProps.length > 0) {
+          newProposals.set(segId, cloneTranscriptDocument(validProps));
+        }
+      }
+    }
+  }
+
+  // アトミックにエディター状態を更新
+  activeProposals = newProposals;
+  editorDocumentSessionId++;
+  cancelActiveCorrection();
+  currentDoc = newDoc;
   currentFilePath = filePath;
-  savedBaselineDoc = filePath !== null ? cloneTranscriptDocument(doc) : null;
+  savedBaselineDoc = newBaseline;
+}
+
+/**
+ * ドキュメントと事前生成された補正提案をアトミックにエディターへ投入する。
+ */
+export function setEditorDocumentWithProposals(
+  doc: TranscriptDocument,
+  proposals: Map<string, CorrectionProposal[]>,
+  filePath: string | null = null,
+): void {
+  setEditorDocument(doc, filePath, proposals);
 }
 
 /**
@@ -449,31 +490,21 @@ export async function runLlmCorrection(): Promise<void> {
   }
 
   try {
-    // 3. 設定読み込み（Ollama設定のsource of truthを一本化）
-    let baseUrl = "http://localhost:11434";
-    let selectedModel = "";
+    // 3. 設定読み込み（Ollama設定・correction設定のsource of truthを一本化）
+    let provider: CorrectionProvider;
+    let dictionary: CorrectionDictionaryEntry[] | undefined;
+    let context: CorrectionContext | undefined;
 
-    if (!customCorrectionProvider) {
-      try {
-        const settings = await invokeTauri<{
-          providers?: Record<string, { base_url?: string; default_model?: string }>;
-        }>("load_api_settings");
-        const ollama = settings?.providers?.["ollama"];
-        if (ollama?.base_url && ollama.base_url.trim().length > 0) {
-          baseUrl = ollama.base_url.trim();
-        }
-        if (ollama?.default_model && ollama.default_model.trim().length > 0) {
-          selectedModel = ollama.default_model.trim();
-        }
-      } catch (e) {
-        console.warn("設定読み込みに失敗しました:", e);
-      }
+    if (customCorrectionProvider) {
+      provider = customCorrectionProvider;
+    } else {
+      const resolved = await resolveCorrectionProvider(invokeFn || invokeTauri);
 
       if (isCancelled()) {
         return;
       }
 
-      if (!selectedModel) {
+      if (!resolved || !resolved.model) {
         await showAppDialog({
           title: "Ollamaモデル未設定",
           message: "Ollamaのモデルが選択されていません。設定画面でモデルを選択してください。",
@@ -481,56 +512,77 @@ export async function runLlmCorrection(): Promise<void> {
         });
         return;
       }
+
+      provider = new OllamaCorrectionProvider({
+        baseUrl: resolved.baseUrl,
+        model: resolved.model,
+        invokeTauri: invokeFn || undefined,
+        isCancelled,
+      });
+
+      if (isCancelled()) {
+        return;
+      }
+
+      const contextRes = await loadCorrectionContext({
+        useDictionary: resolved.useDictionary,
+        useBackground: resolved.useBackground,
+        invokeFn: invokeFn || undefined,
+      });
+
+      if (isCancelled()) {
+        return;
+      }
+
+      if (contextRes.status !== "success") {
+        await showAppDialog({
+          title: contextRes.status === "dictionary_syntax_error" ? "辞書ファイル形式エラー" : "コンテキスト読み込みエラー",
+          message: contextRes.message,
+          type: "error",
+        });
+        return;
+      }
+
+      dictionary = contextRes.dictionary;
+      context = contextRes.context;
+      if (contextRes.warnings.length > 0) {
+        console.warn("Editor correction context warnings:", contextRes.warnings);
+      }
     }
 
     if (isCancelled()) {
       return;
     }
 
-    const provider =
-      customCorrectionProvider ||
-      new OllamaCorrectionProvider({
-        baseUrl,
-        model: selectedModel,
-        invokeTauri: invokeFn || undefined,
+    const result = await runCorrectionForDocument(
+      {
+        document: currentDoc,
+        provider,
+        dictionary,
+        context,
         isCancelled,
-      });
-    const request = createCorrectionRequest(currentDoc);
-
-    const proposals = await provider.correct(request, (completed, total) => {
-      if (isCancelled()) return;
-      if (btnLlm && runId === currentActiveRunId) {
-        btnLlm.innerHTML = `<span class="material-symbols-outlined">sync</span> 補正中 (${completed}/${total})...`;
-      }
-    });
-
-    // 早期キャンセルまたはセッション不一致の確認
-    if (isCancelled() || !currentDoc) {
-      return; // 破棄（activeProposals は一切変更しない）
-    }
-
-    // 新提案セットのローカル構築
-    const nextProposals = new Map<string, CorrectionProposal[]>();
-    for (const prop of proposals) {
-      const seg = currentDoc.segments.find((s) => s.id === prop.segmentId);
-      const val = validateProposal(prop, seg);
-      if (val.valid) {
-        const existing = nextProposals.get(prop.segmentId) || [];
-        if (!existing.some((p) => p.id === prop.id)) {
-          existing.push(prop);
-          nextProposals.set(prop.segmentId, existing);
+        onProgress: (completed, total) => {
+          if (isCancelled()) return;
+          if (btnLlm && runId === currentActiveRunId) {
+            btnLlm.innerHTML = `<span class="material-symbols-outlined">sync</span> 補正中 (${completed}/${total})...`;
+          }
+        },
+      },
+      (nextProposals) => {
+        // 早期キャンセルまたはセッション不一致の確認
+        if (isCancelled() || !currentDoc) {
+          return; // 破棄（activeProposals は一切変更しない）
         }
-      }
-    }
 
-    // 最終コミットガード
-    if (isCancelled() || !currentDoc) {
+        // Transactional Replace: 新提案セットで完全置換
+        activeProposals = nextProposals;
+        renderSegmentsList();
+      },
+    );
+
+    if (result.status === "cancelled") {
       return;
     }
-
-    // Transactional Replace: 新提案セットで完全置換
-    activeProposals = nextProposals;
-    renderSegmentsList();
   } catch (err: unknown) {
     if (isCancelled()) {
       return;
@@ -597,7 +649,7 @@ function renderSegmentCard(seg: TranscriptSegment, index: number): string {
 /**
  * エディター画面のイベントリスナーをバインドする
  */
-export function bindEditorEvents(onNavigate?: (page: any) => Promise<void>): void {
+export function bindEditorEvents(onNavigate?: (page: any) => Promise<unknown>): void {
   const list = document.getElementById("editorSegmentsList");
   if (list) {
     // セグメント編集イベントの委譲
@@ -789,7 +841,7 @@ async function executeSaveDocument(path: string): Promise<boolean> {
 /**
  * エディターUIを現在の currentDoc で明示的に再描画し、イベントリスナーを再バインドする
  */
-export function renderEditor(onNavigate?: (page: any) => Promise<void>): void {
+export function renderEditor(onNavigate?: (page: any) => Promise<unknown>): void {
   const pageContainer = document.getElementById("page-editor");
   if (pageContainer) {
     const editorEl = pageContainer.querySelector(".editor-container, .editor-empty-state");
@@ -811,7 +863,7 @@ export function renderEditor(onNavigate?: (page: any) => Promise<void>): void {
 /**
  * 既存の .asrc.json を開く
  */
-export async function handleOpenFile(onNavigate?: (page: any) => Promise<void>): Promise<void> {
+export async function handleOpenFile(onNavigate?: (page: any) => Promise<unknown>): Promise<void> {
   const canDiscard = await confirmDiscardChanges();
   if (!canDiscard) return;
 

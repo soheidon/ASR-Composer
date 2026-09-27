@@ -562,3 +562,58 @@ export class MockCorrectionProvider implements CorrectionProvider {
     return this.fixtures.filter((f) => validSegmentIds.has(f.segmentId));
   }
 }
+
+export interface RunCorrectionOptions {
+  document: TranscriptDocument;
+  provider: CorrectionProvider;
+  dictionary?: CorrectionDictionaryEntry[];
+  context?: CorrectionContext;
+  isCancelled?: () => boolean;
+  onProgress?: (completed: number, total: number) => void;
+}
+
+export type RunCorrectionResult =
+  | { status: "success"; proposals: Map<string, CorrectionProposal[]> }
+  | { status: "cancelled" };
+
+export async function runCorrectionForDocument(
+  options: RunCorrectionOptions,
+  onSuccess?: (proposals: Map<string, CorrectionProposal[]>) => void,
+): Promise<RunCorrectionResult> {
+  const { document, provider, dictionary, context, isCancelled = () => false, onProgress } = options;
+  if (isCancelled()) {
+    return { status: "cancelled" };
+  }
+
+  const request = createCorrectionRequest(document, dictionary, context);
+  const proposals = await provider.correct(request, onProgress);
+
+  if (isCancelled()) {
+    return { status: "cancelled" };
+  }
+
+  const validProposalsMap = new Map<string, CorrectionProposal[]>();
+  for (const prop of proposals) {
+    const seg = document.segments.find((s) => s.id === prop.segmentId);
+    const val = validateProposal(prop, seg);
+    if (val.valid) {
+      const existing = validProposalsMap.get(prop.segmentId) || [];
+      if (!existing.some((p) => p.id === prop.id)) {
+        existing.push(prop);
+        validProposalsMap.set(prop.segmentId, existing);
+      }
+    }
+  }
+
+  if (isCancelled()) {
+    return { status: "cancelled" };
+  }
+
+  if (onSuccess) {
+    onSuccess(validProposalsMap);
+  }
+
+  return { status: "success", proposals: validProposalsMap };
+}
+
+

@@ -34,10 +34,27 @@ import {
   bindEditorEvents,
   confirmDiscardChanges,
   setEditorDocument,
+  setEditorDocumentWithProposals,
   setEditorInvoke,
   isEditorDirty,
 } from "./editor";
 import type { TranscriptDocument } from "./transcript";
+import {
+  type SavedAppSettings,
+  type SavedProviderSettings,
+  resolveCorrectionProvider,
+  saveCorrectionSettings,
+} from "./correction-settings";
+import {
+  runCorrectionForDocument,
+  type CorrectionProposal,
+} from "./correction";
+import { OllamaCorrectionProvider } from "./ollama-provider";
+import {
+  loadCorrectionContext,
+  openCorrectionFolder,
+  openCorrectionFile,
+} from "./correction-context";
 
 function getAppElement(): HTMLElement | null {
   return document.getElementById("app");
@@ -435,22 +452,63 @@ const transcribePage = `
         </div>
       </section>
 
-      <section class="section-card">
-        <h3 class="section-header"><span class="section-title">補完LLM</span></h3>
-        <div class="engine-row">
-          <label class="field-label">補完LLM</label>
-          <div class="engine-select-wrap">
-            <select class="engine-select" id="llmSelect">
-              <option value="none">なし</option>
-              <option value="gpt4">GPT-4</option>
-              <option value="claude">Claude</option>
-              <option value="gemini">Gemini</option>
-            </select>
-            <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+      <section class="section-card" id="correctionSection">
+        <h3 class="section-header"><span class="section-title">補完</span></h3>
+        <div class="engine-row" id="correctionRow" style="display: flex; align-items: center; flex-wrap: wrap; gap: 8px;">
+          <label class="checkbox-label" style="margin-right: 12px; white-space: nowrap;">
+            <input type="checkbox" id="correctionEnabledCheckbox" />
+            <span>LLM補正</span>
+          </label>
+          <div id="correctionControlsRow" style="display: flex; align-items: center; flex: 1; min-width: 0; gap: 8px;">
+            <label class="field-label-inline" style="margin-left: 0; white-space: nowrap;">Provider</label>
+            <div class="engine-select-wrap engine-select-wrap-mode" style="flex: 0 0 110px;">
+              <select class="engine-select" id="correctionProviderSelect">
+                <option value="ollama">Ollama</option>
+              </select>
+              <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+            </div>
+            <label class="field-label-inline" style="margin-left: 8px; white-space: nowrap;">モデル</label>
+            <div class="engine-select-wrap" style="flex: 1; min-width: 140px;">
+              <select class="engine-select" id="correctionModelSelect">
+                <option value="">（モデル一覧を取得中...）</option>
+              </select>
+              <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+            </div>
+            <button class="btn-icon" id="btnRefreshCorrectionModels" title="モデル一覧を再取得" type="button">
+              <span class="material-symbols-outlined">refresh</span>
+            </button>
+            <button class="btn-icon" id="btnCorrectionSettings" title="Ollama設定を開く" type="button">
+              <span class="material-symbols-outlined">tune</span>
+            </button>
           </div>
-          <button class="btn-icon" title="補完LLM設定">
-            <span class="material-symbols-outlined">tune</span>
-          </button>
+        </div>
+        <div class="correction-context-section" id="correctionContextSection" style="margin-top: 10px; display: flex; align-items: center; flex-wrap: wrap; gap: 16px;">
+          <div class="field-row context-row" id="correctionDictRow" style="display: flex; align-items: center; flex: 1; min-width: 0; gap: 8px;">
+            <label class="checkbox-label" style="white-space: nowrap;">
+              <input type="checkbox" id="correctionDictCheckbox" checked />
+              <span>辞書</span>
+            </label>
+            <input type="text" class="path-input" id="correctionDictFileInput" value="dictionary.csv" readonly style="flex: 1; min-width: 80px;" />
+            <button class="btn-icon" id="btnOpenDictionaryFolder" type="button" title="フォルダを開く: 辞書ファイル（dictionary.csv）の保存先フォルダを開きます">
+              <span class="material-symbols-outlined">folder_open</span>
+            </button>
+            <button class="btn-icon" id="btnOpenDictionaryFile" type="button" title="ファイルを開く: 辞書ファイル（dictionary.csv）をOS既定のアプリで開きます">
+              <span class="material-symbols-outlined">description</span>
+            </button>
+          </div>
+          <div class="field-row context-row" id="correctionBgRow" style="display: flex; align-items: center; flex: 1; min-width: 0; gap: 8px;">
+            <label class="checkbox-label" style="white-space: nowrap;">
+              <input type="checkbox" id="correctionBgCheckbox" checked />
+              <span>背景情報</span>
+            </label>
+            <input type="text" class="path-input" id="correctionBgFileInput" value="background.txt" readonly style="flex: 1; min-width: 80px;" />
+            <button class="btn-icon" id="btnOpenBackgroundFolder" type="button" title="フォルダを開く: 背景情報ファイル（background.txt）の保存先フォルダを開きます">
+              <span class="material-symbols-outlined">folder_open</span>
+            </button>
+            <button class="btn-icon" id="btnOpenBackgroundFile" type="button" title="ファイルを開く: 背景情報ファイル（background.txt）をOS既定のテキストエディタで開きます">
+              <span class="material-symbols-outlined">description</span>
+            </button>
+          </div>
         </div>
       </section>
 
@@ -500,7 +558,10 @@ const transcribePage = `
       </section>
 
       <section class="section-card" id="resultSection" style="display:none">
-        <h3 class="section-header"><span class="section-title">文字起こし結果</span></h3>
+        <h3 class="section-header">
+          <span class="section-title">文字起こし結果</span>
+          <span id="correctionStatusBadge" style="margin-left: 12px; font-size: 13px; font-weight: normal; color: var(--color-primary, #2563eb); display: none;"></span>
+        </h3>
         <textarea class="result-textarea" id="resultText" readonly rows="15"></textarea>
         <div class="saved-files-info" id="savedFilesInfo" style="display:none"></div>
         <div class="result-actions">
@@ -1066,7 +1127,7 @@ async function restoreAsrSelection(): Promise<void> {
   }
 
   if (settings.output_path) {
-    const outputInput = document.querySelector<HTMLInputElement>(".path-input");
+    const outputInput = document.getElementById("outputPathInput") as HTMLInputElement | null;
     if (outputInput) outputInput.value = settings.output_path;
   }
 }
@@ -1161,6 +1222,305 @@ function bindAsrEngineSettingsButton(): void {
       void navigateTo("settings-docker");
     } else {
       void navigateTo("settings");
+    }
+  });
+}
+
+// ---- Correction Selection (補完) ----
+
+export function updateCorrectionUiState(): void {
+  const enabledCheckbox = document.getElementById("correctionEnabledCheckbox") as HTMLInputElement | null;
+  const isEnabled = enabledCheckbox?.checked ?? false;
+
+  const providerSelect = document.getElementById("correctionProviderSelect") as HTMLSelectElement | null;
+  const modelSelect = document.getElementById("correctionModelSelect") as HTMLSelectElement | null;
+  const refreshBtn = document.getElementById("btnRefreshCorrectionModels") as HTMLButtonElement | null;
+  const settingsBtn = document.getElementById("btnCorrectionSettings") as HTMLButtonElement | null;
+  const controlsRow = document.getElementById("correctionControlsRow") as HTMLElement | null;
+
+  const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
+  const bgCheckbox = document.getElementById("correctionBgCheckbox") as HTMLInputElement | null;
+  const dictRow = document.getElementById("correctionDictRow") as HTMLElement | null;
+  const bgRow = document.getElementById("correctionBgRow") as HTMLElement | null;
+
+  if (providerSelect) providerSelect.disabled = !isEnabled;
+  if (modelSelect) modelSelect.disabled = !isEnabled;
+  if (refreshBtn) refreshBtn.disabled = !isEnabled;
+  if (settingsBtn) settingsBtn.disabled = !isEnabled;
+  if (controlsRow) controlsRow.style.opacity = isEnabled ? "" : "0.5";
+
+  if (dictCheckbox) dictCheckbox.disabled = !isEnabled;
+  if (bgCheckbox) bgCheckbox.disabled = !isEnabled;
+  if (dictRow) dictRow.style.opacity = isEnabled ? "" : "0.5";
+  if (bgRow) bgRow.style.opacity = isEnabled ? "" : "0.5";
+}
+
+let savedCorrectionModel = "";
+let correctionModelExplicitlySelected = false;
+
+export function isCorrectionModelExplicitlySelectedForTest(): boolean {
+  return correctionModelExplicitlySelected;
+}
+
+export function getSavedCorrectionModelForTest(): string {
+  return savedCorrectionModel;
+}
+
+export function setSavedCorrectionModelForTest(model: string, explicitlySelected = true): void {
+  savedCorrectionModel = model;
+  correctionModelExplicitlySelected = explicitlySelected;
+}
+
+export async function saveCorrectionSelection(): Promise<void> {
+  const enabledCheckbox = document.getElementById("correctionEnabledCheckbox") as HTMLInputElement | null;
+  const providerSelect = document.getElementById("correctionProviderSelect") as HTMLSelectElement | null;
+  const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
+  const bgCheckbox = document.getElementById("correctionBgCheckbox") as HTMLInputElement | null;
+
+  const enabled = enabledCheckbox?.checked ?? false;
+  const provider = providerSelect?.value || "ollama";
+  const model = correctionModelExplicitlySelected ? savedCorrectionModel : "";
+  const useDictionary = dictCheckbox?.checked ?? true;
+  const useBackground = bgCheckbox?.checked ?? true;
+
+  try {
+    await saveCorrectionSettings({
+      correction_enabled: enabled,
+      correction_provider: provider,
+      correction_model: model,
+      correction_use_dictionary: useDictionary,
+      correction_use_background: useBackground,
+    }, invokeTauri);
+  } catch (error) {
+    console.error("saveCorrectionSelection error:", error);
+  }
+}
+
+export function populateCorrectionModelSelect(
+  select: HTMLSelectElement,
+  models: string[] | null | undefined,
+  currentModel?: string,
+): void {
+  select.innerHTML = "";
+  const modelList = Array.isArray(models) ? models : [];
+  const targetModel = (currentModel && currentModel.trim().length > 0)
+    ? currentModel.trim()
+    : (savedCorrectionModel ? savedCorrectionModel.trim() : "");
+
+  // 常に先頭に「Ollamaの既定モデルを使用」を配置
+  const defaultOpt = document.createElement("option");
+  defaultOpt.value = "";
+  defaultOpt.textContent = "Ollamaの既定モデルを使用";
+  if (!targetModel) {
+    defaultOpt.selected = true;
+  }
+  select.appendChild(defaultOpt);
+
+  if (modelList.length === 0) {
+    if (targetModel) {
+      const opt = document.createElement("option");
+      opt.value = targetModel;
+      opt.textContent = `${targetModel} (一覧取得失敗・未確認)`;
+      opt.selected = true;
+      select.appendChild(opt);
+    }
+    return;
+  }
+
+  let matched = false;
+  for (const m of modelList) {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = m;
+    if (targetModel && m === targetModel) {
+      opt.selected = true;
+      matched = true;
+    }
+    select.appendChild(opt);
+  }
+
+  if (targetModel && !matched) {
+    const opt = document.createElement("option");
+    opt.value = targetModel;
+    opt.textContent = `${targetModel} (未検出)`;
+    opt.selected = true;
+    select.insertBefore(opt, defaultOpt.nextSibling);
+  }
+}
+
+export async function fetchCorrectionModelsForSelect(selectedModel?: string): Promise<void> {
+  const modelSelect = document.getElementById("correctionModelSelect") as HTMLSelectElement | null;
+  if (!modelSelect) return;
+
+  const modelToPreserve = selectedModel !== undefined ? selectedModel : savedCorrectionModel;
+
+  if (cachedOllamaModels && cachedOllamaModels.length > 0) {
+    populateCorrectionModelSelect(modelSelect, cachedOllamaModels, modelToPreserve);
+    return;
+  }
+
+  modelSelect.innerHTML = '<option value="">（モデル一覧を取得中...）</option>';
+
+  try {
+    const models = await invokeTauri<string[]>("fetch_models", { providerId: "ollama" });
+    cachedOllamaModels = models;
+    populateCorrectionModelSelect(modelSelect, models, modelToPreserve);
+  } catch (e) {
+    console.error("fetch_models (ollama) error for correction:", e);
+    modelSelect.innerHTML = "";
+    if (modelToPreserve) {
+      const defaultOpt = document.createElement("option");
+      defaultOpt.value = "";
+      defaultOpt.textContent = "Ollamaの既定モデルを使用";
+      selectAppendSafe(modelSelect, defaultOpt);
+
+      const opt = document.createElement("option");
+      opt.value = modelToPreserve;
+      opt.textContent = `${modelToPreserve} (一覧取得失敗・未確認)`;
+      opt.selected = true;
+      modelSelect.appendChild(opt);
+    } else {
+      const defaultOpt = document.createElement("option");
+      defaultOpt.value = "";
+      defaultOpt.textContent = "Ollamaの既定モデルを使用";
+      defaultOpt.selected = true;
+      modelSelect.appendChild(defaultOpt);
+    }
+  }
+}
+
+function selectAppendSafe(select: HTMLSelectElement, opt: HTMLOptionElement): void {
+  select.appendChild(opt);
+}
+
+export async function restoreCorrectionSelection(): Promise<void> {
+  let settings: SavedAppSettings;
+  try {
+    settings = await invokeTauri<SavedAppSettings>("load_api_settings");
+  } catch (e) {
+    console.error("restoreCorrectionSelection failed to load settings:", e);
+    return;
+  }
+
+  const enabledCheckbox = document.getElementById("correctionEnabledCheckbox") as HTMLInputElement | null;
+  const providerSelect = document.getElementById("correctionProviderSelect") as HTMLSelectElement | null;
+  const modelSelect = document.getElementById("correctionModelSelect") as HTMLSelectElement | null;
+  const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
+  const bgCheckbox = document.getElementById("correctionBgCheckbox") as HTMLInputElement | null;
+
+  if (enabledCheckbox) {
+    enabledCheckbox.checked = settings.correction_enabled === true;
+  }
+  if (providerSelect) {
+    providerSelect.value = settings.correction_provider || "ollama";
+  }
+  if (dictCheckbox) {
+    dictCheckbox.checked = settings.correction_use_dictionary !== false;
+  }
+  if (bgCheckbox) {
+    bgCheckbox.checked = settings.correction_use_background !== false;
+  }
+
+  updateCorrectionUiState();
+
+  const explicitModel = settings.correction_model?.trim() || "";
+  savedCorrectionModel = explicitModel;
+  correctionModelExplicitlySelected = explicitModel.length > 0;
+
+  await fetchCorrectionModelsForSelect(explicitModel);
+  if (modelSelect) {
+    modelSelect.value = explicitModel;
+  }
+}
+
+function bindCorrectionSelection(): void {
+  const enabledCheckbox = document.getElementById("correctionEnabledCheckbox") as HTMLInputElement | null;
+  const providerSelect = document.getElementById("correctionProviderSelect") as HTMLSelectElement | null;
+  const modelSelect = document.getElementById("correctionModelSelect") as HTMLSelectElement | null;
+  const refreshBtn = document.getElementById("btnRefreshCorrectionModels") as HTMLButtonElement | null;
+  const settingsBtn = document.getElementById("btnCorrectionSettings") as HTMLButtonElement | null;
+  const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
+  const bgCheckbox = document.getElementById("correctionBgCheckbox") as HTMLInputElement | null;
+
+  enabledCheckbox?.addEventListener("change", async () => {
+    updateCorrectionUiState();
+    await saveCorrectionSelection();
+  });
+
+  providerSelect?.addEventListener("change", async () => {
+    await saveCorrectionSelection();
+  });
+
+  dictCheckbox?.addEventListener("change", async () => {
+    await saveCorrectionSelection();
+  });
+
+  bgCheckbox?.addEventListener("change", async () => {
+    await saveCorrectionSelection();
+  });
+
+  modelSelect?.addEventListener("change", async () => {
+    if (modelSelect.value && modelSelect.value.trim() !== "") {
+      savedCorrectionModel = modelSelect.value.trim();
+      correctionModelExplicitlySelected = true;
+    } else {
+      savedCorrectionModel = "";
+      correctionModelExplicitlySelected = false;
+    }
+    await saveCorrectionSelection();
+  });
+
+  refreshBtn?.addEventListener("click", async () => {
+    cachedOllamaModels = null;
+    await fetchCorrectionModelsForSelect(savedCorrectionModel);
+  });
+
+  settingsBtn?.addEventListener("click", () => {
+    void navigateTo("settings-ollama");
+  });
+
+  const btnOpenDictFolder = document.getElementById("btnOpenDictionaryFolder");
+  const btnOpenDictFile = document.getElementById("btnOpenDictionaryFile");
+  const btnOpenBgFolder = document.getElementById("btnOpenBackgroundFolder");
+  const btnOpenBgFile = document.getElementById("btnOpenBackgroundFile");
+
+  btnOpenDictFolder?.addEventListener("click", async () => {
+    try {
+      await openCorrectionFolder(invokeTauri);
+    } catch (e) {
+      console.error("open_correction_folder error:", e);
+      const { showAppDialog } = await import("./status");
+      await showAppDialog({ title: "フォルダオープン失敗", message: `フォルダを開けませんでした: ${e}`, type: "error" });
+    }
+  });
+
+  btnOpenDictFile?.addEventListener("click", async () => {
+    try {
+      await openCorrectionFile("dictionary", invokeTauri);
+    } catch (e) {
+      console.error("open_correction_file error:", e);
+      const { showAppDialog } = await import("./status");
+      await showAppDialog({ title: "ファイルオープン失敗", message: `辞書ファイルを開けませんでした: ${e}`, type: "error" });
+    }
+  });
+
+  btnOpenBgFolder?.addEventListener("click", async () => {
+    try {
+      await openCorrectionFolder(invokeTauri);
+    } catch (e) {
+      console.error("open_correction_folder error:", e);
+      const { showAppDialog } = await import("./status");
+      await showAppDialog({ title: "フォルダオープン失敗", message: `フォルダを開けませんでした: ${e}`, type: "error" });
+    }
+  });
+
+  btnOpenBgFile?.addEventListener("click", async () => {
+    try {
+      await openCorrectionFile("background", invokeTauri);
+    } catch (e) {
+      console.error("open_correction_file error:", e);
+      const { showAppDialog } = await import("./status");
+      await showAppDialog({ title: "ファイルオープン失敗", message: `背景情報ファイルを開けませんでした: ${e}`, type: "error" });
     }
   });
 }
@@ -1365,8 +1725,14 @@ async function mountTranscribeWorkspace(): Promise<MountResult> {
   } catch (e) {
     console.error("restoreAsrSelection failed:", e);
   }
+  try {
+    await restoreCorrectionSelection();
+  } catch (e) {
+    console.error("restoreCorrectionSelection failed:", e);
+  }
   bindAsrModeSelect();
   bindAsrEngineSettingsButton();
+  bindCorrectionSelection();
   bindFileSelection();
   bindStartButton();
   await bindTranscribeProgress();
@@ -1476,7 +1842,9 @@ async function mountSettingsSubpage(
   }
 }
 
-export async function navigateTo(page: PageName): Promise<void> {
+export type NavigationResult = "completed" | "superseded";
+
+export async function navigateTo(page: PageName): Promise<NavigationResult> {
   const navId = ++navigationGeneration;
   currentPage = page;
 
@@ -1502,7 +1870,7 @@ export async function navigateTo(page: PageName): Promise<void> {
     navId,
   );
 
-  if (!workspaceMounted || navId !== navigationGeneration) return;
+  if (!workspaceMounted || navId !== navigationGeneration) return "superseded";
 
   const subpageInfo = getSettingsSubpageKey(page);
   if (subpageInfo) {
@@ -1513,10 +1881,10 @@ export async function navigateTo(page: PageName): Promise<void> {
       },
       navId,
     );
-    if (!subpageMounted || navId !== navigationGeneration) return;
+    if (!subpageMounted || navId !== navigationGeneration) return "superseded";
   }
 
-  if (navId !== navigationGeneration) return;
+  if (navId !== navigationGeneration) return "superseded";
 
   if (page === "settings-docker") {
     void loadDockerPageStatuses();
@@ -1556,6 +1924,8 @@ export async function navigateTo(page: PageName): Promise<void> {
       }
     }
   }
+
+  return "completed";
 }
 
 function bindSettingsSidebarNav() {
@@ -1989,6 +2359,9 @@ function bindStartButton(): void {
 
     const jobId = crypto.randomUUID();
     activeJobId = jobId;
+    asrGeneration++;
+    activeAutoCorrectionRunId = null;
+    activeAutoCorrectionGeneration = asrGeneration;
     cancelRequested = false;
     setTranscriptionRunning(true);
     showProgressSection("準備中...");
@@ -2003,6 +2376,22 @@ function bindStartButton(): void {
       });
       if (!cancelRequested) {
         displayTranscriptionResult(result);
+        if (result.document) {
+          const doc = result.document;
+          const generationAtCompletion = asrGeneration;
+          void invokeTauri<SavedAppSettings>("load_api_settings")
+            .then((settings) => {
+              if (generationAtCompletion !== asrGeneration || lastTranscriptionDocument !== doc) {
+                return;
+              }
+              if (settings?.correction_enabled && !cancelRequested) {
+                void runAsrAutoCorrection(jobId, doc, generationAtCompletion);
+              }
+            })
+            .catch((e) => {
+              console.warn("load_api_settings error for auto-correction:", e);
+            });
+        }
       }
     } catch (error) {
       if (!cancelRequested) {
@@ -2037,11 +2426,197 @@ function bindStartButton(): void {
   });
 }
 
+export interface StagedCorrectionResult {
+  asrRunId: string;
+  document: TranscriptDocument;
+  proposals: Map<string, CorrectionProposal[]>;
+  correctionRunId: string;
+}
+
+let asrGeneration = 0;
+let pendingCorrectionResult: StagedCorrectionResult | null = null;
+let activeAutoCorrectionRunId: string | null = null;
+let activeAutoCorrectionGeneration = 0;
+let cachedOllamaModels: string[] | null = null;
 let lastTranscriptionDocument: TranscriptDocument | null = null;
+
+export function getAsrGenerationForTest(): number {
+  return asrGeneration;
+}
+
+export function setAsrGenerationForTest(gen: number): void {
+  asrGeneration = gen;
+}
+
+export function getActiveAutoCorrectionGenerationForTest(): number {
+  return activeAutoCorrectionGeneration;
+}
+
+export function getPendingCorrectionResultForTest(): StagedCorrectionResult | null {
+  return pendingCorrectionResult;
+}
+
+export function setPendingCorrectionResultForTest(staged: StagedCorrectionResult | null): void {
+  pendingCorrectionResult = staged;
+}
+
+export function resetCorrectionStateForTest(): void {
+  pendingCorrectionResult = null;
+  activeAutoCorrectionRunId = null;
+  activeAutoCorrectionGeneration = 0;
+  cachedOllamaModels = null;
+  lastTranscriptionDocument = null;
+  savedCorrectionModel = "";
+  correctionModelExplicitlySelected = false;
+  asrGeneration = 0;
+}
+
+export function setLastTranscriptionDocumentForTest(doc: TranscriptDocument | null): void {
+  lastTranscriptionDocument = doc;
+}
+
+export function getLastTranscriptionDocumentForTest(): TranscriptDocument | null {
+  return lastTranscriptionDocument;
+}
+
+function isCurrentAutoCorrectionRun(
+  correctionRunId: string,
+  generation: number,
+  doc: TranscriptDocument,
+): boolean {
+  return (
+    generation === asrGeneration &&
+    activeAutoCorrectionRunId === correctionRunId &&
+    lastTranscriptionDocument === doc
+  );
+}
+
+export async function runAsrAutoCorrection(
+  jobId: string,
+  doc: TranscriptDocument,
+  generation: number = asrGeneration,
+): Promise<void> {
+  if (generation !== asrGeneration || lastTranscriptionDocument !== doc) {
+    return;
+  }
+
+  const correctionRunId = crypto.randomUUID();
+  activeAutoCorrectionRunId = correctionRunId;
+  activeAutoCorrectionGeneration = generation;
+
+  const badgeEl = document.getElementById("correctionStatusBadge");
+  if (badgeEl && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+    badgeEl.textContent = "補正候補を生成中...";
+    badgeEl.style.display = "inline-block";
+    badgeEl.style.color = "var(--color-primary, #2563eb)";
+  }
+
+  try {
+    const resolved = await resolveCorrectionProvider(invokeTauri);
+    if (!isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+      return;
+    }
+
+    if (!resolved || !resolved.model) {
+      console.warn("自動LLM補正: プロバイダーまたはモデルが解決できないためスキップします");
+      if (badgeEl && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+        badgeEl.style.display = "none";
+      }
+      return;
+    }
+
+    const provider = new OllamaCorrectionProvider({
+      baseUrl: resolved.baseUrl,
+      model: resolved.model,
+      invokeTauri,
+      isCancelled: () => !isCurrentAutoCorrectionRun(correctionRunId, generation, doc),
+    });
+
+    const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
+    const bgCheckbox = document.getElementById("correctionBgCheckbox") as HTMLInputElement | null;
+    const useDictionary = dictCheckbox ? dictCheckbox.checked : resolved.useDictionary;
+    const useBackground = bgCheckbox ? bgCheckbox.checked : resolved.useBackground;
+
+    const contextLoadResult = await loadCorrectionContext({
+      useDictionary,
+      useBackground,
+      invokeFn: invokeTauri,
+    });
+
+    if (!isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+      return;
+    }
+
+    if (contextLoadResult.status !== "success") {
+      console.warn("自動LLM補正中断:", contextLoadResult.message);
+      if (badgeEl && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+        badgeEl.textContent = contextLoadResult.status === "dictionary_syntax_error"
+          ? "辞書ファイルの形式に問題があります (手動確認要)"
+          : "コンテキスト読込失敗 (手動実行可)";
+        badgeEl.style.display = "inline-block";
+        badgeEl.style.color = "#dc2626";
+      }
+      return;
+    }
+
+    const { dictionary, context, warnings } = contextLoadResult;
+    if (warnings.length > 0) {
+      console.warn("自動LLM補正: コンテキスト読み込み警告:", warnings);
+    }
+    if (!isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+      return;
+    }
+
+    const result = await runCorrectionForDocument({
+      document: doc,
+      provider,
+      dictionary,
+      context,
+      isCancelled: () => !isCurrentAutoCorrectionRun(correctionRunId, generation, doc),
+    });
+
+    if (result.status === "cancelled" || !isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+      return;
+    }
+
+    const proposals = result.proposals;
+    if (isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+      pendingCorrectionResult = {
+        asrRunId: jobId,
+        document: doc,
+        proposals,
+        correctionRunId,
+      };
+      const totalProps = Array.from(proposals.values()).reduce((sum, list) => sum + list.length, 0);
+      if (badgeEl && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+        badgeEl.textContent = totalProps > 0 ? `補正候補 (${totalProps}件) を生成しました` : `補正候補はありませんでした (0件)`;
+        badgeEl.style.display = "inline-block";
+        badgeEl.style.color = "var(--color-primary, #2563eb)";
+      }
+    }
+  } catch (err) {
+    if (isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+      console.warn("自動LLM補正中にエラーが発生しました (ASR結果は保持されます):", err);
+      if (badgeEl && isCurrentAutoCorrectionRun(correctionRunId, generation, doc)) {
+        badgeEl.textContent = "LLM補正に失敗しました (手動実行可)";
+        badgeEl.style.display = "inline-block";
+        badgeEl.style.color = "#dc2626";
+      }
+    }
+  }
+}
 
 function displayTranscriptionResult(result: TranscriptionResult): void {
   showResultSection();
+  if (lastTranscriptionDocument !== result.document) {
+    pendingCorrectionResult = null;
+  }
   lastTranscriptionDocument = result.document ?? null;
+  const badgeEl = document.getElementById("correctionStatusBadge");
+  if (badgeEl) {
+    badgeEl.style.display = "none";
+    badgeEl.textContent = "";
+  }
   const textArea = document.getElementById("resultText") as HTMLTextAreaElement | null;
   if (textArea) {
     textArea.value = result.txtContent;
@@ -2070,7 +2645,7 @@ function bindBrowseOutputPath(): void {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const folder = await open({ directory: true, multiple: false });
       if (folder) {
-        const input = document.querySelector<HTMLInputElement>(".path-input");
+        const input = document.getElementById("outputPathInput") as HTMLInputElement | null;
         if (input) input.value = folder;
         void invokeTauri("save_output_path", { path: folder }).catch((e: unknown) => {
           console.error("save_output_path error:", e);
@@ -2107,35 +2682,38 @@ function bindResultButtons(): void {
         const confirmed = await confirmDiscardChanges();
         if (!confirmed) return;
       }
-      setEditorDocument(lastTranscriptionDocument, null);
-      renderEditor(navigateTo);
-      await navigateTo("editor");
+      const targetDoc = lastTranscriptionDocument;
+      const staged = (pendingCorrectionResult && pendingCorrectionResult.document === targetDoc)
+        ? pendingCorrectionResult
+        : null;
+
+      try {
+        if (staged) {
+          setEditorDocumentWithProposals(targetDoc, staged.proposals, null);
+        } else {
+          setEditorDocument(targetDoc, null);
+        }
+        renderEditor(navigateTo);
+        const navResult = await navigateTo("editor");
+
+        if (navResult === "completed" && currentPage === "editor") {
+          if (staged && pendingCorrectionResult === staged) {
+            pendingCorrectionResult = null;
+          }
+        }
+      } catch (err) {
+        console.error("Editor handoff failed:", err);
+        throw err;
+      }
     }
   });
 }
 
 // ---- API Settings: Load ----
 
-interface SavedProviderSettings {
-  env_name?: string;
-  base_url?: string;
-  default_model?: string;
-  options?: Record<string, string>;
-}
-
 interface SaveProviderSecretResult {
   persisted: boolean;
   warning?: string;
-}
-
-interface SavedAppSettings {
-  providers: Record<string, SavedProviderSettings>;
-  asr_mode: string;
-  asr_engine: string;
-  asr_languages: Record<string, string>;
-  speaker_diarization: boolean;
-  num_speakers: string;
-  output_path: string;
 }
 
 async function loadSavedSettings(navGeneration?: number, container: ParentNode = document): Promise<boolean> {
