@@ -79,7 +79,7 @@ ASR Composerは、複数のASR（自動音声認識）エンジンをGUIから�
 
 ### setup.exeによるインストール
 
-1. [リリースページ](https://github.com/soheidon/ASR-Composer/releases)から最新の `ASR-Composer_0.1.0_x64-setup.exe` をダウンロード
+1. [リリースページ](https://github.com/soheidon/ASR-Composer/releases)から最新の `ASR-Composer_0.2.0_x64-setup.exe` をダウンロード
 2. setup.exeを実行してインストール
 3. スタートメニューまたはデスクトップからASR Composerを起動
 
