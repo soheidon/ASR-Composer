@@ -2522,5 +2522,177 @@ html, body {
   background-color: #fecaca;
 }
 
+/* ---- Multi-ASR Staging & Progress UI ---- */
+
+.btn-multi-asr {
+  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+  color: #ffffff;
+  border: none;
+}
+
+.btn-multi-asr:hover:not(:disabled) {
+  background: linear-gradient(135deg, #4338ca 0%, #6d28d9 100%);
+}
+
+.multi-asr-progress-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 0;
+}
+
+.multi-asr-progress-text {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--on-surface);
+}
+
+.progress-bar-container {
+  height: 8px;
+  background: var(--surface-container-high, #e2e8f0);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.multi-asr-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #4f46e5, #7c3aed);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+.multi-asr-card {
+  padding: 16px 20px;
+  border-radius: 8px;
+  border: 1px solid var(--outline-variant, #cbd5e1);
+  background: var(--surface-container-lowest, #ffffff);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.multi-asr-card.card-success {
+  border-left: 4px solid #10b981;
+}
+
+.multi-asr-card.card-warning {
+  border-left: 4px solid #f59e0b;
+}
+
+.multi-asr-card.card-error {
+  border-left: 4px solid #ef4444;
+}
+
+.multi-asr-card .card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.icon-success {
+  color: #10b981;
+}
+
+.icon-warning {
+  color: #f59e0b;
+}
+
+.icon-error {
+  color: #ef4444;
+}
+
+.card-header-titles {
+  display: flex;
+  flex-direction: column;
+}
+
+.card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--on-surface, #1e293b);
+  margin: 0;
+}
+
+.card-subtitle {
+  font-size: 12px;
+  color: var(--on-surface-variant, #64748b);
+}
+
+.card-description {
+  font-size: 13px;
+  color: var(--on-surface, #334155);
+  margin: 0 0 10px 0;
+  line-height: 1.5;
+}
+
+.card-error-text {
+  font-size: 13px;
+  color: #dc2626;
+  margin: 0 0 10px 0;
+  line-height: 1.5;
+}
+
+.engine-summary-container {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: var(--surface-container-low, #f8fafc);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.engine-summary-header {
+  font-weight: 600;
+  color: var(--on-surface, #334155);
+  margin-bottom: 6px;
+}
+
+.engine-record-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.engine-record-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.engine-name {
+  font-weight: 500;
+  color: var(--on-surface, #1e293b);
+}
+
+.engine-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.engine-badge.status-success {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.engine-badge.status-failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.engine-timing {
+  color: var(--on-surface-variant, #64748b);
+  font-size: 11px;
+}
+
+.card-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+
 
 

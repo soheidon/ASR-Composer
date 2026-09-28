@@ -57,6 +57,16 @@ import {
   openCorrectionFolder,
   openCorrectionFile,
 } from "./correction-context";
+import {
+  acquireExecutionLock,
+  releaseExecutionLock,
+  handleAudioFileSelection,
+  getSelectedAudioDurationSec,
+  getMultiAsrStaging,
+  syncMultiAsrUiFromState,
+  executeEditorHandoff,
+  startMultiAsrFromUi,
+} from "./multi-asr-ui";
 
 function getAppElement(): HTMLElement | null {
   return document.getElementById("app");
@@ -557,11 +567,31 @@ const transcribePage = `
           <span class="material-symbols-outlined">play_circle</span>
           <span class="btn-primary-text">文字起こしを開始</span>
         </button>
+        <button class="btn-primary btn-multi-asr" id="startMultiAsrBtn" disabled title="音声ファイルを選択するとMulti-ASRを実行できます">
+          <span class="material-symbols-outlined">auto_awesome</span>
+          <span class="btn-primary-text">Multi-ASRで文字起こし</span>
+        </button>
         <button class="btn-danger" id="cancelBtn" style="display:none">
           <span class="material-symbols-outlined">cancel</span>
           <span>中止</span>
         </button>
+        <button class="btn-danger" id="cancelMultiAsrBtn" style="display:none">
+          <span class="material-symbols-outlined">cancel</span>
+          <span>Multi-ASR中止</span>
+        </button>
       </div>
+
+      <section class="section-card" id="multiAsrProgressSection" style="display:none">
+        <h3 class="section-header"><span class="section-title">Multi-ASR 処理中</span></h3>
+        <div class="multi-asr-progress-container">
+          <div class="multi-asr-progress-text">準備中...</div>
+          <div class="progress-bar-container">
+            <div class="multi-asr-progress-bar" style="width: 0%;"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section-card" id="multiAsrResultSection" style="display:none"></section>
 
       <section class="section-card" id="transcribeProgressSection" style="display:none">
         <h3 class="section-header"><span class="section-title">文字起こし中</span></h3>
@@ -1768,9 +1798,11 @@ async function mountTranscribeWorkspace(): Promise<MountResult> {
   bindCorrectionSelection();
   bindFileSelection();
   bindStartButton();
+  bindMultiAsrButtons();
   await bindTranscribeProgress();
   bindResultButtons();
   bindBrowseOutputPath();
+  syncMultiAsrUiFromState();
   return "mounted";
 }
 
@@ -1956,6 +1988,10 @@ export async function navigateTo(page: PageName): Promise<NavigationResult> {
         }
       }
     }
+  }
+
+  if (page === "transcribe") {
+    syncMultiAsrUiFromState();
   }
 
   return "completed";
@@ -2219,6 +2255,7 @@ async function chooseAudioFile(): Promise<void> {
   if (file) {
     selectedFilePath = file;
     updateFileDisplay(file);
+    void handleAudioFileSelection(file);
   }
 }
 
@@ -2295,6 +2332,7 @@ async function bindTauriFileDragDrop(): Promise<void> {
 
       selectedFilePath = filePath;
       updateFileDisplay(filePath);
+      void handleAudioFileSelection(filePath);
     });
 
   } catch (error) {
@@ -2391,6 +2429,10 @@ function bindStartButton(): void {
     }
 
     const jobId = crypto.randomUUID();
+    if (!acquireExecutionLock("single", jobId)) {
+      return;
+    }
+
     activeJobId = jobId;
     asrGeneration++;
     activeAutoCorrectionRunId = null;
@@ -2432,6 +2474,7 @@ function bindStartButton(): void {
         showAppDialog({ title: "文字起こしエラー", message: String(error), type: "error" });
       }
     } finally {
+      releaseExecutionLock(jobId);
       setTranscriptionRunning(false);
       hideProgressSection();
       if (cancelRequested) {
@@ -2455,6 +2498,82 @@ function bindStartButton(): void {
       await invokeTauri("cancel_transcription", { jobId: activeJobId });
     } catch (e) {
       console.error("cancel_transcription error:", e);
+    }
+  });
+}
+
+let activeMultiAsrJobId: string | null = null;
+let activeMultiAsrRunId: string | null = null;
+let multiAsrCancelRequested = false;
+
+export function getActiveMultiAsrRunIdForTest(): string | null {
+  return activeMultiAsrRunId;
+}
+
+export function getActiveMultiAsrJobIdForTest(): string | null {
+  return activeMultiAsrJobId;
+}
+
+export function resetMultiAsrMainStateForTest(): void {
+  activeMultiAsrJobId = null;
+  activeMultiAsrRunId = null;
+  multiAsrCancelRequested = false;
+}
+
+function bindMultiAsrButtons(): void {
+  const startMultiBtn = document.getElementById("startMultiAsrBtn");
+  const cancelMultiBtn = document.getElementById("cancelMultiAsrBtn") as HTMLButtonElement | null;
+  const resultSection = document.getElementById("multiAsrResultSection");
+
+  startMultiBtn?.addEventListener("click", async () => {
+    multiAsrCancelRequested = false;
+    await startMultiAsrFromUi({
+      targetFilePath: selectedFilePath ?? undefined,
+      duration: getSelectedAudioDurationSec(),
+      invokeFn: invokeTauri,
+      showDialogFn: async (dialog) => {
+        const { showAppDialog } = await import("./status");
+        await showAppDialog(dialog);
+      },
+      onJobIdChange: (jobId) => {
+        activeMultiAsrJobId = jobId;
+      },
+      isCancelled: () => multiAsrCancelRequested,
+    });
+  });
+
+  cancelMultiBtn?.addEventListener("click", async () => {
+    multiAsrCancelRequested = true;
+    cancelMultiBtn.disabled = true;
+    const cancelLabel = cancelMultiBtn.querySelector("span:last-child");
+    if (cancelLabel) cancelLabel.textContent = "中止中...";
+
+    if (activeMultiAsrJobId) {
+      try {
+        await invokeTauri("cancel_transcription", { jobId: activeMultiAsrJobId });
+      } catch (e) {
+        console.error("cancel_transcription for Multi-ASR error:", e);
+      }
+    }
+  });
+
+  resultSection?.addEventListener("click", async (e) => {
+    const target = (e.target as HTMLElement).closest<HTMLElement>("#btnOpenMultiAsrInEditor");
+    if (!target) return;
+    const staging = getMultiAsrStaging();
+    if (!staging) return;
+
+    try {
+      await executeEditorHandoff(
+        staging,
+        navigateTo,
+        setEditorDocumentWithProposals,
+        setEditorDocument,
+        renderEditor
+      );
+      syncMultiAsrUiFromState();
+    } catch (err) {
+      console.error("Multi-ASR Editor handoff failed:", err);
     }
   });
 }

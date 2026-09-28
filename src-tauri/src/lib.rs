@@ -642,10 +642,9 @@ fn validate_transcribe_settings(settings: &AppSettings) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_transcribe_input(app: &tauri::AppHandle, audio_path: &str) -> Result<(), String> {
+fn validate_transcribe_input_with_settings(settings: &AppSettings, audio_path: &str) -> Result<(), String> {
     validate_audio_file(audio_path)?;
-    let settings = load_settings(app);
-    validate_transcribe_settings(&settings)?;
+    validate_transcribe_settings(settings)?;
     Ok(())
 }
 
@@ -709,32 +708,35 @@ fn emit_transcribe_progress(app: &tauri::AppHandle, job_id: &str, stage: &str, m
     );
 }
 
-async fn read_output_lines(
-    mut reader: tokio::io::BufReader<tokio::process::ChildStdout>,
-    app: tauri::AppHandle,
+async fn read_output_lines_opt(
+    reader: Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>,
+    app: Option<tauri::AppHandle>,
     job_id: String,
 ) -> Vec<String> {
     use tauri::Emitter;
     use tokio::io::AsyncBufReadExt;
+    let mut buf_reader = tokio::io::BufReader::new(reader);
     let mut lines = Vec::new();
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        match buf_reader.read_line(&mut line).await {
             Ok(0) => break,
             Ok(_) => {
                 let trimmed = line.trim().to_string();
                 if !trimmed.is_empty() {
                     lines.push(trimmed.clone());
-                    let _ = app.emit(
-                        "local-asr-transcription-progress",
-                        LocalAsrTranscriptionProgress {
-                            job_id: job_id.clone(),
-                            stage: "processing".to_string(),
-                            message: String::new(),
-                            log_line: Some(trimmed),
-                        },
-                    );
+                    if let Some(ref a) = app {
+                        let _ = a.emit(
+                            "local-asr-transcription-progress",
+                            LocalAsrTranscriptionProgress {
+                                job_id: job_id.clone(),
+                                stage: "processing".to_string(),
+                                message: String::new(),
+                                log_line: Some(trimmed),
+                            },
+                        );
+                    }
                 }
             }
             Err(_) => break,
@@ -743,32 +745,35 @@ async fn read_output_lines(
     lines
 }
 
-async fn read_stderr_lines(
-    mut reader: tokio::io::BufReader<tokio::process::ChildStderr>,
-    app: tauri::AppHandle,
+async fn read_stderr_lines_opt(
+    reader: Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>,
+    app: Option<tauri::AppHandle>,
     job_id: String,
 ) -> Vec<String> {
     use tauri::Emitter;
     use tokio::io::AsyncBufReadExt;
+    let mut buf_reader = tokio::io::BufReader::new(reader);
     let mut lines = Vec::new();
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        match buf_reader.read_line(&mut line).await {
             Ok(0) => break,
             Ok(_) => {
                 let trimmed = line.trim().to_string();
                 if !trimmed.is_empty() {
                     lines.push(trimmed.clone());
-                    let _ = app.emit(
-                        "local-asr-transcription-progress",
-                        LocalAsrTranscriptionProgress {
-                            job_id: job_id.clone(),
-                            stage: "processing".to_string(),
-                            message: String::new(),
-                            log_line: Some(trimmed),
-                        },
-                    );
+                    if let Some(ref a) = app {
+                        let _ = a.emit(
+                            "local-asr-transcription-progress",
+                            LocalAsrTranscriptionProgress {
+                                job_id: job_id.clone(),
+                                stage: "processing".to_string(),
+                                message: String::new(),
+                                log_line: Some(trimmed),
+                            },
+                        );
+                    }
                 }
             }
             Err(_) => break,
@@ -781,96 +786,757 @@ fn container_name(job_id: &str) -> String {
     format!("asr-composer-job-{job_id}")
 }
 
-async fn run_docker_transcribe(
-    app: &tauri::AppHandle,
-    job_id: &str,
-    image_name: &str,
-    work_dir: &std::path::Path,
-    env_vars: Vec<(String, String)>,
-    hf_token: Option<&str>,
-) -> Result<(), String> {
-    use tokio::process::Command;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrJobState {
+    Preparing,
+    Creating,
+    Created,
+    Starting,
+    Running,
+    Stopping,
+    Finished,
+}
 
-    let source_dir = work_dir.join("source");
-    let output_dir = work_dir.join("output");
-    let tmp_dir = work_dir.join("tmp");
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerPresence {
+    Present,
+    Absent,
+}
 
-    let source_abs = fs::canonicalize(&source_dir).unwrap_or(source_dir.clone());
-    let output_abs = fs::canonicalize(&output_dir).unwrap_or(output_dir.clone());
-    let tmp_abs = fs::canonicalize(&tmp_dir).unwrap_or(tmp_dir.clone());
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DockerError {
+    CliNotFound(String),
+    DaemonUnavailable(String),
+    CommandFailed { code: i32, stderr: String },
+    Timeout(String),
+    InspectFailed(String),
+    Io(String),
+}
 
-    // Windowsの\\?\プレフィックスを除去（Docker Desktop対応）
-    let source_str = source_abs.to_string_lossy().replace("\\\\?\\", "");
-    let output_str = output_abs.to_string_lossy().replace("\\\\?\\", "");
-    let tmp_str = tmp_abs.to_string_lossy().replace("\\\\?\\", "");
+impl fmt::Display for DockerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DockerError::CliNotFound(s) => write!(f, "Docker CLIが見つかりません: {s}"),
+            DockerError::DaemonUnavailable(s) => write!(f, "Docker daemonに接続できません: {s}"),
+            DockerError::CommandFailed { code, stderr } => write!(f, "Dockerコマンド失敗 (code {code}): {stderr}"),
+            DockerError::Timeout(s) => write!(f, "タイムアウト: {s}"),
+            DockerError::InspectFailed(s) => write!(f, "inspect失敗: {s}"),
+            DockerError::Io(s) => write!(f, "IOエラー: {s}"),
+        }
+    }
+}
 
-    let source_mount = format!("{source_str}:/work/source:ro");
-    let output_mount = format!("{output_str}:/work/output");
-    let tmp_mount = format!("{tmp_str}:/work/tmp");
+impl std::error::Error for DockerError {}
 
-    let cname = container_name(job_id);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobTerminalOutcome {
+    Success,
+    Cancelled,
+    Failed(String),
+    CleanupFailed(String),
+}
 
-    let mut cmd = Command::new("docker");
-    cmd.arg("run").arg("--rm").arg("--gpus").arg("all");
-    cmd.arg("--name").arg(&cname);
-    cmd.arg("-v").arg(&source_mount);
-    cmd.arg("-v").arg(&output_mount);
-    cmd.arg("-v").arg(&tmp_mount);
-    cmd.arg("-e").arg("WORK_SOURCE=/work/source");
-    cmd.arg("-e").arg("WORK_OUTPUT=/work/output");
-    cmd.arg("-e").arg("WORK_TMP=/work/tmp");
+pub struct JobControlInner {
+    pub state: AsrJobState,
+    pub cancel_requested: bool,
+    pub container_id: Option<String>,
+    pub terminal_result: Option<JobTerminalOutcome>,
+    pub cleanup_confirmed: bool,
+    pub recovery_in_progress: bool,
+    pub docker_path: Option<PathBuf>,
+    pub docker_context: Option<String>,
+}
 
-    // HF_TOKEN: プロセス環境にだけ設定
-    if let Some(token) = hf_token {
-        cmd.env("HF_TOKEN", token);
-        cmd.arg("-e").arg("HF_TOKEN");
+#[derive(Clone)]
+pub struct JobControl {
+    pub job_id: String,
+    pub inner: std::sync::Arc<tokio::sync::Mutex<JobControlInner>>,
+    pub notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl JobControl {
+    pub fn new(job_id: &str) -> Self {
+        Self {
+            job_id: job_id.to_string(),
+            inner: std::sync::Arc::new(tokio::sync::Mutex::new(JobControlInner {
+                state: AsrJobState::Preparing,
+                cancel_requested: false,
+                container_id: None,
+                terminal_result: None,
+                cleanup_confirmed: true,
+                recovery_in_progress: false,
+                docker_path: None,
+                docker_context: None,
+            })),
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
     }
 
-    // その他の環境変数
-    for (key, value) in &env_vars {
-        cmd.arg("-e").arg(format!("{key}={value}"));
+    pub async fn get_state(&self) -> AsrJobState {
+        let inner = self.inner.lock().await;
+        inner.state
     }
 
-    cmd.arg(image_name);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    pub async fn is_cancel_requested(&self) -> bool {
+        let inner = self.inner.lock().await;
+        inner.cancel_requested
+    }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Docker起動エラー: {e}"))?;
+    pub async fn request_cancel(&self) {
+        {
+            let mut inner = self.inner.lock().await;
+            inner.cancel_requested = true;
+        }
+        self.notify.notify_waiters();
+    }
 
-    let stdout = child.stdout.take().ok_or("stdout取得エラー")?;
-    let stderr = child.stderr.take().ok_or("stderr取得エラー")?;
+    pub async fn set_state(&self, state: AsrJobState) {
+        {
+            let mut inner = self.inner.lock().await;
+            inner.state = state;
+        }
+        self.notify.notify_waiters();
+    }
 
-    let stdout_reader = tokio::io::BufReader::new(stdout);
-    let stderr_reader = tokio::io::BufReader::new(stderr);
+    pub async fn set_terminal_result(&self, outcome: JobTerminalOutcome) {
+        {
+            let mut inner = self.inner.lock().await;
+            inner.terminal_result = Some(outcome);
+            inner.state = AsrJobState::Finished;
+        }
+        self.notify.notify_waiters();
+    }
 
-    let app_clone = app.clone();
-    let jid = job_id.to_string();
-    let stdout_task = tokio::spawn(read_output_lines(stdout_reader, app_clone, jid.clone()));
-    let stderr_task = tokio::spawn(read_stderr_lines(stderr_reader, app.clone(), jid));
+    pub async fn await_terminal_result(&self) -> JobTerminalOutcome {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = self.inner.lock().await;
+                if let Some(res) = &inner.terminal_result {
+                    return res.clone();
+                }
+            }
+            notified.await;
+        }
+    }
+}
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("Docker待機エラー: {e}"))?;
+pub fn is_job_fully_terminal(inner: &JobControlInner) -> bool {
+    inner.state == AsrJobState::Finished
+        && inner.terminal_result.is_some()
+        && inner.cleanup_confirmed
+}
 
-    let _ = stdout_task.await;
-    let stderr_lines = stderr_task.await.unwrap_or_default();
+pub fn can_remove_job(inner: &JobControlInner) -> bool {
+    is_job_fully_terminal(inner)
+}
 
-    if !status.success() {
-        let code = status.code().unwrap_or(-1);
-        let last_logs: Vec<&str> = stderr_lines.iter().rev().take(10).map(|s| s.as_str()).collect();
-        let log_str = if last_logs.is_empty() {
-            "(ログなし)".to_string()
+fn active_job_controls() -> &'static std::sync::Mutex<HashMap<String, JobControl>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<String, JobControl>>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+pub fn register_job_control(job_id: &str) -> Result<JobControl, String> {
+    let mut map = active_job_controls().lock().map_err(|e| e.to_string())?;
+    if map.contains_key(job_id) {
+        return Err(format!("Job ID already exists in registry: {job_id}"));
+    }
+    let ctrl = JobControl::new(job_id);
+    map.insert(job_id.to_string(), ctrl.clone());
+    Ok(ctrl)
+}
+
+pub fn get_job_control(job_id: &str) -> Option<JobControl> {
+    if let Ok(map) = active_job_controls().lock() {
+        map.get(job_id).cloned()
+    } else {
+        None
+    }
+}
+
+pub async fn try_remove_job_control(job_id: &str, target_ctrl: &JobControl) -> bool {
+    // Step 1: Check JobControl state with async lock (without holding registry lock)
+    let removable = {
+        let inner = target_ctrl.inner.lock().await;
+        can_remove_job(&inner)
+    };
+    if !removable {
+        return false;
+    }
+    // Step 2: Lock registry Mutex only, verify Arc::ptr_eq, and remove
+    let mut registry = active_job_controls().lock().unwrap();
+    if let Some(existing) = registry.get(job_id) {
+        if std::sync::Arc::ptr_eq(&existing.inner, &target_ctrl.inner) {
+            registry.remove(job_id);
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+pub fn remove_job_control_for_test(job_id: &str) {
+    if let Ok(mut map) = active_job_controls().lock() {
+        map.remove(job_id);
+    }
+}
+
+pub async fn finalize_job(
+    ctrl: &JobControl,
+    outcome: JobTerminalOutcome,
+    cleanup_confirmed: bool,
+) {
+    {
+        let mut inner = ctrl.inner.lock().await;
+        inner.terminal_result = Some(outcome);
+        inner.cleanup_confirmed = cleanup_confirmed;
+        inner.state = AsrJobState::Finished;
+    }
+    ctrl.notify.notify_waiters();
+    let _ = try_remove_job_control(&ctrl.job_id, ctrl).await;
+}
+
+pub struct LogStreams {
+    pub stdout: Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>,
+    pub stderr: Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>,
+    pub kill_handle: Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>,
+}
+
+pub trait DockerRuntime: Send + Sync {
+    fn create_container(
+        &self,
+        cname: &str,
+        image: &str,
+        mounts: &[String],
+        env_vars: &[(String, String)],
+        labels: &[(String, String)],
+    ) -> impl std::future::Future<Output = Result<String, DockerError>> + Send;
+
+    fn start_container(&self, cname: &str) -> impl std::future::Future<Output = Result<(), DockerError>> + Send;
+
+    fn follow_logs(
+        &self,
+        cname: &str,
+    ) -> impl std::future::Future<Output = Result<LogStreams, DockerError>> + Send;
+
+    fn wait_container(&self, cname: &str) -> impl std::future::Future<Output = Result<i32, DockerError>> + Send;
+
+    fn stop_container(&self, cname: &str, timeout_secs: u32) -> impl std::future::Future<Output = Result<(), DockerError>> + Send;
+
+    fn remove_container(&self, cname: &str) -> impl std::future::Future<Output = Result<(), DockerError>> + Send;
+
+    fn inspect_container(&self, cname: &str) -> impl std::future::Future<Output = Result<ContainerPresence, DockerError>> + Send;
+}
+
+#[derive(Clone)]
+pub struct RealDockerCliRuntime {
+    pub docker_path: PathBuf,
+    pub docker_context: String,
+}
+
+impl DockerRuntime for RealDockerCliRuntime {
+    async fn create_container(
+        &self,
+        cname: &str,
+        image: &str,
+        mounts: &[String],
+        env_vars: &[(String, String)],
+        labels: &[(String, String)],
+    ) -> Result<String, DockerError> {
+        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        cmd.kill_on_drop(true);
+        if !self.docker_context.is_empty() {
+            cmd.arg("--context").arg(&self.docker_context);
+        }
+        cmd.arg("create");
+        cmd.arg("--name").arg(cname);
+        cmd.arg("--gpus").arg("all");
+        for label in labels {
+            cmd.arg("--label").arg(format!("{}={}", label.0, label.1));
+        }
+        for m in mounts {
+            cmd.arg("-v").arg(m);
+        }
+        for (k, v) in env_vars {
+            cmd.arg("-e").arg(format!("{k}={v}"));
+        }
+        cmd.arg(image);
+        let output = cmd.output().await.map_err(|e| DockerError::Io(e.to_string()))?;
+        if output.status.success() {
+            let cid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(cid)
         } else {
-            last_logs.join("\n")
-        };
-        return Err(format!(
-            "Dockerコンテナがエラー終了しました。終了コード: {code}\n最後のログ:\n{log_str}"
-        ));
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Err(DockerError::CommandFailed {
+                code: output.status.code().unwrap_or(-1),
+                stderr,
+            })
+        }
     }
-    Ok(())
+
+    async fn start_container(&self, cname: &str) -> Result<(), DockerError> {
+        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        cmd.kill_on_drop(true);
+        if !self.docker_context.is_empty() {
+            cmd.arg("--context").arg(&self.docker_context);
+        }
+        cmd.arg("start").arg(cname);
+        let output = cmd.output().await.map_err(|e| DockerError::Io(e.to_string()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Err(DockerError::CommandFailed {
+                code: output.status.code().unwrap_or(-1),
+                stderr,
+            })
+        }
+    }
+
+    async fn follow_logs(
+        &self,
+        cname: &str,
+    ) -> Result<LogStreams, DockerError> {
+        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        cmd.kill_on_drop(true);
+        if !self.docker_context.is_empty() {
+            cmd.arg("--context").arg(&self.docker_context);
+        }
+        cmd.arg("logs").arg("-f").arg(cname);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| DockerError::Io(e.to_string()))?;
+        let stdout = child.stdout.take().ok_or_else(|| DockerError::Io("stdout取得失敗".into()))?;
+        let stderr = child.stderr.take().ok_or_else(|| DockerError::Io("stderr取得失敗".into()))?;
+        let kill_handle = Box::new(move || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            })
+        });
+        Ok(LogStreams {
+            stdout: Box::new(stdout),
+            stderr: Box::new(stderr),
+            kill_handle,
+        })
+    }
+
+    async fn wait_container(&self, cname: &str) -> Result<i32, DockerError> {
+        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        cmd.kill_on_drop(true);
+        if !self.docker_context.is_empty() {
+            cmd.arg("--context").arg(&self.docker_context);
+        }
+        cmd.arg("wait").arg(cname);
+        let output = cmd.output().await.map_err(|e| DockerError::Io(e.to_string()))?;
+        if output.status.success() {
+            let out_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let code = out_str.parse::<i32>().unwrap_or(-1);
+            Ok(code)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Err(DockerError::CommandFailed {
+                code: output.status.code().unwrap_or(-1),
+                stderr,
+            })
+        }
+    }
+
+    async fn stop_container(&self, cname: &str, timeout_secs: u32) -> Result<(), DockerError> {
+        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        cmd.kill_on_drop(true);
+        if !self.docker_context.is_empty() {
+            cmd.arg("--context").arg(&self.docker_context);
+        }
+        cmd.arg("stop").arg("--timeout").arg(timeout_secs.to_string()).arg(cname);
+        let output = cmd.output().await.map_err(|e| DockerError::Io(e.to_string()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Err(DockerError::CommandFailed {
+                code: output.status.code().unwrap_or(-1),
+                stderr,
+            })
+        }
+    }
+
+    async fn remove_container(&self, cname: &str) -> Result<(), DockerError> {
+        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        cmd.kill_on_drop(true);
+        if !self.docker_context.is_empty() {
+            cmd.arg("--context").arg(&self.docker_context);
+        }
+        cmd.arg("rm").arg("-f").arg(cname);
+        let output = cmd.output().await.map_err(|e| DockerError::Io(e.to_string()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Err(DockerError::CommandFailed {
+                code: output.status.code().unwrap_or(-1),
+                stderr,
+            })
+        }
+    }
+
+    async fn inspect_container(&self, cname: &str) -> Result<ContainerPresence, DockerError> {
+        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        cmd.kill_on_drop(true);
+        if !self.docker_context.is_empty() {
+            cmd.arg("--context").arg(&self.docker_context);
+        }
+        cmd.arg("inspect").arg(cname);
+        let output = cmd.output().await.map_err(|e| DockerError::Io(e.to_string()))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        classify_inspect_output_typed(output.status.success(), &stderr)
+    }
+}
+
+/// docker inspect の実行結果（exit code, stderr）を分類する純粋関数。
+/// - Exit code 0 -> Present
+/// - Exit code != 0 かつ stderr に明示的な "No such object" / "No such container" -> Absent
+/// - それ以外の失敗（daemon connection error, permission error, empty output, CLI failure） -> Err
+fn classify_inspect_output_typed(status_success: bool, stderr: &str) -> Result<ContainerPresence, DockerError> {
+    if status_success {
+        Ok(ContainerPresence::Present)
+    } else {
+        let err_lower = stderr.to_lowercase();
+        if err_lower.contains("no such object") || err_lower.contains("no such container") {
+            Ok(ContainerPresence::Absent)
+        } else {
+            Err(DockerError::InspectFailed(stderr.trim().to_string()))
+        }
+    }
+}
+
+pub const PANIC_RECOVERY_ABSENT_CONFIRMATIONS: usize = 6;
+#[cfg(not(test))]
+pub const PANIC_RECOVERY_INTERVAL_MS: u64 = 100;
+#[cfg(test)]
+pub const PANIC_RECOVERY_INTERVAL_MS: u64 = 1;
+pub const PANIC_RECOVERY_MAX_ATTEMPTS: usize = 20;
+
+/// 通常ライフサイクル用のクリーンアップ（1回の明示的 Absent 確認で完了）
+pub async fn cleanup_container<R: DockerRuntime>(
+    runtime: &R,
+    cname: &str,
+    need_stop: bool,
+) -> Result<(), DockerError> {
+    if need_stop {
+        let _ = runtime.stop_container(cname, 1).await;
+    }
+    let _ = runtime.remove_container(cname).await;
+
+    match runtime.inspect_container(cname).await {
+        Ok(ContainerPresence::Absent) => Ok(()),
+        Ok(ContainerPresence::Present) => {
+            let _ = runtime.remove_container(cname).await;
+            match runtime.inspect_container(cname).await {
+                Ok(ContainerPresence::Absent) => Ok(()),
+                Ok(ContainerPresence::Present) => Err(DockerError::InspectFailed("コンテナが削除後も存在しています".to_string())),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 異常系（Driver panic / abort / 不確実なライフサイクル）用の安定確認リカバリクリーンアップ
+/// 連続 6 回（100ms 間隔、計約 500ms）の Absent を確認して初めてクリーンアップ完了とする
+pub async fn panic_recovery_cleanup<R: DockerRuntime>(
+    runtime: &R,
+    cname: &str,
+    need_stop: bool,
+) -> Result<(), DockerError> {
+    if need_stop {
+        let _ = runtime.stop_container(cname, 1).await;
+    }
+    let _ = runtime.remove_container(cname).await;
+
+    let mut consecutive_absent = 0;
+    for _ in 0..PANIC_RECOVERY_MAX_ATTEMPTS {
+        match runtime.inspect_container(cname).await {
+            Ok(ContainerPresence::Absent) => {
+                consecutive_absent += 1;
+                if consecutive_absent >= PANIC_RECOVERY_ABSENT_CONFIRMATIONS {
+                    return Ok(());
+                }
+            }
+            Ok(ContainerPresence::Present) => {
+                consecutive_absent = 0;
+                let _ = runtime.remove_container(cname).await;
+            }
+            Err(e) => {
+                match &e {
+                    DockerError::InspectFailed(msg) if msg.contains("timeout") => {
+                        // タイムアウト系のみリトライを許容
+                    }
+                    _ => {
+                        // DaemonUnavailable / PermissionDenied などの Fatal エラーは即時 fail-closed
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(PANIC_RECOVERY_INTERVAL_MS)).await;
+    }
+
+    if consecutive_absent >= PANIC_RECOVERY_ABSENT_CONFIRMATIONS {
+        Ok(())
+    } else {
+        Err(DockerError::InspectFailed("コンテナの不在を確認できませんでした (Present継続または最大試行回数超過)".to_string()))
+    }
+}
+
+pub async fn run_cleanup_recovery<R: DockerRuntime>(
+    ctrl: &JobControl,
+    runtime: &R,
+) -> Result<(), DockerError> {
+    let cname = container_name(&ctrl.job_id);
+    let cleanup_res = panic_recovery_cleanup(runtime, &cname, true).await;
+    {
+        let mut inner = ctrl.inner.lock().await;
+        inner.recovery_in_progress = false;
+        if cleanup_res.is_ok() {
+            inner.cleanup_confirmed = true;
+            // Note: Preserve original terminal_result!
+        }
+    }
+    ctrl.notify.notify_waiters();
+    if cleanup_res.is_ok() {
+        let _ = try_remove_job_control(&ctrl.job_id, ctrl).await;
+    }
+    cleanup_res
+}
+
+pub async fn run_recovery_driver<R: DockerRuntime>(
+    runtime: &R,
+    ctrl: &JobControl,
+    _cname: &str,
+) -> Result<(), DockerError> {
+    run_cleanup_recovery(ctrl, runtime).await
+}
+
+pub async fn handle_driver_join_result<R: DockerRuntime>(
+    join_res: Result<JobTerminalOutcome, tokio::task::JoinError>,
+    ctrl: &JobControl,
+    runtime: &R,
+    cname: &str,
+) -> JobTerminalOutcome {
+    match join_res {
+        Ok(outcome) => {
+            // Driver finished normally; driver already finalized itself
+            outcome
+        }
+        Err(join_err) => {
+            eprintln!("Lifecycle driver task panicked or aborted: {join_err}");
+            let cleanup_res = panic_recovery_cleanup(runtime, cname, true).await;
+            let (outcome, confirmed) = match cleanup_res {
+                Ok(()) => (
+                    JobTerminalOutcome::Failed(format!("Lifecycle driver panicked (container cleaned up): {join_err}")),
+                    true,
+                ),
+                Err(e) => (
+                    JobTerminalOutcome::CleanupFailed(format!("Lifecycle driver panicked and cleanup failed: {e}")),
+                    false,
+                ),
+            };
+            finalize_job(ctrl, outcome.clone(), confirmed).await;
+            outcome
+        }
+    }
+}
+
+async fn run_docker_lifecycle_driver<R: DockerRuntime>(
+    runtime: &R,
+    ctrl: &JobControl,
+    cname: &str,
+    image_name: &str,
+    mounts: Vec<String>,
+    env_vars: Vec<(String, String)>,
+    labels: Vec<(String, String)>,
+    app: Option<&tauri::AppHandle>,
+) -> JobTerminalOutcome {
+    // 1. Preparing -> Creating (cleanup_confirmed becomes false atomically before create)
+    {
+        let mut inner = ctrl.inner.lock().await;
+        if inner.cancel_requested {
+            drop(inner);
+            finalize_job(ctrl, JobTerminalOutcome::Cancelled, true).await;
+            return JobTerminalOutcome::Cancelled;
+        }
+        inner.state = AsrJobState::Creating;
+        inner.cleanup_confirmed = false;
+    }
+    ctrl.notify.notify_waiters();
+
+    let create_res = runtime.create_container(cname, image_name, &mounts, &env_vars, &labels).await;
+    match create_res {
+        Ok(cid) => {
+            {
+                let mut inner = ctrl.inner.lock().await;
+                inner.container_id = Some(cid);
+                inner.state = AsrJobState::Created;
+            }
+            ctrl.notify.notify_waiters();
+        }
+        Err(e) => {
+            let cleanup_res = cleanup_container(runtime, cname, false).await;
+            let is_absent = cleanup_res.is_ok();
+            let outcome = if is_absent {
+                if ctrl.is_cancel_requested().await {
+                    JobTerminalOutcome::Cancelled
+                } else {
+                    JobTerminalOutcome::Failed(format!("コンテナ生成エラー: {e}"))
+                }
+            } else {
+                JobTerminalOutcome::CleanupFailed(format!("コンテナ生成失敗後のクリーンアップに失敗しました: {e}"))
+            };
+            finalize_job(ctrl, outcome.clone(), is_absent).await;
+            return outcome;
+        }
+    }
+
+    // Check cancel at Created
+    if ctrl.is_cancel_requested().await {
+        let cleanup_res = cleanup_container(runtime, cname, false).await;
+        let is_absent = cleanup_res.is_ok();
+        let outcome = if is_absent {
+            JobTerminalOutcome::Cancelled
+        } else {
+            JobTerminalOutcome::CleanupFailed("キャンセル時のコンテナ削除確認に失敗しました".to_string())
+        };
+        finalize_job(ctrl, outcome.clone(), is_absent).await;
+        return outcome;
+    }
+
+    // 2. Created -> Starting
+    ctrl.set_state(AsrJobState::Starting).await;
+
+    let start_res = runtime.start_container(cname).await;
+    match start_res {
+        Ok(()) => {
+            ctrl.set_state(AsrJobState::Running).await;
+        }
+        Err(e) => {
+            let cleanup_res = cleanup_container(runtime, cname, false).await;
+            let is_absent = cleanup_res.is_ok();
+            let outcome = if is_absent {
+                if ctrl.is_cancel_requested().await {
+                    JobTerminalOutcome::Cancelled
+                } else {
+                    JobTerminalOutcome::Failed(format!("コンテナ起動エラー: {e}"))
+                }
+            } else {
+                JobTerminalOutcome::CleanupFailed(format!("起動失敗後のコンテナ削除確認に失敗しました: {e}"))
+            };
+            finalize_job(ctrl, outcome.clone(), is_absent).await;
+            return outcome;
+        }
+    }
+
+    // Check cancel right after Starting
+    if ctrl.is_cancel_requested().await {
+        let cleanup_res = cleanup_container(runtime, cname, true).await;
+        let is_absent = cleanup_res.is_ok();
+        let outcome = if is_absent {
+            JobTerminalOutcome::Cancelled
+        } else {
+            JobTerminalOutcome::CleanupFailed("キャンセル時のコンテナ停止確認に失敗しました".to_string())
+        };
+        finalize_job(ctrl, outcome.clone(), is_absent).await;
+        return outcome;
+    }
+
+    // 3. Running: follow logs and wait container
+    let log_streams = match runtime.follow_logs(cname).await {
+        Ok(res) => res,
+        Err(e) => {
+            let cleanup_res = cleanup_container(runtime, cname, true).await;
+            let is_absent = cleanup_res.is_ok();
+            let outcome = if is_absent {
+                JobTerminalOutcome::Failed(format!("ログ取得接続エラー: {e}"))
+            } else {
+                JobTerminalOutcome::CleanupFailed(format!("ログ取得接続エラー: {e} (コンテナクリーンアップ未確認)"))
+            };
+            finalize_job(ctrl, outcome.clone(), is_absent).await;
+            return outcome;
+        }
+    };
+
+    let jid = ctrl.job_id.clone();
+    let app_opt = app.cloned();
+    let stdout_task = tokio::spawn(async move {
+        read_output_lines_opt(log_streams.stdout, app_opt, jid).await
+    });
+    let app_opt2 = app.cloned();
+    let jid2 = ctrl.job_id.clone();
+    let stderr_task = tokio::spawn(async move {
+        read_stderr_lines_opt(log_streams.stderr, app_opt2, jid2).await
+    });
+
+    let mut wait_fut = Box::pin(runtime.wait_container(cname));
+    let mut exit_code: Option<i32> = None;
+    let mut was_cancelled = false;
+
+    loop {
+        if ctrl.is_cancel_requested().await {
+            was_cancelled = true;
+            let _ = runtime.stop_container(cname, 1).await;
+            break;
+        }
+
+        match tokio::time::timeout(tokio::time::Duration::from_millis(50), &mut wait_fut).await {
+            Ok(Ok(code)) => {
+                exit_code = Some(code);
+                break;
+            }
+            Ok(Err(e)) => {
+                if ctrl.is_cancel_requested().await {
+                    was_cancelled = true;
+                } else {
+                    exit_code = Some(-1);
+                    eprintln!("docker wait error: {e}");
+                }
+                break;
+            }
+            Err(_) => {
+                // 50ms timeout elapsed, loop again to check cancellation
+            }
+        }
+    }
+
+    // 4. Stopping & logs drain
+    ctrl.set_state(AsrJobState::Stopping).await;
+
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+    }).await;
+    (log_streams.kill_handle)().await;
+
+    let cleanup_res = cleanup_container(runtime, cname, true).await;
+    let is_absent = cleanup_res.is_ok();
+
+    let outcome = if !is_absent {
+        JobTerminalOutcome::CleanupFailed("コンテナ削除の確認に失敗しました".to_string())
+    } else if was_cancelled || ctrl.is_cancel_requested().await {
+        JobTerminalOutcome::Cancelled
+    } else if let Some(code) = exit_code {
+        if code == 0 {
+            JobTerminalOutcome::Success
+        } else {
+            JobTerminalOutcome::Failed(format!("コンテナが異常終了しました (コード: {code})"))
+        }
+    } else {
+        JobTerminalOutcome::Failed("コンテナ終了コードを取得できませんでした".to_string())
+    };
+
+    finalize_job(ctrl, outcome.clone(), is_absent).await;
+    outcome
 }
 
 const ALLOWED_OUTPUT_FORMATS: &[&str] = &["txt", "json", "md", "srt", "csv", "vtt"];
@@ -933,22 +1599,43 @@ fn validate_transcribe_engine_status(engine: &str) -> Result<(), String> {
     validate_engine_status_for_transcribe(&status)
 }
 
-#[tauri::command]
-async fn local_asr_transcribe(
-    app: tauri::AppHandle,
-    job_id: String,
-    audio_path: String,
-    output_path: String,
-    output_formats: Vec<String>,
-) -> Result<TranscriptionResult, String> {
-    // jobId検証
-    validate_job_id(&job_id)?;
+pub(crate) struct PreparedJob {
+    pub(crate) save_dir: Option<PathBuf>,
+    pub(crate) work_dir: PathBuf,
+    pub(crate) output_dir: PathBuf,
+    pub(crate) output_stem: String,
+    pub(crate) image_name: String,
+    pub(crate) mounts: Vec<String>,
+    pub(crate) full_env_vars: Vec<(String, String)>,
+    pub(crate) labels: Vec<(String, String)>,
+    pub(crate) target_engine: String,
+    pub(crate) settings: AppSettings,
+    pub(crate) docker_path: PathBuf,
+    pub(crate) docker_context: String,
+}
 
-    // 入力バリデーション
-    validate_transcribe_input(&app, &audio_path)?;
+pub(crate) async fn prepare_job_with_base_dir(
+    ctrl: &JobControl,
+    job_id: &str,
+    audio_path: &str,
+    output_path: &str,
+    output_formats: &[String],
+    target_engine: &str,
+    settings: AppSettings,
+    save_to_disk: Option<bool>,
+    base_app_data_dir: &std::path::Path,
+    validate_docker_engine: bool,
+    app_handle: Option<&tauri::AppHandle>,
+) -> Result<PreparedJob, String> {
+    if ctrl.is_cancel_requested().await {
+        return Err("Transcription cancelled".to_string());
+    }
 
-    // 出力形式検証
-    for fmt in &output_formats {
+    // 1. Inputs validation
+    validate_transcribe_input_with_settings(&settings, audio_path)?;
+
+    // 2. Output formats validation
+    for fmt in output_formats {
         if !ALLOWED_OUTPUT_FORMATS.contains(&fmt.as_str()) {
             return Err(format!("未対応の出力形式です: {}", fmt));
         }
@@ -957,135 +1644,328 @@ async fn local_asr_transcribe(
         return Err("出力を1形式以上選択してください".to_string());
     }
 
-    let settings = load_settings(&app);
-    let engine = settings.asr_engine.clone();
+    // 3. Engine status validation
+    if validate_docker_engine {
+        validate_transcribe_engine_status(target_engine)?;
+    }
 
-    // エンジンイメージのインストールおよび更新状態を事前確認（Docker起動やディレクトリ作成より前に拒否）
-    validate_transcribe_engine_status(&engine)?;
+    if ctrl.is_cancel_requested().await {
+        return Err("Transcription cancelled".to_string());
+    }
 
-    // 保存先ディレクトリ解決
-    let save_dir = resolve_output_dir(&output_path)?;
-
-    // ワークディレクトリ作成
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("アプリデータディレクトリの取得に失敗: {e}"))?;
-    let work_dir = app_data.join("local-asr").join("jobs").join(&job_id);
-    let source_dir = work_dir.join("source");
-    let output_dir = work_dir.join("output");
-    let tmp_dir = work_dir.join("tmp");
-    fs::create_dir_all(&source_dir).map_err(|e| format!("sourceディレクトリ作成エラー: {e}"))?;
-    fs::create_dir_all(&output_dir).map_err(|e| format!("outputディレクトリ作成エラー: {e}"))?;
-    fs::create_dir_all(&tmp_dir).map_err(|e| format!("tmpディレクトリ作成エラー: {e}"))?;
-
-    // 入力ファイルコピー
-    let audio_path_obj = std::path::Path::new(&audio_path);
-    let input_filename = audio_path_obj
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("入力ファイル名を取得できません")?
-        .to_string();
-    let output_stem = audio_path_obj
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("出力ファイル名を生成できません")?
-        .to_string();
-    fs::copy(&audio_path, source_dir.join(&input_filename))
-        .map_err(|e| format!("ファイルコピーエラー: {e}"))?;
-
-    // 進捗通知
-    emit_transcribe_progress(&app, &job_id, "preparing", "準備中...");
-
-    // 環境変数構築
-    let env_vars = build_transcribe_env_vars(&engine, &settings, &input_filename, &output_formats)?;
-
-    // HF_TOKEN取得（話者分離ON時のみ必須・コンテナへ渡す）
-    let hf_token = if settings.speaker_diarization {
-        Some(get_hf_token_value()?)
+    // 4. Resolve save_dir
+    let is_save_to_disk = save_to_disk.unwrap_or(true);
+    let save_dir = if is_save_to_disk {
+        Some(resolve_output_dir(output_path)?)
     } else {
         None
     };
 
-    // Docker image名解決
-    let image_name = resolve_asr_image_name(&engine)?;
+    // 5. Work dir paths
+    let work_dir = base_app_data_dir.join("local-asr").join("jobs").join(job_id);
+    let source_dir = work_dir.join("source");
+    let output_dir = work_dir.join("output");
+    let tmp_dir = work_dir.join("tmp");
+
+    let mut created_work_dir: Option<PathBuf> = None;
+
+    let res = (async {
+        fs::create_dir_all(&source_dir).map_err(|e| format!("sourceディレクトリ作成エラー: {e}"))?;
+        created_work_dir = Some(work_dir.clone());
+        fs::create_dir_all(&output_dir).map_err(|e| format!("outputディレクトリ作成エラー: {e}"))?;
+        fs::create_dir_all(&tmp_dir).map_err(|e| format!("tmpディレクトリ作成エラー: {e}"))?;
+
+        let audio_path_obj = std::path::Path::new(audio_path);
+        let input_filename = audio_path_obj
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("入力ファイル名を取得できません")?
+            .to_string();
+        let output_stem = audio_path_obj
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or("出力ファイル名を生成できません")?
+            .to_string();
+        fs::copy(audio_path, source_dir.join(&input_filename))
+            .map_err(|e| format!("ファイルコピーエラー: {e}"))?;
+
+        if ctrl.is_cancel_requested().await {
+            return Err("Transcription cancelled".to_string());
+        }
+
+        if let Some(app) = app_handle {
+            emit_transcribe_progress(app, job_id, "preparing", "準備中...");
+        }
+
+        let env_vars = build_transcribe_env_vars(target_engine, &settings, &input_filename, output_formats)?;
+
+        let hf_token = if settings.speaker_diarization {
+            Some(get_hf_token_value()?)
+        } else {
+            None
+        };
+
+        let image_name = resolve_asr_image_name(target_engine)?;
+
+        if ctrl.is_cancel_requested().await {
+            return Err("Transcription cancelled".to_string());
+        }
+
+        let (docker_path, docker_context) = if validate_docker_engine {
+            let p = match find_docker_cli() {
+                Some(p) => p,
+                None => return Err("Dockerがインストールされていません".to_string()),
+            };
+            let ctx = resolve_docker_context(&p).await.unwrap_or_default();
+            (p, ctx)
+        } else {
+            (PathBuf::from("docker"), String::new())
+        };
+
+        let source_abs = fs::canonicalize(&source_dir).unwrap_or(source_dir.clone());
+        let output_abs = fs::canonicalize(&output_dir).unwrap_or(output_dir.clone());
+        let tmp_abs = fs::canonicalize(&tmp_dir).unwrap_or(tmp_dir.clone());
+
+        let source_str = source_abs.to_string_lossy().replace("\\\\?\\", "");
+        let output_str = output_abs.to_string_lossy().replace("\\\\?\\", "");
+        let tmp_str = tmp_abs.to_string_lossy().replace("\\\\?\\", "");
+
+        let mounts = vec![
+            format!("{source_str}:/work/source:ro"),
+            format!("{output_str}:/work/output"),
+            format!("{tmp_str}:/work/tmp"),
+        ];
+
+        let labels = vec![
+            ("asr-composer.managed".to_string(), "true".to_string()),
+            ("asr-composer.job-id".to_string(), job_id.to_string()),
+        ];
+
+        let mut full_env_vars = env_vars;
+        if let Some(token) = hf_token {
+            full_env_vars.push(("HF_TOKEN".to_string(), token));
+        }
+
+        Ok(PreparedJob {
+            save_dir,
+            work_dir: work_dir.clone(),
+            output_dir,
+            output_stem,
+            image_name: image_name.to_string(),
+            mounts,
+            full_env_vars,
+            labels,
+            target_engine: target_engine.to_string(),
+            settings,
+            docker_path,
+            docker_context,
+        })
+    }).await;
+
+    match res {
+        Ok(prepared) => Ok(prepared),
+        Err(err) => {
+            if let Some(ref d) = created_work_dir {
+                if let Err(cleanup_err) = fs::remove_dir_all(d) {
+                    eprintln!("一時作業ディレクトリの削除に失敗 ({}): {cleanup_err}", d.display());
+                    return Err(format!("{err} (一時ディレクトリ削除警告: {cleanup_err})"));
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn prepare_job(
+    app: &tauri::AppHandle,
+    ctrl: &JobControl,
+    job_id: &str,
+    audio_path: &str,
+    output_path: &str,
+    output_formats: &[String],
+    engine: Option<&str>,
+    save_to_disk: Option<bool>,
+) -> Result<PreparedJob, String> {
+    let settings = load_settings(app);
+    let target_engine = engine.map(|s| s.to_string()).unwrap_or_else(|| settings.asr_engine.clone());
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("アプリデータディレクトリの取得に失敗: {e}"))?;
+
+    prepare_job_with_base_dir(
+        ctrl,
+        job_id,
+        audio_path,
+        output_path,
+        output_formats,
+        &target_engine,
+        settings,
+        save_to_disk,
+        &app_data,
+        true,
+        Some(app),
+    ).await
+}
+
+#[tauri::command]
+async fn local_asr_transcribe(
+    app: tauri::AppHandle,
+    job_id: String,
+    audio_path: String,
+    output_path: String,
+    output_formats: Vec<String>,
+    engine: Option<String>,
+    save_to_disk: Option<bool>,
+) -> Result<TranscriptionResult, String> {
+    // 1. Job ID validation
+    validate_job_id(&job_id)?;
+
+    // 2. Immediately register JobControl (Preparing state, cleanup_confirmed: true)
+    let ctrl = match register_job_control(&job_id) {
+        Ok(c) => c,
+        Err(e) => return Err(format!("ジョブ登録エラー: {e}")),
+    };
+
+    let prepared = match prepare_job(
+        &app,
+        &ctrl,
+        &job_id,
+        &audio_path,
+        &output_path,
+        &output_formats,
+        engine.as_deref(),
+        save_to_disk,
+    ).await {
+        Ok(p) => p,
+        Err(e) => {
+            let is_cancelled = e == "Transcription cancelled" || ctrl.is_cancel_requested().await;
+            let outcome = if is_cancelled {
+                JobTerminalOutcome::Cancelled
+            } else {
+                JobTerminalOutcome::Failed(e.clone())
+            };
+            finalize_job(&ctrl, outcome, true).await;
+            return Err(e);
+        }
+    };
+
+    // 保存先コンテキスト情報をJobControlInnerに記録（再試行ドライバが同宛先を使用するため）
+    {
+        let mut inner = ctrl.inner.lock().await;
+        inner.docker_path = Some(prepared.docker_path.clone());
+        inner.docker_context = Some(prepared.docker_context.clone());
+    }
 
     emit_transcribe_progress(&app, &job_id, "starting_container", "Dockerコンテナを起動中...");
 
-    // Docker実行
-    let run_result = run_docker_transcribe(
-        &app,
-        &job_id,
-        image_name,
-        &work_dir,
-        env_vars,
-        hf_token.as_deref(),
-    )
-    .await;
+    let runtime = RealDockerCliRuntime {
+        docker_path: prepared.docker_path.clone(),
+        docker_context: prepared.docker_context.clone(),
+    };
+
+    let cname = container_name(&job_id);
+    let ctrl_driver = ctrl.clone();
+    let ctrl_sup = ctrl.clone();
+    let app_handle = app.clone();
+    let cname_sup = cname.clone();
+    let runtime_sup = runtime.clone();
+    let image_name = prepared.image_name;
+    let mounts = prepared.mounts;
+    let full_env_vars = prepared.full_env_vars;
+    let labels = prepared.labels;
+
+    // Supervisor wraps the lifecycle driver in the background
+    tokio::spawn(async move {
+        let runtime_inner = runtime_sup.clone();
+        let cname_inner = cname_sup.clone();
+        let driver_task = tokio::spawn(async move {
+            run_docker_lifecycle_driver(
+                &runtime_inner,
+                &ctrl_driver,
+                &cname_inner,
+                &image_name,
+                mounts,
+                full_env_vars,
+                labels,
+                Some(&app_handle),
+            ).await
+        });
+
+        let join_res = driver_task.await;
+        handle_driver_join_result(join_res, &ctrl_sup, &runtime_sup, &cname_sup).await;
+    });
+
+    // Caller awaits terminal result
+    let outcome = ctrl.await_terminal_result().await;
 
     // 結果を処理（成功・失敗に関わらずクリーンアップ）
-    let result = match run_result {
-        Ok(()) => {
+    let result = match outcome {
+        JobTerminalOutcome::Success => {
             emit_transcribe_progress(&app, &job_id, "reading_output", "出力を読み込み中...");
 
-            // GUI表示用TXTは常に読み込む
-            let txt_path = output_dir.join(format!("{output_stem}.txt"));
+            let txt_path = prepared.output_dir.join(format!("{}.txt", prepared.output_stem));
             let txt = fs::read_to_string(&txt_path)
                 .map_err(|e| format!("TXT読み込みエラー ({}): {e}", txt_path.display()))?;
 
-            // VTTはvtt選択時のみ読み込む
             let vtt = if output_formats.contains(&"vtt".to_string()) {
-                let vtt_path = output_dir.join(format!("{output_stem}.vtt"));
+                let vtt_path = prepared.output_dir.join(format!("{}.vtt", prepared.output_stem));
                 Some(fs::read_to_string(&vtt_path)
                     .map_err(|e| format!("VTT読み込みエラー ({}): {e}", vtt_path.display()))?)
             } else {
                 None
             };
 
-            // ユーザー保存先へコピー
             let mut saved_files: Vec<SavedOutputFile> = Vec::new();
             let mut copy_errors: Vec<String> = Vec::new();
 
-            for fmt in &output_formats {
-                let ext = fmt.as_str();
-                let src_name = format!("{output_stem}.{ext}");
-                let src_path = output_dir.join(&src_name);
-                if !src_path.exists() {
-                    copy_errors.push(format!("{}: 一時ファイルが見つかりません", src_name));
-                    continue;
-                }
-                let dest_path = save_dir.join(&src_name);
-                match fs::copy(&src_path, &dest_path) {
-                    Ok(_) => {
-                        saved_files.push(SavedOutputFile {
-                            format: ext.to_string(),
-                            path: dest_path.to_string_lossy().to_string(),
-                            file_name: src_name,
-                        });
+            if let Some(ref s_dir) = prepared.save_dir {
+                for fmt in &output_formats {
+                    let ext = fmt.as_str();
+                    let src_name = format!("{}.{ext}", prepared.output_stem);
+                    let src_path = prepared.output_dir.join(&src_name);
+                    if !src_path.exists() {
+                        copy_errors.push(format!("{}: 一時ファイルが見つかりません", src_name));
+                        continue;
                     }
-                    Err(e) => {
-                        copy_errors.push(format!("{}: コピーエラー: {}", src_name, e));
+                    let dest_path = s_dir.join(&src_name);
+                    match fs::copy(&src_path, &dest_path) {
+                        Ok(_) => {
+                            saved_files.push(SavedOutputFile {
+                                format: ext.to_string(),
+                                path: dest_path.to_string_lossy().to_string(),
+                                file_name: src_name,
+                            });
+                        }
+                        Err(e) => {
+                            copy_errors.push(format!("{}: コピーエラー: {}", src_name, e));
+                        }
                     }
                 }
             }
 
-            // CanonicalセグメントJSONの読み込みとTranscriptDocument生成
-            let segments_json_path = output_dir.join(format!("{output_stem}.segments.json"));
+            let lang = prepared.settings
+                .asr_languages
+                .get(&prepared.target_engine)
+                .cloned()
+                .unwrap_or_else(|| "ja".to_string());
+
+            let segments_json_path = prepared.output_dir.join(format!("{}.segments.json", prepared.output_stem));
             let document = if segments_json_path.exists() {
                 match fs::read_to_string(&segments_json_path) {
                     Ok(content) => match serde_json::from_str::<Vec<transcript::RawSegment>>(&content) {
                         Ok(raw_segments) => {
-                            let lang = settings
-                                .asr_languages
-                                .get(&settings.asr_engine)
-                                .cloned()
-                                .unwrap_or_else(|| "ja".to_string());
+                            let input_filename = std::path::Path::new(&audio_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("audio")
+                                .to_string();
                             Some(transcript::TranscriptDocument::from_raw_segments(
                                 raw_segments,
                                 audio_path.clone(),
-                                input_filename.clone(),
-                                Some(lang),
-                                Some(engine.clone()),
+                                input_filename,
+                                Some(lang.clone()),
+                                Some(prepared.target_engine.clone()),
                                 Some(job_id.clone()),
                             ))
                         }
@@ -1115,25 +1995,121 @@ async fn local_asr_transcribe(
             Ok(TranscriptionResult {
                 txt_content: txt,
                 vtt_content: vtt,
-                engine,
-                language: settings
-                    .asr_languages
-                    .get(&settings.asr_engine)
-                    .cloned()
-                    .unwrap_or_else(|| "ja".to_string()),
+                engine: prepared.target_engine,
+                language: lang,
                 saved_files,
                 document,
             })
         }
-        Err(e) => Err(e),
+        JobTerminalOutcome::Cancelled => {
+            Err("Transcription cancelled".to_string())
+        }
+        JobTerminalOutcome::Failed(e) => {
+            Err(e)
+        }
+        JobTerminalOutcome::CleanupFailed(e) => {
+            Err(format!("クリーンアップエラー: {e}"))
+        }
     };
 
-    // クリーンアップ（成功・失敗とも）
-    if let Err(e) = fs::remove_dir_all(&work_dir) {
+    if let Err(e) = fs::remove_dir_all(&prepared.work_dir) {
         eprintln!("ジョブディレクトリの削除に失敗: {e}");
     }
 
     result
+}
+
+pub async fn cancel_transcription_with_runtime<R: DockerRuntime + 'static>(
+    job_id: &str,
+    runtime: std::sync::Arc<R>,
+) -> Result<String, String> {
+    validate_job_id(job_id)?;
+
+    let ctrl = match get_job_control(job_id) {
+        Some(c) => c,
+        None => {
+            return Err("指定されたジョブが見つかりません".to_string());
+        }
+    };
+
+    ctrl.request_cancel().await;
+
+    // Check if job is in Finished but cleanup_confirmed == false -> trigger recovery driver
+    let should_spawn_recovery = {
+        let mut inner = ctrl.inner.lock().await;
+        if inner.state == AsrJobState::Finished && !inner.cleanup_confirmed {
+            if !inner.recovery_in_progress {
+                inner.recovery_in_progress = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+
+    if should_spawn_recovery {
+        let ctrl_rec = ctrl.clone();
+        let runtime_rec = std::sync::Arc::clone(&runtime);
+        tokio::spawn(async move {
+            let _ = run_cleanup_recovery(&ctrl_rec, &*runtime_rec).await;
+        });
+    }
+
+    // Wait on notify loop for terminal state or recovery completion
+    let wait_res = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+        loop {
+            let notified = ctrl.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = ctrl.inner.lock().await;
+                if is_job_fully_terminal(&inner) {
+                    return Ok("stopped".to_string());
+                }
+                if inner.state == AsrJobState::Finished && !inner.recovery_in_progress && !inner.cleanup_confirmed {
+                    if let Some(JobTerminalOutcome::CleanupFailed(ref e)) = inner.terminal_result {
+                        return Err(format!("クリーンアップ再試行に失敗しました: {e}"));
+                    } else {
+                        return Err("クリーンアップ再試行に失敗しました".to_string());
+                    }
+                }
+            }
+            notified.await;
+        }
+    }).await;
+
+    match wait_res {
+        Ok(res) => res,
+        Err(_) => Err("キャンセル完了の確認がタイムアウトしました".to_string()),
+    }
+}
+
+pub async fn cancel_transcription_internal(job_id: &str) -> Result<String, String> {
+    validate_job_id(job_id)?;
+
+    let ctrl = match get_job_control(job_id) {
+        Some(c) => c,
+        None => {
+            return Err("指定されたジョブが見つかりません".to_string());
+        }
+    };
+
+    let (docker_path, docker_context) = {
+        let inner = ctrl.inner.lock().await;
+        (
+            inner.docker_path.clone().unwrap_or_else(|| PathBuf::from("docker")),
+            inner.docker_context.clone().unwrap_or_default(),
+        )
+    };
+
+    let runtime = std::sync::Arc::new(RealDockerCliRuntime {
+        docker_path,
+        docker_context,
+    });
+
+    cancel_transcription_with_runtime(job_id, runtime).await
 }
 
 #[tauri::command]
@@ -1141,66 +2117,7 @@ async fn cancel_transcription(
     _app: tauri::AppHandle,
     job_id: String,
 ) -> Result<String, String> {
-    validate_job_id(&job_id)?;
-
-    let cname = container_name(&job_id);
-
-    // docker path を取得
-    let docker_path = find_docker_cli().ok_or("Dockerがインストールされていません")?;
-
-    // docker context を取得
-    let docker_context = resolve_docker_context(&docker_path)
-        .await
-        .unwrap_or_default();
-
-    // docker stop --timeout 3 <container_name>
-    let mut stop_cmd = tokio::process::Command::new(&docker_path);
-    if !docker_context.is_empty() {
-        stop_cmd.arg("--context").arg(&docker_context);
-    }
-    stop_cmd.arg("stop").arg("--timeout").arg("3").arg(&cname);
-
-    let stop_output = stop_cmd
-        .output()
-        .await
-        .map_err(|e| format!("docker stop実行エラー: {e}"))?;
-
-    if stop_output.status.success() {
-        return Ok("stopped".to_string());
-    }
-
-    let stderr = String::from_utf8_lossy(&stop_output.stderr);
-
-    // No such container → すでに終了済み
-    if stderr.contains("No such container") {
-        return Ok("already-finished".to_string());
-    }
-
-    // stopが失敗した場合はkillを試行
-    let mut kill_cmd = tokio::process::Command::new(&docker_path);
-    if !docker_context.is_empty() {
-        kill_cmd.arg("--context").arg(&docker_context);
-    }
-    kill_cmd.arg("kill").arg(&cname);
-
-    let kill_output = kill_cmd
-        .output()
-        .await
-        .map_err(|e| format!("docker kill実行エラー: {e}"))?;
-
-    if kill_output.status.success() {
-        return Ok("stopped".to_string());
-    }
-
-    let kill_stderr = String::from_utf8_lossy(&kill_output.stderr);
-    if kill_stderr.contains("No such container") {
-        return Ok("already-finished".to_string());
-    }
-
-    Err(format!(
-        "コンテナの停止に失敗しました: {}",
-        stderr.trim()
-    ))
+    cancel_transcription_internal(&job_id).await
 }
 
 #[tauri::command]
@@ -8308,4 +9225,1468 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_resolve_asr_image_name_per_target_engine() {
+        assert_eq!(
+            resolve_asr_image_name("kotoba-whisper").unwrap(),
+            "asr-composer-kotoba-whisper:cu126"
+        );
+        assert_eq!(
+            resolve_asr_image_name("reazonspeech").unwrap(),
+            "asr-composer-reazonspeech:cu126"
+        );
+        assert_eq!(
+            resolve_asr_image_name("qwen3-asr").unwrap(),
+            "asr-composer-qwen3-asr:cu126"
+        );
+    }
+
+    #[test]
+    fn test_container_name_formatting() {
+        let job = "job-race-sync-456";
+        assert_eq!(container_name(job), "asr-composer-job-job-race-sync-456");
+    }
+
+    #[test]
+    fn test_classify_inspect_output_strict_three_way() {
+        // Case A: Command succeeds -> Present
+        let res_present = classify_inspect_output_typed(true, "");
+        assert_eq!(res_present, Ok(ContainerPresence::Present));
+
+        // Case B: Command fails with explicit "No such object" -> Absent
+        let res_absent1 = classify_inspect_output_typed(false, "Error: No such object: asr-composer-job-123\n");
+        assert_eq!(res_absent1, Ok(ContainerPresence::Absent));
+
+        // Case B: Command fails with explicit "No such container" -> Absent
+        let res_absent2 = classify_inspect_output_typed(false, "Error response from daemon: No such container: asr-composer-job-123\n");
+        assert_eq!(res_absent2, Ok(ContainerPresence::Absent));
+
+        // Case C: Command fails with daemon connection error -> Err (MUST NOT be Absent)
+        let res_daemon_err = classify_inspect_output_typed(false, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n");
+        assert!(res_daemon_err.is_err());
+        match res_daemon_err.unwrap_err() {
+            DockerError::InspectFailed(msg) => assert!(msg.contains("Cannot connect to the Docker daemon")),
+            other => panic!("Unexpected error variant: {:?}", other),
+        }
+
+        // Case C: Command fails with permission error -> Err (MUST NOT be Absent)
+        let res_perm_err = classify_inspect_output_typed(false, "permission denied while trying to connect to the Docker daemon socket\n");
+        assert!(res_perm_err.is_err());
+
+        // Case C: Command fails with empty or unexpected error -> Err (MUST NOT be Absent)
+        let res_empty_err = classify_inspect_output_typed(false, "");
+        assert!(res_empty_err.is_err());
+    }
+
+    // Mock Docker Runtime for Deterministic Lifecycle Testing
+    #[derive(Clone, Default)]
+    struct MockDockerState {
+        created_containers: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
+        started_containers: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        stopped_containers: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        removed_containers: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        presence_map: std::sync::Arc<std::sync::Mutex<HashMap<String, ContainerPresence>>>,
+        inspect_sequence: std::sync::Arc<std::sync::Mutex<Vec<Result<ContainerPresence, DockerError>>>>,
+        exit_code: std::sync::Arc<std::sync::Mutex<i32>>,
+        create_delay_ms: std::sync::Arc<std::sync::Mutex<u64>>,
+        start_delay_ms: std::sync::Arc<std::sync::Mutex<u64>>,
+        fail_create: std::sync::Arc<std::sync::Mutex<bool>>,
+        fail_start: std::sync::Arc<std::sync::Mutex<bool>>,
+        fail_inspect: std::sync::Arc<std::sync::Mutex<bool>>,
+        fail_logs: std::sync::Arc<std::sync::Mutex<bool>>,
+        fail_remove: std::sync::Arc<std::sync::Mutex<bool>>,
+        stop_count: std::sync::Arc<std::sync::Mutex<u32>>,
+        remove_count: std::sync::Arc<std::sync::Mutex<u32>>,
+        recovery_cleanup_count: std::sync::Arc<std::sync::Mutex<u32>>,
+        create_hook: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockDockerRuntime {
+        state: MockDockerState,
+    }
+
+    impl DockerRuntime for MockDockerRuntime {
+        async fn create_container(
+            &self,
+            cname: &str,
+            _image: &str,
+            _mounts: &[String],
+            _env_vars: &[(String, String)],
+            _labels: &[(String, String)],
+        ) -> Result<String, DockerError> {
+            let delay = *self.state.create_delay_ms.lock().unwrap();
+            if delay > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+            }
+            if let Some(hook) = self.state.create_hook.lock().unwrap().clone() {
+                hook(cname);
+            }
+            if *self.state.fail_create.lock().unwrap() {
+                return Err(DockerError::CommandFailed {
+                    code: 1,
+                    stderr: "mock create failure".to_string(),
+                });
+            }
+            let cid = format!("cid-mock-{cname}");
+            self.state.created_containers.lock().unwrap().insert(cname.to_string(), cid.clone());
+            self.state.presence_map.lock().unwrap().insert(cname.to_string(), ContainerPresence::Present);
+            Ok(cid)
+        }
+
+        async fn start_container(&self, cname: &str) -> Result<(), DockerError> {
+            let delay = *self.state.start_delay_ms.lock().unwrap();
+            if delay > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+            }
+            if *self.state.fail_start.lock().unwrap() {
+                return Err(DockerError::CommandFailed {
+                    code: 1,
+                    stderr: "mock start failure".to_string(),
+                });
+            }
+            self.state.started_containers.lock().unwrap().insert(cname.to_string());
+            Ok(())
+        }
+
+        async fn follow_logs(
+            &self,
+            _cname: &str,
+        ) -> Result<LogStreams, DockerError> {
+            if *self.state.fail_logs.lock().unwrap() {
+                return Err(DockerError::CommandFailed {
+                    code: 1,
+                    stderr: "mock logs connection failure".to_string(),
+                });
+            }
+
+            let (mut stdout_tx, stdout_rx) = tokio::io::duplex(1024);
+            let (_stderr_tx, stderr_rx) = tokio::io::duplex(1024);
+
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdout_tx.write_all(b"{\"stage\":\"processing\",\"message\":\"test\"}\n").await;
+            });
+
+            let kill_handle = Box::new(|| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                Box::pin(async move {})
+            });
+
+            Ok(LogStreams {
+                stdout: Box::new(stdout_rx),
+                stderr: Box::new(stderr_rx),
+                kill_handle,
+            })
+        }
+
+        async fn wait_container(&self, _cname: &str) -> Result<i32, DockerError> {
+            let code = *self.state.exit_code.lock().unwrap();
+            Ok(code)
+        }
+
+        async fn stop_container(&self, cname: &str, _timeout_secs: u32) -> Result<(), DockerError> {
+            *self.state.stop_count.lock().unwrap() += 1;
+            self.state.stopped_containers.lock().unwrap().insert(cname.to_string());
+            Ok(())
+        }
+
+        async fn remove_container(&self, cname: &str) -> Result<(), DockerError> {
+            if *self.state.fail_remove.lock().unwrap() {
+                return Err(DockerError::CommandFailed {
+                    code: 1,
+                    stderr: "mock remove failure".to_string(),
+                });
+            }
+            *self.state.remove_count.lock().unwrap() += 1;
+            *self.state.recovery_cleanup_count.lock().unwrap() += 1;
+            self.state.removed_containers.lock().unwrap().insert(cname.to_string());
+            self.state.presence_map.lock().unwrap().insert(cname.to_string(), ContainerPresence::Absent);
+            Ok(())
+        }
+
+        async fn inspect_container(&self, cname: &str) -> Result<ContainerPresence, DockerError> {
+            if let Ok(mut seq) = self.state.inspect_sequence.lock() {
+                if !seq.is_empty() {
+                    return seq.remove(0);
+                }
+            }
+            if *self.state.fail_inspect.lock().unwrap() {
+                return Err(DockerError::DaemonUnavailable("mock daemon down".to_string()));
+            }
+            let presence = self.state.presence_map.lock().unwrap().get(cname).copied().unwrap_or(ContainerPresence::Absent);
+            Ok(presence)
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_a_creating_cancellation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.create_delay_ms.lock().unwrap() = 50;
+
+            let job_id = "test-job-a-creating-cancel";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            let ctrl_clone = ctrl.clone();
+            let mock_clone = mock.clone();
+            let cname_clone = cname.clone();
+            let driver_task = tokio::spawn(async move {
+                run_docker_lifecycle_driver(
+                    &mock_clone,
+                    &ctrl_clone,
+                    &cname_clone,
+                    "test-image",
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                ).await
+            });
+
+            // Request cancellation while in Creating
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            ctrl.request_cancel().await;
+
+            let outcome = driver_task.await.unwrap();
+            assert_eq!(outcome, JobTerminalOutcome::Cancelled);
+
+            // Container was created on daemon, start was skipped, and rm was called
+            assert!(mock.state.created_containers.lock().unwrap().contains_key(&cname));
+            assert!(!mock.state.started_containers.lock().unwrap().contains(&cname));
+            assert!(mock.state.removed_containers.lock().unwrap().contains(&cname));
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_b_delayed_daemon_creation_race() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.create_delay_ms.lock().unwrap() = 40;
+
+            let job_id = "test-job-b-delayed-creation";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            // Initial inspect before create completes is Absent
+            assert_eq!(mock.inspect_container(&cname).await.unwrap(), ContainerPresence::Absent);
+
+            let ctrl_clone = ctrl.clone();
+            let mock_clone = mock.clone();
+            let cname_clone = cname.clone();
+            let driver_task = tokio::spawn(async move {
+                run_docker_lifecycle_driver(
+                    &mock_clone,
+                    &ctrl_clone,
+                    &cname_clone,
+                    "test-image",
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                ).await
+            });
+
+            // Cancel during create
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            ctrl.request_cancel().await;
+
+            let outcome = driver_task.await.unwrap();
+            assert_eq!(outcome, JobTerminalOutcome::Cancelled);
+
+            // Cleaned up after create finished
+            assert_eq!(mock.inspect_container(&cname).await.unwrap(), ContainerPresence::Absent);
+            assert!(mock.state.removed_containers.lock().unwrap().contains(&cname));
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_c_create_timeout_no_orphan() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.create_delay_ms.lock().unwrap() = 100;
+
+            let job_id = "test-job-c-create-timeout";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            let ctrl_clone = ctrl.clone();
+            let mock_clone = mock.clone();
+            let cname_clone = cname.clone();
+            let _driver_task = tokio::spawn(async move {
+                run_docker_lifecycle_driver(
+                    &mock_clone,
+                    &ctrl_clone,
+                    &cname_clone,
+                    "test-image",
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                ).await
+            });
+
+            // Caller times out after 20ms
+            let caller_res = tokio::time::timeout(tokio::time::Duration::from_millis(20), ctrl.await_terminal_result()).await;
+            assert!(caller_res.is_err(), "Caller timed out");
+
+            // Registry entry remains while background driver is still running
+            assert!(get_job_control(job_id).is_some());
+
+            // Wait for background driver to finish
+            let terminal = ctrl.await_terminal_result().await;
+            assert_eq!(terminal, JobTerminalOutcome::Success);
+
+            // Registry entry cleaned up only after driver finished
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            assert!(get_job_control(job_id).is_none());
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_d_starting_and_running_cancellation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.start_delay_ms.lock().unwrap() = 50;
+
+            let job_id = "test-job-d-starting-cancel";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            let ctrl_clone = ctrl.clone();
+            let mock_clone = mock.clone();
+            let cname_clone = cname.clone();
+            let driver_task = tokio::spawn(async move {
+                run_docker_lifecycle_driver(
+                    &mock_clone,
+                    &ctrl_clone,
+                    &cname_clone,
+                    "test-image",
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                ).await
+            });
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            ctrl.request_cancel().await;
+
+            let outcome = driver_task.await.unwrap();
+            assert_eq!(outcome, JobTerminalOutcome::Cancelled);
+
+            assert!(mock.state.removed_containers.lock().unwrap().contains(&cname));
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_e_inspect_failure_fail_closed() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.fail_inspect.lock().unwrap() = true;
+
+            let job_id = "test-job-e-inspect-failure";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            let outcome = run_docker_lifecycle_driver(
+                &mock,
+                &ctrl,
+                &cname,
+                "test-image",
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ).await;
+
+            // Fails-closed as CleanupFailed because inspect failed
+            assert!(matches!(outcome, JobTerminalOutcome::CleanupFailed(_)));
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_f_created_direct_cancellation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+
+            let job_id = "test-job-f-created-cancel";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            // Pre-request cancel
+            ctrl.request_cancel().await;
+
+            let outcome = run_docker_lifecycle_driver(
+                &mock,
+                &ctrl,
+                &cname,
+                "test-image",
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ).await;
+
+            assert_eq!(outcome, JobTerminalOutcome::Cancelled);
+            assert!(!mock.state.started_containers.lock().unwrap().contains(&cname));
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_g_start_timeout_no_orphan() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.start_delay_ms.lock().unwrap() = 100;
+
+            let job_id = "test-job-g-start-timeout";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            let ctrl_clone = ctrl.clone();
+            let mock_clone = mock.clone();
+            let _driver_task = tokio::spawn(async move {
+                run_docker_lifecycle_driver(
+                    &mock_clone,
+                    &ctrl_clone,
+                    &cname,
+                    "test-image",
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                ).await
+            });
+
+            // Caller times out after 20ms
+            let caller_res = tokio::time::timeout(tokio::time::Duration::from_millis(20), ctrl.await_terminal_result()).await;
+            assert!(caller_res.is_err());
+
+            // Background driver completes normally
+            let outcome = ctrl.await_terminal_result().await;
+            assert_eq!(outcome, JobTerminalOutcome::Success);
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_h_logs_drain_and_success_exit() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.exit_code.lock().unwrap() = 0;
+
+            let job_id = "test-job-h-success";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            let outcome = run_docker_lifecycle_driver(
+                &mock,
+                &ctrl,
+                &cname,
+                "test-image",
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ).await;
+
+            assert_eq!(outcome, JobTerminalOutcome::Success);
+            assert!(mock.state.removed_containers.lock().unwrap().contains(&cname));
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_j_failure_exit_code_non_zero() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.exit_code.lock().unwrap() = 137;
+
+            let job_id = "test-job-j-failure";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            let outcome = run_docker_lifecycle_driver(
+                &mock,
+                &ctrl,
+                &cname,
+                "test-image",
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ).await;
+
+            assert!(matches!(outcome, JobTerminalOutcome::Failed(_)));
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_l_duplicate_cancel_callers() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.create_delay_ms.lock().unwrap() = 50;
+
+            let job_id = "test-job-l-duplicate-cancel";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            let ctrl_clone = ctrl.clone();
+            let mock_clone = mock.clone();
+            tokio::spawn(async move {
+                run_docker_lifecycle_driver(
+                    &mock_clone,
+                    &ctrl_clone,
+                    &cname,
+                    "test-image",
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                ).await
+            });
+
+            // Caller 1 and Caller 2 concurrently cancel and wait
+            let ctrl1 = ctrl.clone();
+            let task1 = tokio::spawn(async move {
+                ctrl1.request_cancel().await;
+                ctrl1.await_terminal_result().await
+            });
+
+            let ctrl2 = ctrl.clone();
+            let task2 = tokio::spawn(async move {
+                ctrl2.request_cancel().await;
+                ctrl2.await_terminal_result().await
+            });
+
+            let res1 = task1.await.unwrap();
+            let res2 = task2.await.unwrap();
+
+            assert_eq!(res1, JobTerminalOutcome::Cancelled);
+            assert_eq!(res2, JobTerminalOutcome::Cancelled);
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_driver_test_r_notify_lost_wakeup_predicate_safety() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let job_id = "test-job-r-lost-wakeup";
+            let ctrl = JobControl::new(job_id);
+
+            // Set terminal result BEFORE any caller starts awaiting
+            ctrl.set_terminal_result(JobTerminalOutcome::Success).await;
+
+            // Caller arrives later: predicate loop immediately yields the outcome without blocking
+            let outcome = ctrl.await_terminal_result().await;
+            assert_eq!(outcome, JobTerminalOutcome::Success);
+        });
+    }
+
+    #[test]
+    fn test_duplicate_registration_rejected() {
+        let job_id = "test-job-duplicate-rejection";
+        let ctrl1 = register_job_control(job_id);
+        assert!(ctrl1.is_ok());
+
+        // Duplicate registration with same job_id fails
+        let ctrl2 = register_job_control(job_id);
+        match ctrl2 {
+            Err(err) => assert!(err.contains("already exists")),
+            Ok(_) => panic!("duplicate registration should fail"),
+        }
+
+        // Cleanup
+        let ctrl = ctrl1.unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            finalize_job(&ctrl, JobTerminalOutcome::Success, true).await;
+        });
+    }
+
+    #[test]
+    fn test_try_remove_job_control_instance_ptr_eq_protection() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let job_id = "test-job-instance-protection";
+            let ctrl1 = register_job_control(job_id).unwrap();
+
+            // Create a different JobControl instance with the SAME job_id
+            let ctrl2 = JobControl::new(job_id);
+            {
+                let mut inner2 = ctrl2.inner.lock().await;
+                inner2.state = AsrJobState::Finished;
+                inner2.terminal_result = Some(JobTerminalOutcome::Success);
+                inner2.cleanup_confirmed = true;
+            }
+
+            // Attempting to remove job_id using ctrl2 fails because Arc::ptr_eq fails
+            let removed = try_remove_job_control(job_id, &ctrl2).await;
+            assert!(!removed);
+            assert!(get_job_control(job_id).is_some());
+
+            // Removing with ctrl1 succeeds after setting removable state
+            finalize_job(&ctrl1, JobTerminalOutcome::Success, true).await;
+            assert!(get_job_control(job_id).is_none());
+        });
+    }
+
+    #[test]
+    fn test_follow_logs_failure_with_clean_removal() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.fail_logs.lock().unwrap() = true;
+
+            let job_id = "test-job-logs-fail-clean";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            let outcome = run_docker_lifecycle_driver(
+                &mock,
+                &ctrl,
+                &cname,
+                "test-image",
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ).await;
+
+            // Outcome is Failed (not CleanupFailed) because cleanup succeeded
+            match outcome {
+                JobTerminalOutcome::Failed(msg) => assert!(msg.contains("ログ取得接続エラー")),
+                other => panic!("Unexpected outcome: {:?}", other),
+            }
+
+            // Cleanup confirmed true -> removed from registry
+            assert!(get_job_control(job_id).is_none());
+            assert!(mock.state.removed_containers.lock().unwrap().contains(&cname));
+        });
+    }
+
+    #[test]
+    fn test_follow_logs_failure_with_cleanup_failed_preserves_registry() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            *mock.state.fail_logs.lock().unwrap() = true;
+            *mock.state.fail_remove.lock().unwrap() = true; // remove fails!
+
+            let job_id = "test-job-logs-fail-unclean";
+            remove_job_control_for_test(job_id);
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            let outcome = run_docker_lifecycle_driver(
+                &mock,
+                &ctrl,
+                &cname,
+                "test-image",
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ).await;
+
+            // Outcome is CleanupFailed
+            match outcome {
+                JobTerminalOutcome::CleanupFailed(msg) => {
+                    assert!(msg.contains("ログ取得接続エラー"));
+                    assert!(msg.contains("コンテナクリーンアップ未確認"));
+                }
+                other => panic!("Unexpected outcome: {:?}", other),
+            }
+
+            // cleanup_confirmed is false -> REGISTRY ENTRY IS RETAINED!
+            let retained = get_job_control(job_id);
+            assert!(retained.is_some());
+            let inner = ctrl.inner.lock().await;
+            assert!(!inner.cleanup_confirmed);
+            assert_eq!(inner.state, AsrJobState::Finished);
+
+            // Clean up registry to avoid test leakage
+            remove_job_control_for_test(job_id);
+            assert!(get_job_control(job_id).is_none());
+        });
+    }
+
+    #[test]
+    fn test_cleanup_failed_recovery_driver_single_ownership_and_preserves_outcome() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            let job_id = "test-job-recovery-single-owner";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            // Initially in CleanupFailed state
+            let original_outcome = JobTerminalOutcome::Failed("original asr engine failure".to_string());
+            {
+                let mut inner = ctrl.inner.lock().await;
+                inner.state = AsrJobState::Finished;
+                inner.terminal_result = Some(original_outcome.clone());
+                inner.cleanup_confirmed = false;
+            }
+
+            // Two concurrent recovery requests
+            let ctrl1 = ctrl.clone();
+            let mock1 = mock.clone();
+            let cname1 = cname.clone();
+
+            let ctrl2 = ctrl.clone();
+            let mock2 = mock.clone();
+            let cname2 = cname.clone();
+
+            // Simulate caller 1 triggering recovery driver
+            let task1 = tokio::spawn(async move {
+                let should_spawn = {
+                    let mut inner = ctrl1.inner.lock().await;
+                    if !inner.recovery_in_progress {
+                        inner.recovery_in_progress = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_spawn {
+                    run_recovery_driver(&mock1, &ctrl1, &cname1).await;
+                }
+            });
+
+            // Simulate caller 2 simultaneously triggering recovery driver
+            let task2 = tokio::spawn(async move {
+                let should_spawn = {
+                    let mut inner = ctrl2.inner.lock().await;
+                    if !inner.recovery_in_progress {
+                        inner.recovery_in_progress = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_spawn {
+                    run_recovery_driver(&mock2, &ctrl2, &cname2).await;
+                }
+            });
+
+            let _ = task1.await;
+            let _ = task2.await;
+
+            // Exactly ONE remove/cleanup was executed!
+            let count = *mock.state.recovery_cleanup_count.lock().unwrap();
+            assert_eq!(count, 1, "Only single recovery driver must execute cleanup");
+
+            // cleanup_confirmed is now true, registry removed
+            assert!(get_job_control(job_id).is_none());
+
+            // CRITICAL: original terminal outcome was PRESERVED, NOT overwritten with Cancelled!
+            let inner = ctrl.inner.lock().await;
+            assert_eq!(inner.terminal_result, Some(original_outcome));
+            assert!(inner.cleanup_confirmed);
+        });
+    }
+
+    #[test]
+    fn test_job_control_cancel_during_preparing_discovered_not_unknown() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let job_id = uuid::Uuid::new_v4().to_string();
+            assert!(get_job_control(&job_id).is_none(), "Registry must be empty before test");
+            let ctrl = register_job_control(&job_id).unwrap();
+
+            // A. In Preparing: cleanup_confirmed == true, state == Preparing, terminal_result == None
+            {
+                let inner = ctrl.inner.lock().await;
+                assert_eq!(inner.state, AsrJobState::Preparing);
+                assert_eq!(inner.cleanup_confirmed, true);
+                assert!(inner.terminal_result.is_none());
+            }
+
+            // Simulate background preparation task
+            let ctrl_prep = ctrl.clone();
+            let (prep_started_tx, prep_started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (finalize_trigger_tx, finalize_trigger_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let prep_task = tokio::spawn(async move {
+                let _ = prep_started_tx.send(());
+                let _ = finalize_trigger_rx.await;
+                if ctrl_prep.is_cancel_requested().await {
+                    finalize_job(&ctrl_prep, JobTerminalOutcome::Cancelled, true).await;
+                }
+            });
+
+            // Wait for preparation task to start
+            let _ = prep_started_rx.await;
+
+            // Spawn cancel_transcription_with_runtime with MockDockerRuntime in a separate task
+            let jid_cancel = job_id.clone();
+            let mock = std::sync::Arc::new(MockDockerRuntime::default());
+            let mut cancel_task = tokio::spawn(async move {
+                cancel_transcription_with_runtime(&jid_cancel, mock).await
+            });
+
+            // Allow cancel_transcription_with_runtime to request cancel and enter notify wait loop
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+            // B. After cancel_requested, cancel future is NOT completed (still waiting for preparation to finish)
+            assert!(ctrl.is_cancel_requested().await, "cancel_requested must be true");
+            assert!(
+                tokio::time::timeout(tokio::time::Duration::from_millis(10), &mut cancel_task).await.is_err(),
+                "cancel future must NOT complete while preparation is in progress"
+            );
+
+            // C. State is still Preparing while waiting
+            {
+                let inner = ctrl.inner.lock().await;
+                assert_eq!(inner.state, AsrJobState::Preparing);
+            }
+
+            // Trigger preparation task to detect cancellation and finalize
+            let _ = finalize_trigger_tx.send(());
+            let _ = prep_task.await;
+
+            // D, E, F: Verify post-finalize state
+            {
+                let inner = ctrl.inner.lock().await;
+                assert_eq!(inner.state, AsrJobState::Finished);
+                assert_eq!(inner.terminal_result, Some(JobTerminalOutcome::Cancelled));
+                assert_eq!(inner.cleanup_confirmed, true);
+            }
+
+            // G. Now cancel caller resolves to Ok("stopped")
+            let cancel_res = cancel_task.await.unwrap();
+            assert_eq!(cancel_res, Ok("stopped".to_string()));
+
+            // Job is removed from registry
+            assert!(get_job_control(&job_id).is_none());
+        });
+    }
+
+    #[test]
+    fn test_unknown_job_cancel_returns_err_and_no_marker() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let unknown_id = uuid::Uuid::new_v4().to_string();
+            let cancel_res = cancel_transcription_internal(&unknown_id).await;
+            assert_eq!(cancel_res, Err("指定されたジョブが見つかりません".to_string()));
+            assert!(get_job_control(&unknown_id).is_none());
+        });
+    }
+
+    #[test]
+    fn test_prepare_job_workdir_created_env_fail_cleans_workdir() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let temp_base = std::env::temp_dir().join(format!("test-asr-c-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&temp_base).unwrap();
+            let dummy_audio = temp_base.join("input.wav");
+            fs::write(&dummy_audio, b"RIFF dummy wav data").unwrap();
+
+            let job_id = "test-job-c-env-fail";
+            let ctrl = register_job_control(job_id).unwrap();
+
+            let mut settings = AppSettings::default();
+            settings.asr_mode = "local".to_string();
+            settings.asr_engine = "qwen3-asr".to_string();
+            // Invalid language code causes build_transcribe_env_vars to fail for qwen3-asr
+            settings.asr_languages.insert("qwen3-asr".to_string(), "invalid-language-code".to_string());
+
+            let res = prepare_job_with_base_dir(
+                &ctrl,
+                job_id,
+                dummy_audio.to_str().unwrap(),
+                "",
+                &["txt".to_string()],
+                "qwen3-asr",
+                settings,
+                Some(false),
+                &temp_base,
+                false, // validate_docker_engine
+                None,
+            ).await;
+
+            let err_msg = match res {
+                Err(e) => e,
+                Ok(_) => panic!("Expected env preparation failure"),
+            };
+            assert!(err_msg.contains("未対応のQwen3言語コード") || err_msg.contains("invalid-language-code"), "Error was: {err_msg}");
+
+            // Workdir was deleted by error cleanup
+            let expected_work_dir = temp_base.join("local-asr").join("jobs").join(job_id);
+            assert!(!expected_work_dir.exists(), "Work dir must be cleaned up on failure");
+
+            // Finalize job and verify removal from registry
+            finalize_job(&ctrl, JobTerminalOutcome::Failed(err_msg), true).await;
+            assert!(get_job_control(job_id).is_none());
+
+            let _ = fs::remove_dir_all(&temp_base);
+        });
+    }
+
+    #[test]
+    fn test_prepare_job_workdir_created_hf_token_fail_cleans_workdir() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let temp_base = std::env::temp_dir().join(format!("test-asr-d-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&temp_base).unwrap();
+            let dummy_audio = temp_base.join("input.wav");
+            fs::write(&dummy_audio, b"RIFF dummy wav data").unwrap();
+
+            let job_id = "test-job-d-hf-fail";
+            let ctrl = register_job_control(job_id).unwrap();
+
+            let mut settings = AppSettings::default();
+            settings.asr_mode = "local".to_string();
+            settings.asr_engine = "kotoba-whisper".to_string();
+            settings.speaker_diarization = true;
+
+            struct RestoreHfToken(Option<String>);
+            impl Drop for RestoreHfToken {
+                fn drop(&mut self) {
+                    if let Some(ref t) = self.0 {
+                        std::env::set_var("HF_TOKEN", t);
+                    } else {
+                        std::env::remove_var("HF_TOKEN");
+                    }
+                }
+            }
+            let _guard = RestoreHfToken(std::env::var("HF_TOKEN").ok());
+            std::env::remove_var("HF_TOKEN");
+
+            let res = prepare_job_with_base_dir(
+                &ctrl,
+                job_id,
+                dummy_audio.to_str().unwrap(),
+                "",
+                &["txt".to_string()],
+                "kotoba-whisper",
+                settings,
+                Some(false),
+                &temp_base,
+                false,
+                None,
+            ).await;
+
+            let err_msg = match res {
+                Err(e) => e,
+                Ok(_) => panic!("Expected HF token failure"),
+            };
+            assert!(err_msg.contains("HF_TOKEN"), "Error was: {err_msg}");
+
+            // Workdir was deleted by error cleanup
+            let expected_work_dir = temp_base.join("local-asr").join("jobs").join(job_id);
+            assert!(!expected_work_dir.exists(), "Work dir must be cleaned up on HF token failure");
+
+            finalize_job(&ctrl, JobTerminalOutcome::Failed(err_msg), true).await;
+            assert!(get_job_control(job_id).is_none());
+
+            let _ = fs::remove_dir_all(&temp_base);
+        });
+    }
+
+    #[test]
+    fn test_prepare_job_workdir_created_image_resolution_fail_cleans_workdir() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let temp_base = std::env::temp_dir().join(format!("test-asr-e-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&temp_base).unwrap();
+            let dummy_audio = temp_base.join("input.wav");
+            fs::write(&dummy_audio, b"RIFF dummy wav data").unwrap();
+
+            let job_id = "test-job-e-image-fail";
+            let ctrl = register_job_control(job_id).unwrap();
+
+            let mut settings = AppSettings::default();
+            settings.asr_mode = "local".to_string();
+            settings.asr_engine = "kotoba-whisper".to_string();
+            settings.speaker_diarization = false;
+
+            let res = prepare_job_with_base_dir(
+                &ctrl,
+                job_id,
+                dummy_audio.to_str().unwrap(),
+                "",
+                &["txt".to_string()],
+                "unsupported-engine-name",
+                settings,
+                Some(false),
+                &temp_base,
+                false,
+                None,
+            ).await;
+
+            let err_msg = match res {
+                Err(e) => e,
+                Ok(_) => panic!("Expected image resolution failure"),
+            };
+            assert!(err_msg.contains("未対応のASRエンジン"), "Error was: {err_msg}");
+
+            // Workdir was deleted by error cleanup
+            let expected_work_dir = temp_base.join("local-asr").join("jobs").join(job_id);
+            assert!(!expected_work_dir.exists(), "Work dir must be cleaned up on image resolution failure");
+
+            finalize_job(&ctrl, JobTerminalOutcome::Failed(err_msg), true).await;
+            assert!(get_job_control(job_id).is_none());
+
+            let _ = fs::remove_dir_all(&temp_base);
+        });
+    }
+
+    #[test]
+    fn test_preparing_initial_cleanup_confirmed_true() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let job_id = "test-job-f-preparing-initial";
+            let ctrl = register_job_control(job_id).unwrap();
+
+            {
+                let inner = ctrl.inner.lock().await;
+                assert_eq!(inner.state, AsrJobState::Preparing);
+                assert_eq!(inner.cleanup_confirmed, true);
+            }
+
+            finalize_job(&ctrl, JobTerminalOutcome::Cancelled, true).await;
+            assert!(get_job_control(job_id).is_none());
+        });
+    }
+
+    #[test]
+    fn test_creating_transition_cleanup_confirmed_false_atomically() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            let job_id = "test-job-g-creating-atomic";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            // Hook executed during create_container before it finishes
+            *mock.state.create_hook.lock().unwrap() = Some(std::sync::Arc::new(|_cname: &str| {
+                let job_ctrl = get_job_control("test-job-g-creating-atomic").unwrap();
+                let inner = job_ctrl.inner.try_lock().expect("Lock should be available");
+                assert_eq!(inner.state, AsrJobState::Creating, "State must be Creating when create_container starts");
+                assert_eq!(inner.cleanup_confirmed, false, "cleanup_confirmed must be false before create_container runs");
+            }));
+
+            let ctrl_clone = ctrl.clone();
+            let mock_clone = mock.clone();
+            let cname_clone = cname.clone();
+            let driver_task = tokio::spawn(async move {
+                run_docker_lifecycle_driver(
+                    &mock_clone,
+                    &ctrl_clone,
+                    &cname_clone,
+                    "test-image",
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                ).await
+            });
+
+            let outcome = driver_task.await.unwrap();
+            assert_eq!(outcome, JobTerminalOutcome::Success);
+            assert!(get_job_control(job_id).is_none());
+        });
+    }
+
+    #[test]
+    fn test_panic_recovery_absent_three_times_does_not_succeed() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            let cname = "test-container-h-absent3";
+
+            // Inspect sequence: 3 Absents, then Present, then Present remaining
+            let mut seq = vec![
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+            ];
+            for _ in 0..20 {
+                seq.push(Ok(ContainerPresence::Present));
+            }
+            *mock.state.inspect_sequence.lock().unwrap() = seq;
+
+            let res = panic_recovery_cleanup(&mock, cname, false).await;
+            assert!(res.is_err(), "Absent x3 must NOT be enough to succeed");
+            match res.unwrap_err() {
+                DockerError::InspectFailed(msg) => {
+                    assert!(msg.contains("不在を確認できませんでした"));
+                }
+                other => panic!("Unexpected error: {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_panic_recovery_absent_six_times_succeeds() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            let cname = "test-container-i-absent6";
+
+            // Inspect sequence: 6 consecutive Absents
+            let seq = vec![
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+            ];
+            *mock.state.inspect_sequence.lock().unwrap() = seq;
+
+            let res = panic_recovery_cleanup(&mock, cname, false).await;
+            assert!(res.is_ok(), "Absent x6 must succeed recovery");
+        });
+    }
+
+    #[test]
+    fn test_panic_recovery_delayed_creation_absent_present_absent6() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            let cname = "test-container-j-delayed";
+
+            // Delayed creation sequence:
+            // 1. Initial inspect: Absent
+            // 2. Delayed creation finishes on daemon: Present
+            // 3. remove_container is triggered -> next 6 inspects: Absent
+            let seq = vec![
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Present),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+            ];
+            *mock.state.inspect_sequence.lock().unwrap() = seq;
+
+            let res = panic_recovery_cleanup(&mock, cname, false).await;
+            assert!(res.is_ok(), "Absent -> Present -> rm -> Absent x6 must succeed");
+            assert!(mock.state.removed_containers.lock().unwrap().contains(cname));
+        });
+    }
+
+    #[test]
+    fn test_driver_panic_production_supervisor_helper() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            let job_id = "test-job-k-driver-panic-supervisor";
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            // Container was present on daemon
+            mock.state.presence_map.lock().unwrap().insert(cname.clone(), ContainerPresence::Present);
+
+            // Provide 6 consecutive Absents after remove
+            *mock.state.inspect_sequence.lock().unwrap() = vec![
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+                Ok(ContainerPresence::Absent),
+            ];
+
+            let ctrl_sup = ctrl.clone();
+            let cname_sup = cname.clone();
+            let mock_sup = mock.clone();
+
+            // Simulate driver task panic
+            let driver_task = tokio::spawn(async move {
+                panic!("intentional driver panic for test K");
+            });
+
+            let join_res = driver_task.await;
+            assert!(join_res.is_err(), "Task panicked");
+
+            // Execute via PRODUCTION helper handle_driver_join_result
+            let outcome = handle_driver_join_result(join_res, &ctrl_sup, &mock_sup, &cname_sup).await;
+
+            match outcome {
+                JobTerminalOutcome::Failed(msg) => {
+                    assert!(msg.contains("Lifecycle driver panicked"));
+                    assert!(msg.contains("container cleaned up"));
+                }
+                other => panic!("Unexpected outcome from supervisor: {:?}", other),
+            }
+
+            // Cleanup confirmed and job removed from registry
+            assert!(get_job_control(job_id).is_none());
+            assert!(mock.state.removed_containers.lock().unwrap().contains(&cname));
+        });
+    }
+
+    #[test]
+    fn test_panic_recovery_fatal_inspect_error_fails_closed() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mock = MockDockerRuntime::default();
+            let job_id = "test-job-l-fatal-inspect-fail-closed";
+            remove_job_control_for_test(job_id);
+            let ctrl = register_job_control(job_id).unwrap();
+            let cname = container_name(job_id);
+
+            // Mock inspect returns fatal daemon error
+            *mock.state.inspect_sequence.lock().unwrap() = vec![
+                Err(DockerError::DaemonUnavailable("dockerd daemon unreachable".to_string())),
+            ];
+
+            let ctrl_sup = ctrl.clone();
+            let cname_sup = cname.clone();
+            let mock_sup = mock.clone();
+
+            // Simulate driver panic
+            let driver_task = tokio::spawn(async move {
+                panic!("intentional driver panic for test L");
+            });
+
+            let join_res = driver_task.await;
+            assert!(join_res.is_err(), "Task panicked");
+
+            // Execute via PRODUCTION helper
+            let outcome = handle_driver_join_result(join_res, &ctrl_sup, &mock_sup, &cname_sup).await;
+
+            match outcome {
+                JobTerminalOutcome::CleanupFailed(msg) => {
+                    assert!(msg.contains("dockerd daemon unreachable"));
+                }
+                other => panic!("Unexpected outcome from supervisor: {:?}", other),
+            }
+
+            // CRITICAL: Cleanup was NOT confirmed, so registry entry is RETAINED!
+            assert!(get_job_control(job_id).is_some(), "Job must NOT be removed from registry on CleanupFailed");
+            let inner = ctrl.inner.lock().await;
+            assert_eq!(inner.cleanup_confirmed, false);
+            assert_eq!(inner.state, AsrJobState::Finished);
+
+            // Clean up registry to avoid test leakage
+            remove_job_control_for_test(job_id);
+            assert!(get_job_control(job_id).is_none());
+        });
+    }
+
+    #[test]
+    fn test_cancel_regression_finished_cleanup_confirmed_true_returns_stopped() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let job_id = uuid::Uuid::new_v4().to_string();
+            assert!(get_job_control(&job_id).is_none(), "Registry must be empty before test");
+            let ctrl = register_job_control(&job_id).unwrap();
+
+            // Job finished normally and cleanup confirmed
+            {
+                let mut inner = ctrl.inner.lock().await;
+                inner.state = AsrJobState::Finished;
+                inner.terminal_result = Some(JobTerminalOutcome::Success);
+                inner.cleanup_confirmed = true;
+            }
+
+            let mock = std::sync::Arc::new(MockDockerRuntime::default());
+            let res = cancel_transcription_with_runtime(&job_id, mock.clone()).await;
+            assert_eq!(res, Ok("stopped".to_string()));
+
+            // Clean up registry
+            let _ = try_remove_job_control(&job_id, &ctrl).await;
+            assert!(get_job_control(&job_id).is_none(), "Registry must be clean after test");
+        });
+    }
+
+    // Test A: CleanupFailed recovery + MockRuntime success -> cleanup_confirmed=true, original terminal_result preserved, registry removed
+    #[test]
+    fn test_cancel_cleanup_failed_recovery_mock_success_cleans_and_removes() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let job_id = uuid::Uuid::new_v4().to_string();
+            assert!(get_job_control(&job_id).is_none(), "Registry must be empty before test");
+            let ctrl = register_job_control(&job_id).unwrap();
+
+            let original_outcome = JobTerminalOutcome::CleanupFailed("initial rm error".to_string());
+            // Job reached Finished but cleanup failed (cleanup_confirmed == false)
+            {
+                let mut inner = ctrl.inner.lock().await;
+                inner.state = AsrJobState::Finished;
+                inner.terminal_result = Some(original_outcome.clone());
+                inner.cleanup_confirmed = false;
+            }
+
+            let mock = std::sync::Arc::new(MockDockerRuntime::default());
+            let res = cancel_transcription_with_runtime(&job_id, mock.clone()).await;
+            assert_eq!(res, Ok("stopped".to_string()));
+
+            // Verify MockDockerRuntime received cleanup sequence
+            let cname = container_name(&job_id);
+            assert!(mock.state.stopped_containers.lock().unwrap().contains(&cname), "stop must be called");
+            assert!(mock.state.removed_containers.lock().unwrap().contains(&cname), "remove must be called");
+            assert_eq!(*mock.state.stop_count.lock().unwrap(), 1);
+            assert_eq!(*mock.state.remove_count.lock().unwrap(), 1);
+
+            // Verify inner state transitions: cleanup_confirmed == true, recovery_in_progress == false
+            let inner = ctrl.inner.lock().await;
+            assert_eq!(inner.cleanup_confirmed, true);
+            assert_eq!(inner.recovery_in_progress, false);
+            // CRITICAL: Original terminal outcome is preserved
+            assert_eq!(inner.terminal_result, Some(original_outcome), "Original terminal_result must be preserved");
+
+            // Fully terminal -> removed from registry
+            assert!(get_job_control(&job_id).is_none(), "Registry entry must be removed on confirmed cleanup");
+        });
+    }
+
+    // Test B: CleanupFailed recovery + MockRuntime inspect failure -> cleanup_confirmed=false, registry retained, Err
+    #[test]
+    fn test_cancel_cleanup_failed_recovery_mock_inspect_failure_retains_registry() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let job_id = uuid::Uuid::new_v4().to_string();
+            assert!(get_job_control(&job_id).is_none(), "Registry must be empty before test");
+            let ctrl = register_job_control(&job_id).unwrap();
+
+            let original_outcome = JobTerminalOutcome::CleanupFailed("initial daemon drop".to_string());
+            {
+                let mut inner = ctrl.inner.lock().await;
+                inner.state = AsrJobState::Finished;
+                inner.terminal_result = Some(original_outcome.clone());
+                inner.cleanup_confirmed = false;
+            }
+
+            let mock = std::sync::Arc::new(MockDockerRuntime::default());
+            *mock.state.fail_inspect.lock().unwrap() = true;
+
+            let res = cancel_transcription_with_runtime(&job_id, mock.clone()).await;
+            assert!(res.is_err(), "Recovery failure must return Err");
+            let err_msg = res.unwrap_err();
+            assert!(err_msg.contains("クリーンアップ再試行に失敗しました"));
+
+            // Verify cleanup was NOT confirmed and registry entry is RETAINED
+            assert!(get_job_control(&job_id).is_some(), "Job must NOT be removed from registry on failed recovery");
+            let inner = ctrl.inner.lock().await;
+            assert_eq!(inner.cleanup_confirmed, false);
+            assert_eq!(inner.recovery_in_progress, false);
+            assert_eq!(inner.terminal_result, Some(original_outcome));
+
+            // Clean up test registry
+            remove_job_control_for_test(&job_id);
+            assert!(get_job_control(&job_id).is_none());
+        });
+    }
+
+    // Test C: Duplicate recovery callers -> Docker cleanup sequence executed exactly once
+    #[test]
+    fn test_cancel_cleanup_failed_recovery_duplicate_callers_single_cleanup() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let job_id = uuid::Uuid::new_v4().to_string();
+            assert!(get_job_control(&job_id).is_none(), "Registry must be empty before test");
+            let ctrl = register_job_control(&job_id).unwrap();
+
+            let original_outcome = JobTerminalOutcome::CleanupFailed("initial err".to_string());
+            {
+                let mut inner = ctrl.inner.lock().await;
+                inner.state = AsrJobState::Finished;
+                inner.terminal_result = Some(original_outcome.clone());
+                inner.cleanup_confirmed = false;
+            }
+
+            let mock = std::sync::Arc::new(MockDockerRuntime::default());
+            let jid1 = job_id.clone();
+            let mock1 = mock.clone();
+            let task1 = tokio::spawn(async move {
+                cancel_transcription_with_runtime(&jid1, mock1).await
+            });
+
+            let jid2 = job_id.clone();
+            let mock2 = mock.clone();
+            let task2 = tokio::spawn(async move {
+                cancel_transcription_with_runtime(&jid2, mock2).await
+            });
+
+            let res1 = task1.await.unwrap();
+            let res2 = task2.await.unwrap();
+            assert_eq!(res1, Ok("stopped".to_string()));
+            assert_eq!(res2, Ok("stopped".to_string()));
+
+            // Exactly ONE stop and ONE remove was executed across duplicate callers!
+            assert_eq!(*mock.state.stop_count.lock().unwrap(), 1, "Stop must be called only once");
+            assert_eq!(*mock.state.remove_count.lock().unwrap(), 1, "Remove must be called only once");
+            assert_eq!(*mock.state.recovery_cleanup_count.lock().unwrap(), 1);
+
+            // Job is removed from registry
+            assert!(get_job_control(&job_id).is_none());
+            let inner = ctrl.inner.lock().await;
+            assert_eq!(inner.cleanup_confirmed, true);
+            assert_eq!(inner.terminal_result, Some(original_outcome));
+        });
+    }
+
+    // Test D: Test runtime that RealDockerCliRuntime is not invoked on unknown jobs
+    #[test]
+    fn test_cancel_transcription_internal_unknown_job_does_not_invoke_docker() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let unknown_id = uuid::Uuid::new_v4().to_string();
+            let res = cancel_transcription_internal(&unknown_id).await;
+            assert_eq!(res, Err("指定されたジョブが見つかりません".to_string()));
+            assert!(get_job_control(&unknown_id).is_none());
+        });
+    }
 }
+
