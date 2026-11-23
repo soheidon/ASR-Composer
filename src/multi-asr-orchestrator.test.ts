@@ -1021,4 +1021,375 @@ describe("multi-asr-orchestrator", () => {
       expect(result.status).toBe("success");
     });
   });
+
+  describe("Compare Mode (LLM-free, First-Engine Anchor)", () => {
+    it("Test CMP-1: Executes sequentially in order, skips LLM synthesis, and keeps 1st engine timestamps as anchor", async () => {
+      const executed: string[] = [];
+      const synthSpy = vi.fn();
+
+      const first: MultiAsrEngineSpec = {
+        engineId: "kotoba-whisper",
+        displayName: "Kotoba Whisper v2.0",
+        timingGranularity: "segment",
+        runTranscription: async (media) => {
+          executed.push(`kotoba:${media}`);
+          return createMockDocument(defaultPath, defaultFileName, [
+            { id: "k1", start: 0.5, end: 2.5, text: "第1結果" },
+          ]);
+        },
+      };
+
+      const second: MultiAsrEngineSpec = {
+        engineId: "reazonspeech",
+        displayName: "ReazonSpeech v2.0",
+        timingGranularity: "whole_audio",
+        runTranscription: async (media) => {
+          executed.push(`reazon:${media}`);
+          return createMockDocument(defaultPath, defaultFileName, [
+            { id: "r1", start: 0.0, end: 10.0, text: "第2結果" },
+          ]);
+        },
+      };
+
+      const result = await runMultiAsrOrchestration({
+        mediaPath: defaultPath,
+        mediaFileName: defaultFileName,
+        expectedDurationSec: defaultDuration,
+        engines: [first, second],
+        executionMode: "compare",
+        anchorEngineId: "kotoba-whisper",
+        synthesisProvider: { synthesize: synthSpy },
+      });
+
+      expect(executed).toEqual([`kotoba:${defaultPath}`, `reazon:${defaultPath}`]);
+      expect(synthSpy).not.toHaveBeenCalled();
+      expect(result.status).toBe("compare_ready");
+      if (result.status === "compare_ready") {
+        expect(result.designatedAnchorEngineId).toBe("kotoba-whisper");
+        expect(result.anchorAvailable).toBe(true);
+        expect(result.anchorUnavailableReason).toBeUndefined();
+        expect(result.engineOrder).toEqual(["kotoba-whisper", "reazonspeech"]);
+        expect(result.session.results["kotoba-whisper"].document.segments[0].start).toBe(0.5);
+        expect(result.session.results["reazonspeech"].document.segments[0].end).toBe(10.0);
+      }
+    });
+
+    it("Test CMP-5: Compare mode respects caller-specified anchorEngineId (e.g. AI 2)", async () => {
+      const executed: string[] = [];
+      const engines: MultiAsrEngineSpec[] = [
+        {
+          engineId: "local:reazonspeech",
+          displayName: "ReazonSpeech",
+          timingGranularity: "segment",
+          runTranscription: async () => {
+            executed.push("AI 1");
+            return createMockDocument(defaultPath, defaultFileName, [
+              { id: "r1", start: 0.2, end: 2, text: "first" },
+            ]);
+          },
+        },
+        {
+          engineId: "cloud:google_stt",
+          displayName: "Google STT",
+          timingGranularity: "segment",
+          runTranscription: async () => {
+            executed.push("AI 2");
+            return createMockDocument(defaultPath, defaultFileName, [
+              { id: "g1", start: 0.4, end: 2.4, text: "second" },
+            ]);
+          },
+        },
+      ];
+      const result = await runMultiAsrOrchestration({
+        mediaPath: defaultPath,
+        mediaFileName: defaultFileName,
+        expectedDurationSec: defaultDuration,
+        engines,
+        executionMode: "compare",
+        anchorEngineId: "cloud:google_stt",
+      });
+      expect(executed).toEqual(["AI 1", "AI 2"]);
+      expect(result.status).toBe("compare_ready");
+      if (result.status === "compare_ready") {
+        expect(result.designatedAnchorEngineId).toBe("cloud:google_stt");
+        expect(result.anchorAvailable).toBe(true);
+        expect(result.session.anchorEngineId).toBe("cloud:google_stt");
+      }
+    });
+
+    it("Test CMP-2: When 1st engine fails, 2nd engine result is preserved but NOT promoted to anchor", async () => {
+      const first: MultiAsrEngineSpec = {
+        engineId: "kotoba-whisper",
+        displayName: "Kotoba Whisper v2.0",
+        timingGranularity: "segment",
+        runTranscription: async () => {
+          throw new Error("Kotoba crashed");
+        },
+      };
+
+      const second: MultiAsrEngineSpec = {
+        engineId: "reazonspeech",
+        displayName: "ReazonSpeech v2.0",
+        timingGranularity: "segment",
+        runTranscription: async () =>
+          createMockDocument(defaultPath, defaultFileName, [
+            { id: "r1", start: 0.0, end: 4.0, text: "Reazon raw text" },
+          ]),
+      };
+
+      const result = await runMultiAsrOrchestration({
+        mediaPath: defaultPath,
+        mediaFileName: defaultFileName,
+        expectedDurationSec: defaultDuration,
+        engines: [first, second],
+        executionMode: "compare",
+        anchorEngineId: "kotoba-whisper",
+      });
+
+      expect(result.status).toBe("compare_ready");
+      if (result.status === "compare_ready") {
+        expect(result.designatedAnchorEngineId).toBe("kotoba-whisper");
+        expect(result.anchorAvailable).toBe(false);
+        expect(result.anchorUnavailableReason).toBe("first_engine_failed");
+        expect(result.session.anchorEngineId).toBe("");
+        expect(validateMultiEngineSession(result.session, { requireAnchor: false }).valid).toBe(true);
+        expect(result.session.results["reazonspeech"]?.document.segments[0].text).toBe("Reazon raw text");
+      }
+    });
+
+    it("Test CMP-3: When 1st engine is whole_audio, 2nd segment engine is NOT promoted to anchor", async () => {
+      const first: MultiAsrEngineSpec = {
+        engineId: "reazonspeech",
+        displayName: "ReazonSpeech v2.0",
+        timingGranularity: "whole_audio",
+        runTranscription: async () =>
+          createMockDocument(defaultPath, defaultFileName, [
+            { id: "r1", start: 0.0, end: 10.0, text: "Whole audio text" },
+          ]),
+      };
+
+      const second: MultiAsrEngineSpec = {
+        engineId: "kotoba-whisper",
+        displayName: "Kotoba Whisper v2.0",
+        timingGranularity: "segment",
+        runTranscription: async () =>
+          createMockDocument(defaultPath, defaultFileName, [
+            { id: "k1", start: 0.0, end: 3.0, text: "Seg 1" },
+          ]),
+      };
+
+      const result = await runMultiAsrOrchestration({
+        mediaPath: defaultPath,
+        mediaFileName: defaultFileName,
+        expectedDurationSec: defaultDuration,
+        engines: [first, second],
+        executionMode: "compare",
+        anchorEngineId: "reazonspeech",
+      });
+
+      expect(result.status).toBe("compare_ready");
+      if (result.status === "compare_ready") {
+        expect(result.designatedAnchorEngineId).toBe("reazonspeech");
+        expect(result.anchorAvailable).toBe(false);
+        expect(result.anchorUnavailableReason).toBe("no_segment_timing_anchor");
+        expect(result.session.anchorEngineId).toBe("");
+        expect(validateMultiEngineSession(result.session, { requireAnchor: false }).valid).toBe(true);
+      }
+    });
+
+    it("Test CMP-4: When 1st engine has invalid segment timestamps, marks anchor unavailable and does not promote 2nd engine", async () => {
+      const first: MultiAsrEngineSpec = {
+        engineId: "kotoba-whisper",
+        displayName: "Kotoba Whisper v2.0",
+        timingGranularity: "segment",
+        runTranscription: async () =>
+          createMockDocument(defaultPath, defaultFileName, [
+            { id: "k1", start: -1.0, end: 2.0, text: "Invalid negative start" },
+          ]),
+      };
+
+      const second: MultiAsrEngineSpec = {
+        engineId: "reazonspeech",
+        displayName: "ReazonSpeech v2.0",
+        timingGranularity: "segment",
+        runTranscription: async () =>
+          createMockDocument(defaultPath, defaultFileName, [
+            { id: "r1", start: 0.0, end: 4.0, text: "Valid second" },
+          ]),
+      };
+
+      const result = await runMultiAsrOrchestration({
+        mediaPath: defaultPath,
+        mediaFileName: defaultFileName,
+        expectedDurationSec: defaultDuration,
+        engines: [first, second],
+        executionMode: "compare",
+        anchorEngineId: "kotoba-whisper",
+      });
+
+      expect(result.status).toBe("compare_ready");
+      if (result.status === "compare_ready") {
+        expect(result.designatedAnchorEngineId).toBe("kotoba-whisper");
+        expect(result.anchorAvailable).toBe(false);
+        expect(result.anchorUnavailableReason).toBe("invalid_anchor_timestamps");
+        expect(result.session.anchorEngineId).toBe("");
+        expect(validateMultiEngineSession(result.session, { requireAnchor: false }).valid).toBe(true);
+      }
+    });
+
+    it("Test CMP-7: Compare mode runs mandatory LLM comparison correction with Google raw JSON + word alignment and produces finalDocument", async () => {
+      const googleRaw = {
+        results: [{ alternatives: [{ transcript: "きょお は", words: [{ word: "きょお", startOffset: "0s", endOffset: "0.5s" }, { word: "は", startOffset: "0.5s", endOffset: "1s" }] }] }],
+      };
+      const rawBefore = JSON.stringify(googleRaw);
+      const engines: MultiAsrEngineSpec[] = [
+        {
+          engineId: "local:kotoba-whisper",
+          displayName: "Kotoba Whisper v2.0",
+          timingGranularity: "segment",
+          runTranscription: async () =>
+            createMockDocument(defaultPath, defaultFileName, [
+              { id: "k1", start: 0, end: 1.0, text: "今日は" },
+            ]),
+        },
+        {
+          engineId: "cloud:google_stt",
+          displayName: "Google Cloud Speech-to-Text",
+          timingGranularity: "segment",
+          runTranscription: async () =>
+            createMockDocument(defaultPath, defaultFileName, [
+              { id: "gword-1", start: 0, end: 0.5, text: "きょお" },
+              { id: "gword-2", start: 0.5, end: 1.0, text: "は" },
+            ]),
+        },
+      ];
+
+      let capturedPartnerCandidates = 0;
+      const result = await runMultiAsrOrchestration({
+        mediaPath: defaultPath,
+        mediaFileName: defaultFileName,
+        expectedDurationSec: defaultDuration,
+        engines,
+        executionMode: "compare",
+        anchorEngineId: "cloud:google_stt",
+        rawGoogleResponses: { "cloud:google_stt": googleRaw },
+        compareCorrectionProvider: {
+          async correctBatch(req) {
+            capturedPartnerCandidates = req.targets.reduce((acc, t) => acc + t.partnerCandidates.length, 0);
+            return req.targets.map((t) => ({
+              segmentId: t.segmentId,
+              correctedText: t.segmentId === "gword-1" ? "今日" : t.anchorText,
+            }));
+          },
+        },
+      });
+
+      expect(JSON.stringify(googleRaw)).toBe(rawBefore);
+      expect(capturedPartnerCandidates).toBeGreaterThan(0);
+      expect(result.status).toBe("compare_ready");
+      if (result.status === "compare_ready") {
+        expect(result.correctionStatus).toBe("success");
+        expect(result.finalDocument?.segments[0]).toMatchObject({
+          id: "gword-1",
+          start: 0,
+          end: 0.5,
+          text: "今日",
+        });
+        expect(result.rawGoogleResponses?.["cloud:google_stt"]).toEqual(googleRaw);
+      }
+    });
+
+    it("Test CMP-8: Partial ASR failure skips LLM correction and records partialAsrFailure", async () => {
+      let llmCalled = false;
+      const engines: MultiAsrEngineSpec[] = [
+        {
+          engineId: "local:kotoba-whisper",
+          displayName: "Kotoba Whisper v2.0",
+          timingGranularity: "segment",
+          runTranscription: async () => {
+            throw new Error("CUDA OOM");
+          },
+        },
+        {
+          engineId: "local:reazonspeech",
+          displayName: "ReazonSpeech v2.0",
+          timingGranularity: "segment",
+          runTranscription: async () =>
+            createMockDocument(defaultPath, defaultFileName, [
+              { id: "r1", start: 0, end: 2.0, text: "生き残った結果" },
+            ]),
+        },
+      ];
+
+      const result = await runMultiAsrOrchestration({
+        mediaPath: defaultPath,
+        mediaFileName: defaultFileName,
+        expectedDurationSec: defaultDuration,
+        engines,
+        executionMode: "compare",
+        anchorEngineId: "local:kotoba-whisper",
+        compareCorrectionProvider: {
+          async correctBatch() {
+            llmCalled = true;
+            return [];
+          },
+        },
+      });
+
+      expect(llmCalled).toBe(false);
+      expect(result.status).toBe("compare_ready");
+      if (result.status === "compare_ready") {
+        expect(result.correctionStatus).toBe("skipped_partial_failure");
+        expect(result.partialAsrFailure).toBe(true);
+        expect(result.engineRecords.find((r) => r.engineId === "local:kotoba-whisper")?.error).toContain("CUDA OOM");
+        expect(result.session.results["local:reazonspeech"].document.segments[0].text).toBe("生き残った結果");
+      }
+    });
+
+    it("Test CMP-9: LLM failure in compare mode marks correctionStatus='failed' and preserves raw results", async () => {
+      const engines: MultiAsrEngineSpec[] = [
+        {
+          engineId: "local:kotoba-whisper",
+          displayName: "Kotoba Whisper v2.0",
+          timingGranularity: "segment",
+          runTranscription: async () =>
+            createMockDocument(defaultPath, defaultFileName, [
+              { id: "k1", start: 0, end: 1.5, text: "生結果1" },
+            ]),
+        },
+        {
+          engineId: "local:reazonspeech",
+          displayName: "ReazonSpeech v2.0",
+          timingGranularity: "segment",
+          runTranscription: async () =>
+            createMockDocument(defaultPath, defaultFileName, [
+              { id: "r1", start: 0, end: 1.5, text: "生結果2" },
+            ]),
+        },
+      ];
+
+      const result = await runMultiAsrOrchestration({
+        mediaPath: defaultPath,
+        mediaFileName: defaultFileName,
+        expectedDurationSec: defaultDuration,
+        engines,
+        executionMode: "compare",
+        anchorEngineId: "local:kotoba-whisper",
+        compareCorrectionProvider: {
+          async correctBatch() {
+            throw new Error("Ollama timeout");
+          },
+        },
+      });
+
+      expect(result.status).toBe("compare_ready");
+      if (result.status === "compare_ready") {
+        expect(result.correctionStatus).toBe("failed");
+        expect(result.correctionError).toContain("Ollama timeout");
+        expect(result.finalDocument).toBeUndefined();
+        expect(result.session.results["local:kotoba-whisper"].document.segments[0].text).toBe("生結果1");
+        expect(result.session.results["local:reazonspeech"].document.segments[0].text).toBe("生結果2");
+      }
+    });
+  });
 });

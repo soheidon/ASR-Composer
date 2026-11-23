@@ -1,17 +1,32 @@
 import type { TranscriptDocument } from "./transcript";
-import type { CorrectionProposal, CorrectionMode } from "./correction";
+import type {
+  CorrectionProposal,
+  CorrectionMode,
+  CorrectionDictionaryEntry,
+  CorrectionContext,
+} from "./correction";
 import {
   type MultiAsrOrchestrationResult,
   type MultiAsrProgress,
   type EngineExecutionRecord,
   type MultiAsrEngineSpec,
+  type MultiAsrExecutionMode,
   runMultiAsrOrchestration,
 } from "./multi-asr-orchestrator";
 import { isEditorDirty, confirmDiscardChanges } from "./editor";
 import { escapeHtml } from "./docker";
-import { resolveCorrectionProvider } from "./correction-settings";
+import { resolveCorrectionProvider, type SavedAppSettings } from "./correction-settings";
 import { loadCorrectionContext } from "./correction-context";
 import { OllamaSynthesisProvider } from "./synthesis-provider";
+import {
+  convertGoogleRawResponseToTranscriptDocument,
+  type GoogleSttRawResponse,
+} from "./google-stt";
+import {
+  OllamaCompareCorrectionProvider,
+  type CompareCorrectionProvider,
+} from "./compare-correction";
+import type { TimingGranularity } from "./multi-asr";
 
 /**
  * 実行排他ロックのステータス型
@@ -19,11 +34,11 @@ import { OllamaSynthesisProvider } from "./synthesis-provider";
 export type ActiveAsrExecutionType = "none" | "single" | "multi";
 
 /**
- * Staging可能なMulti-ASR結果型 (success または partial_asr_only に限定)
+ * Staging可能なMulti-ASR結果型 (success / partial_asr_only / compare_ready)
  */
 export type StagedMultiAsrStatus = Extract<
   MultiAsrOrchestrationResult,
-  { status: "success" | "partial_asr_only" }
+  { status: "success" | "partial_asr_only" | "compare_ready" }
 >;
 
 /**
@@ -369,6 +384,122 @@ export function syncMultiAsrUiFromState(container: ParentNode = document): void 
   }
 }
 
+export function formatCompareTimestamp(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) {
+    return "--:--.-";
+  }
+  const mins = Math.floor(sec / 60);
+  const secs = Math.floor(sec % 60);
+  const tenths = Math.floor((sec * 10) % 10);
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}.${tenths}`;
+}
+
+function isCloudAsrEngineId(engineId: string): boolean {
+  return engineId === "google_stt" || engineId === "xiaomi_mimo_asr" ||
+    engineId.endsWith(":google_stt") || engineId.endsWith(":xiaomi_mimo_asr");
+}
+
+export function buildCompareExportPayload(
+  res: Extract<MultiAsrOrchestrationResult, { status: "compare_ready" }>
+) {
+  return {
+    schemaVersion: 1,
+    mode: "compare" as const,
+    anchorEngineId: res.designatedAnchorEngineId,
+    anchorAvailable: res.anchorAvailable,
+    anchorUnavailableReason: res.anchorUnavailableReason ?? null,
+    partialAsrFailure: Boolean(res.partialAsrFailure),
+    correctionStatus: res.correctionStatus ?? null,
+    correctionError: res.correctionError ?? null,
+    engineOrder: [...res.engineOrder],
+    mediaPath: res.session.mediaPath,
+    mediaFileName: res.session.mediaFileName,
+    rawGoogleResponses: res.rawGoogleResponses ?? null,
+    compareInput: res.compareInput ?? null,
+    llmCorrections: res.llmCorrections ?? null,
+    finalDocument: res.finalDocument ?? null,
+    results: res.engineOrder.map((engineId) => {
+      const record = res.engineRecords.find((r) => r.engineId === engineId);
+      const engineResult = res.session.results[engineId];
+      return {
+        engineId,
+        displayName: engineResult?.displayName ?? record?.displayName ?? engineId,
+        status: record?.status ?? (engineResult ? "success" : "failed"),
+        error: record?.error ?? null,
+        timingGranularity: engineResult?.timingGranularity ?? record?.timingGranularity ?? null,
+        isDesignatedAnchor: engineId === res.designatedAnchorEngineId,
+        document: engineResult?.document ?? null,
+      };
+    }),
+  };
+}
+
+function renderCompareColumnsHtml(
+  res: Extract<MultiAsrOrchestrationResult, { status: "compare_ready" }>
+): string {
+  const columns = res.engineOrder
+    .map((engineId, index) => {
+      const isAnchor = engineId === res.designatedAnchorEngineId;
+      const roleLabel = isAnchor
+        ? res.anchorAvailable ? `ASRエンジン ${index + 1} (基準)` : `ASRエンジン ${index + 1} (基準時刻なし)`
+        : `ASRエンジン ${index + 1}`;
+      const record = res.engineRecords.find((r) => r.engineId === engineId);
+      const engineResult = res.session.results[engineId];
+      const displayName = engineResult?.displayName ?? record?.displayName ?? engineId;
+      const isSuccess = Boolean(engineResult);
+      const isGoogle = engineId === "cloud:google_stt";
+      const timingNote = !isSuccess
+        ? "失敗"
+        : isAnchor
+          ? res.anchorAvailable
+            ? isGoogle
+              ? "基準タイムスタンプ (Google単語単位)"
+              : "基準タイムスタンプ (区間単位)"
+            : res.anchorUnavailableReason === "invalid_anchor_timestamps"
+              ? "基準利用不可 (タイムスタンプ不正)"
+              : isGoogle
+                ? "基準利用不可 (単語時刻なし)"
+                : "基準利用不可 (全体単位)"
+          : isCloudAsrEngineId(engineId)
+            ? isGoogle
+              ? "Google単語タイムスタンプ"
+              : "時間情報なし (テキストのみ)"
+          : `ASRエンジン ${index + 1}の独立タイムスタンプ (再配置なし)`;
+
+      const segmentsHtml = isSuccess && engineResult
+        ? engineResult.document.segments.length > 0
+          ? engineResult.document.segments
+            .map(
+              (seg) => `
+                <div class="compare-segment-item">
+              <span class="compare-segment-time">${engineResult?.timingGranularity === "whole_audio" && isCloudAsrEngineId(engineId) ? "[時間情報なし]" : `[${formatCompareTimestamp(seg.start)} - ${formatCompareTimestamp(seg.end)}]`}</span>
+                  <span class="compare-segment-text">${escapeHtml(seg.text)}</span>
+                </div>
+              `
+            )
+            .join("")
+          : engineResult.document.transcriptTextWithoutTiming
+            ? `<div class="compare-segment-item"><span class="compare-segment-time">[時間情報なし]</span><span class="compare-segment-text">${escapeHtml(engineResult.document.transcriptTextWithoutTiming)}</span></div>`
+            : `<p class="card-description">文字起こしテキストがありません。</p>`
+        : `<p class="card-error-text">${escapeHtml(record?.error || "文字起こしに失敗しました")}</p>`;
+
+      return `
+        <div class="multi-asr-compare-column" data-compare-engine="${escapeHtml(engineId)}">
+          <div class="compare-column-header">
+            <span class="compare-role-badge">${escapeHtml(roleLabel)}</span>
+            <strong class="compare-engine-name">${escapeHtml(displayName)}</strong>
+            <span class="engine-badge ${isSuccess ? "status-success" : "status-failed"}">[${isSuccess ? "完了" : "失敗"}]</span>
+          </div>
+          <div class="compare-timing-note">${escapeHtml(timingNote)}</div>
+          <div class="compare-segments-list">${segmentsHtml}</div>
+        </div>
+      `;
+    })
+    .join("");
+
+  return `<div class="multi-asr-compare-grid">${columns}</div>`;
+}
+
 export function renderStagingCardHtml(staging: StagedMultiAsrResult): string {
   const res = staging.result;
   if (res.status === "success") {
@@ -434,6 +565,123 @@ export function renderStagingCardHtml(staging: StagedMultiAsrResult): string {
           <button id="btnOpenMultiAsrInEditor" class="btn btn-secondary" type="button">
             <span class="material-symbols-outlined">edit_note</span>
             <span>ASR結果を開く (${escapeHtml(anchorEngine)})</span>
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  if (res.status === "compare_ready") {
+    const anchorResult = res.session.results[res.designatedAnchorEngineId];
+    const firstFallbackId = res.engineOrder.find((id) => Boolean(res.session.results[id]));
+    const firstFallbackResult = firstFallbackId ? res.session.results[firstFallbackId] : undefined;
+    const anchorRecord = res.engineRecords.find((r) => r.engineId === res.designatedAnchorEngineId);
+    const anchorName = anchorResult?.displayName ?? anchorRecord?.displayName ?? res.designatedAnchorEngineId;
+
+    const failedRecords = res.engineRecords.filter((r) => r.status === "failed");
+    const hasCorrectedFinal =
+      res.correctionStatus === "success" && Boolean(res.finalDocument);
+    const hasCorrectionFailure = res.correctionStatus === "failed";
+
+    const statusTitle = res.partialAsrFailure
+      ? "Multi-ASR 部分成功 (片側ASR失敗・比較補正なし)"
+      : hasCorrectedFinal
+        ? "Multi-ASR 2エンジン比較LLM補正完了"
+        : hasCorrectionFailure
+          ? "Multi-ASR 比較LLM補正失敗 (生結果は保持)"
+          : res.anchorAvailable
+            ? "Multi-ASR 結果比較"
+            : "Multi-ASR 結果比較 (基準時刻不在)";
+
+    const anchorIndex = res.engineOrder.indexOf(res.designatedAnchorEngineId) + 1;
+    const anchorLabel = `ASRエンジン ${anchorIndex || 1}`;
+    const failedSummaryText = failedRecords
+      .map((r) => `${r.displayName || r.engineId}: ${r.error || "不明なエラー"}`)
+      .join(" / ");
+
+    const statusDescription = res.partialAsrFailure
+      ? `片方のASRが失敗したため比較補正は実行せず、成功した生結果のみを表示しています（単一ASR補正へ自動切替しません）。失敗: ${failedSummaryText}`
+      : hasCorrectionFailure
+        ? `LLM比較補正に失敗しました（${res.correctionError || "詳細不明"}）。補正済み最終結果は生成されていませんが、両エンジンの生結果は保持されています。`
+        : hasCorrectedFinal
+          ? `${anchorLabel}（${anchorName}）のタイムスタンプを基準として保持し、両エンジンの結果を比較してLLM補正済み最終結果を生成しました。`
+          : res.anchorAvailable
+            ? `${anchorLabel}（${anchorName}）の区間タイムスタンプを基準として保持し、両方の生結果を並べて比較しています。`
+            : res.anchorUnavailableReason === "first_engine_failed"
+              ? `${anchorLabel}（${anchorName}）が失敗したため基準タイムスタンプは不在です。もう一方を自動で基準へ切り替えず、時間基準付き比較は利用不可としています。`
+              : res.anchorUnavailableReason === "invalid_anchor_timestamps"
+                ? `${anchorLabel}（${anchorName}）のタイムスタンプが不正（負値・非有限・範囲外等）のため、基準タイムスタンプは不在です。もう一方を自動で基準へ切り替えず、時間基準付き比較は利用不可としています。`
+                : `${anchorLabel}（${anchorName}）が区間タイムスタンプを持たないため、時間基準付き比較は利用不可です（生テキストのみ比較できます）。`;
+
+    const apiAnchorHasNoTiming =
+      !res.partialAsrFailure &&
+      isCloudAsrEngineId(res.designatedAnchorEngineId) &&
+      !res.anchorAvailable;
+    const canOpenInEditor =
+      !hasCorrectionFailure &&
+      res.anchorUnavailableReason !== "invalid_anchor_timestamps" &&
+      !apiAnchorHasNoTiming;
+    const openTargetName = canOpenInEditor
+      ? hasCorrectedFinal
+        ? `${anchorName} 補正済み最終結果`
+        : anchorResult?.displayName ?? firstFallbackResult?.displayName
+      : undefined;
+    const openBtnLabel = hasCorrectedFinal
+      ? `補正済み最終結果を開く (${anchorName})`
+      : res.anchorAvailable
+        ? `基準結果を開く (${openTargetName})`
+        : anchorResult
+          ? `ASRエンジン ${anchorIndex || 1}の結果を開く (基準時刻なし: ${openTargetName})`
+          : `結果を開く (基準外: ${openTargetName})`;
+
+    const finalDocSectionHtml = hasCorrectedFinal && res.finalDocument
+      ? `
+        <div class="compare-final-result" id="compareFinalResultSection">
+          <h5 class="compare-final-title">LLM比較補正済み最終結果 (基準: ${escapeHtml(anchorName)})</h5>
+          <div class="compare-segments-list">
+            ${res.finalDocument.segments
+              .map(
+                (seg) => `
+                  <div class="compare-segment-item">
+                    <span class="compare-segment-time">[${formatCompareTimestamp(seg.start)} - ${formatCompareTimestamp(seg.end)}]</span>
+                    <span class="compare-segment-text">${escapeHtml(seg.text)}</span>
+                  </div>
+                `
+              )
+              .join("")}
+          </div>
+        </div>
+      `
+      : "";
+
+    return `
+      <div class="multi-asr-card ${res.anchorAvailable && !res.partialAsrFailure && !hasCorrectionFailure ? "card-success" : "card-warning"}">
+        <div class="card-header">
+          <span class="material-symbols-outlined ${res.anchorAvailable && !res.partialAsrFailure && !hasCorrectionFailure ? "icon-success" : "icon-warning"}">
+            ${res.anchorAvailable && !res.partialAsrFailure && !hasCorrectionFailure ? "compare" : "info"}
+          </span>
+          <div class="card-header-titles">
+            <h4 class="card-title">${escapeHtml(statusTitle)}</h4>
+            <span class="card-subtitle">${res.anchorAvailable ? "基準エンジン" : "基準指定"}: ${escapeHtml(anchorLabel)} (${escapeHtml(anchorName)}) | 実行順: ${escapeHtml(res.engineOrder.map((id, index) => `エンジン${index + 1}: ${id}`).join(" → "))}</span>
+          </div>
+        </div>
+        <div class="card-body">
+          <p class="card-description">${escapeHtml(statusDescription)}</p>
+          ${finalDocSectionHtml}
+          ${renderCompareColumnsHtml(res)}
+        </div>
+        <div class="card-actions">
+          ${
+            openTargetName
+              ? `<button id="btnOpenMultiAsrInEditor" class="btn btn-primary" type="button">
+                   <span class="material-symbols-outlined">edit_note</span>
+                   <span>${escapeHtml(openBtnLabel)}</span>
+                 </button>`
+              : ""
+          }
+          <button id="btnCopyMultiAsrCompareJson" class="btn btn-secondary" type="button">
+            <span class="material-symbols-outlined">content_copy</span>
+            <span>比較JSONをコピー</span>
           </button>
         </div>
       </div>
@@ -532,6 +780,39 @@ export function prepareHandoffData(
     };
   }
 
+  if (staging.result.status === "compare_ready") {
+    const res = staging.result;
+    if (res.correctionStatus === "failed") {
+      return null;
+    }
+    if (res.correctionStatus === "success" && res.finalDocument) {
+      return {
+        document: res.finalDocument,
+        proposalsMap: null,
+      };
+    }
+    if (
+      res.anchorUnavailableReason === "invalid_anchor_timestamps" ||
+      (!res.partialAsrFailure && isCloudAsrEngineId(res.designatedAnchorEngineId) && !res.anchorAvailable)
+    ) {
+      return null;
+    }
+    const anchorDoc = res.session.results[res.designatedAnchorEngineId]?.document;
+    if (anchorDoc) {
+      return {
+        document: anchorDoc,
+        proposalsMap: null,
+      };
+    }
+    const fallbackId = res.engineOrder.find((id) => Boolean(res.session.results[id]?.document));
+    const fallbackDoc = fallbackId ? res.session.results[fallbackId]?.document : undefined;
+    if (!fallbackDoc) return null;
+    return {
+      document: fallbackDoc,
+      proposalsMap: null,
+    };
+  }
+
   return null;
 }
 
@@ -591,31 +872,152 @@ export interface StartMultiAsrUiOptions {
   duration?: number | null;
   invokeFn?: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
   engines?: MultiAsrEngineSpec[];
+  executionMode?: MultiAsrExecutionMode;
+  engineOrder?: string[];
+  anchorEngineId?: string;
+  compareCorrectionProvider?: CompareCorrectionProvider;
   showDialogFn?: (dialog: { title: string; message: string; type?: "error" | "info" | "success" }) => Promise<void> | void;
-  onJobIdChange?: (jobId: string | null) => void;
+  onJobIdChange?: (jobId: string | null, engineId?: string) => void;
   isCancelled?: () => boolean;
   useDictionary?: boolean;
   useBackground?: boolean;
+  language?: string;
 }
 
-export function createDefaultMultiAsrEngines(
-  invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>,
-  onJobIdChange?: (jobId: string | null) => void
-): MultiAsrEngineSpec[] {
-  const configs: Array<{ engineId: string; displayName: string; timingGranularity: "segment" | "whole_audio" }> = [
-    { engineId: "kotoba-whisper", displayName: "Kotoba Whisper v2.0", timingGranularity: "segment" },
-    { engineId: "reazonspeech", displayName: "ReazonSpeech v2.0", timingGranularity: "whole_audio" },
-    { engineId: "qwen3-asr", displayName: "Qwen3 ASR", timingGranularity: "whole_audio" },
-  ];
+export const MULTI_ASR_ENGINE_CATALOG: ReadonlyArray<{
+  engineId: string;
+  displayName: string;
+  timingGranularity: "segment" | "whole_audio";
+}> = [
+  { engineId: "kotoba-whisper", displayName: "Kotoba Whisper v2.0", timingGranularity: "segment" },
+  { engineId: "reazonspeech", displayName: "ReazonSpeech v2.0", timingGranularity: "whole_audio" },
+  { engineId: "qwen3-asr", displayName: "Qwen3 ASR", timingGranularity: "whole_audio" },
+];
 
-  return configs.map(({ engineId, displayName, timingGranularity }) => ({
-    engineId,
+export const MULTI_ASR_API_ENGINE_CATALOG: ReadonlyArray<{ engineId: string; displayName: string }> = [
+  { engineId: "google_stt", displayName: "Google Cloud Speech-to-Text" },
+  { engineId: "xiaomi_mimo_asr", displayName: "Xiaomi MiMo Speech Recognition" },
+];
+
+export function createMultiAsrEnginesByOrder(
+  engineOrder: string[] | undefined,
+  invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>,
+  onJobIdChange?: (jobId: string | null, engineId?: string) => void,
+  language = "ja",
+  rawGoogleResponses?: Record<string, GoogleSttRawResponse>,
+  expectedDurationSec?: number,
+): MultiAsrEngineSpec[] {
+  const requested = engineOrder?.length ? engineOrder : ["local:kotoba-whisper", "local:reazonspeech", "local:qwen3-asr"];
+  const configs = requested.map((choice) => {
+    const separator = choice.indexOf(":");
+    const sourceMode = separator > 0
+      ? choice.slice(0, separator)
+      : choice === "google_stt" || choice === "xiaomi_mimo_asr" ? "cloud" : "local";
+    const engineId = separator > 0 ? choice.slice(separator + 1) : choice;
+    const catalog = sourceMode === "cloud" ? MULTI_ASR_API_ENGINE_CATALOG : MULTI_ASR_ENGINE_CATALOG;
+    const entry = catalog.find((item) => item.engineId === engineId);
+    if (!entry || (sourceMode !== "cloud" && sourceMode !== "local")) return null;
+    const timingGranularity: TimingGranularity | undefined =
+      sourceMode === "cloud"
+        ? (engineId === "google_stt" ? "segment" : "whole_audio")
+        : ("timingGranularity" in entry ? (entry.timingGranularity as TimingGranularity) : undefined);
+    return {
+      choiceId: `${sourceMode}:${engineId}`,
+      sourceMode,
+      engineId,
+      displayName: entry.displayName,
+      timingGranularity,
+    };
+  }).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+
+  return configs.map(({ choiceId, sourceMode, engineId, displayName, timingGranularity }) => ({
+    engineId: choiceId,
     displayName,
     timingGranularity,
     runTranscription: async (mediaPath: string) => {
       const currentEngineJobId = crypto.randomUUID();
-      onJobIdChange?.(currentEngineJobId);
+      onJobIdChange?.(currentEngineJobId, choiceId);
       try {
+        if (sourceMode === "cloud") {
+          const settings = await invokeFn<SavedAppSettings>("load_api_settings");
+          const provider = settings.providers?.[engineId];
+          let transcript = "";
+          const mediaFileName = mediaPath.split(/[\\/]/).pop() || mediaPath;
+          if (engineId === "google_stt") {
+            const options = provider?.options ?? {};
+            const projectId = options.project_id?.trim() ?? "";
+            const location = options.location?.trim() ?? "";
+            if (!projectId || !location) throw new Error("Google Speech-to-TextのプロジェクトIDとロケーションを設定してください");
+            const langCode = language.toLowerCase().startsWith("en") ? "en-US" : language.toLowerCase().startsWith("zh") ? "cmn-Hans-CN" : "ja-JP";
+            const result = await invokeFn<{
+              transcript?: string;
+              rawResponse?: GoogleSttRawResponse;
+              raw_response?: GoogleSttRawResponse;
+            }>("google_stt_recognize", {
+              input: {
+                projectId,
+                location,
+                recognizerId: options.recognizer_id?.trim() || "_",
+                languageCode: langCode,
+                model: "chirp_2",
+                audioPath: mediaPath,
+              },
+            });
+            transcript = result.transcript ?? "";
+            const rawResponse = result.rawResponse ?? result.raw_response;
+            if (rawResponse !== undefined) {
+              if (rawGoogleResponses) {
+                rawGoogleResponses[choiceId] = rawResponse;
+              }
+              const converted = convertGoogleRawResponseToTranscriptDocument({
+                rawResponse,
+                mediaPath,
+                mediaFileName,
+                language,
+                sourceRunId: currentEngineJobId,
+                expectedDurationSec,
+                transcriptFallback: transcript,
+              });
+              if (converted.ok) {
+                return converted.document;
+              }
+              if (transcript.trim() || converted.documentWithoutTiming.transcriptTextWithoutTiming?.trim()) {
+                return converted.documentWithoutTiming;
+              }
+              throw new Error(converted.reason || `${displayName} から有効な単語タイムスタンプ付き結果が返されませんでした`);
+            }
+          } else if (engineId === "xiaomi_mimo_asr") {
+            const apiLanguage = language.toLowerCase().startsWith("en") ? "en" : language.toLowerCase().startsWith("zh") ? "zh" : "auto";
+            const result = await invokeFn<{ transcript?: string }>("xiaomi_mimo_asr_recognize", {
+              input: {
+                baseUrl: provider?.base_url?.trim() || "https://api.xiaomimimo.com/v1",
+                model: provider?.default_model?.trim() || "mimo-v2.5-asr",
+                language: apiLanguage,
+                audioPath: mediaPath,
+              },
+            });
+            transcript = result.transcript ?? "";
+          } else {
+            throw new Error(`未対応のASR APIです: ${engineId}`);
+          }
+          if (!transcript.trim()) {
+            throw new Error(`${displayName} から文字起こしテキストが返されませんでした`);
+          }
+          const now = new Date().toISOString();
+          return {
+            schemaVersion: 1,
+            mediaPath,
+            mediaFileName,
+            createdAt: now,
+            updatedAt: now,
+            language,
+            sourceEngine: choiceId,
+            sourceRunId: currentEngineJobId,
+            // Keep text-only output out of timed segments: 0..0 would fabricate a timestamp.
+            segments: [],
+            transcriptTextWithoutTiming: transcript,
+          };
+        }
         const res = await invokeFn<{ document?: TranscriptDocument }>("local_asr_transcribe", {
           jobId: currentEngineJobId,
           audioPath: mediaPath,
@@ -629,10 +1031,17 @@ export function createDefaultMultiAsrEngines(
         }
         return res.document;
       } finally {
-        onJobIdChange?.(null);
+        onJobIdChange?.(null, choiceId);
       }
     },
   }));
+}
+
+export function createDefaultMultiAsrEngines(
+  invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>,
+  onJobIdChange?: (jobId: string | null, engineId?: string) => void
+): MultiAsrEngineSpec[] {
+  return createMultiAsrEnginesByOrder(undefined, invokeFn, onJobIdChange);
 }
 
 export async function startMultiAsrFromUi(options: StartMultiAsrUiOptions = {}): Promise<void> {
@@ -676,7 +1085,44 @@ export async function startMultiAsrFromUi(options: StartMultiAsrUiOptions = {}):
     return invoke<T>(cmd, args);
   });
 
-  const engines = options.engines ?? createDefaultMultiAsrEngines(invokeFn, options.onJobIdChange);
+  const executionMode: MultiAsrExecutionMode = options.executionMode ?? "synthesis";
+  const rawGoogleResponses: Record<string, GoogleSttRawResponse> = {};
+  const engines =
+    options.engines ??
+    createMultiAsrEnginesByOrder(
+      options.engineOrder,
+      invokeFn,
+      options.onJobIdChange,
+      options.language ?? "ja",
+      rawGoogleResponses,
+      duration,
+    );
+  const anchorEngineId = executionMode === "compare" ? (options.anchorEngineId ?? engines[0]?.engineId) : undefined;
+  if (executionMode === "compare" && anchorEngineId) {
+    const hasGoogle = engines.some((e) => e.engineId === "cloud:google_stt" || e.engineId === "google_stt");
+    if (hasGoogle && anchorEngineId !== "cloud:google_stt" && anchorEngineId !== "google_stt") {
+      releaseExecutionLock(runId);
+      setMultiAsrProgress(null);
+      syncMultiAsrUiFromState();
+      await showDialog({
+        title: "エラー",
+        message: "Google Speech-to-Textを比較に含める場合は、Googleをタイムスタンプ基準に選択してください。",
+        type: "error",
+      });
+      return;
+    }
+    if (anchorEngineId === "cloud:xiaomi_mimo_asr" || anchorEngineId === "xiaomi_mimo_asr") {
+      releaseExecutionLock(runId);
+      setMultiAsrProgress(null);
+      syncMultiAsrUiFromState();
+      await showDialog({
+        title: "エラー",
+        message: "Xiaomi MiMo Speech Recognitionはタイムスタンプを返さないため、基準エンジンに選択できません。",
+        type: "error",
+      });
+      return;
+    }
+  }
   const isCancelled = options.isCancelled ?? (() => false);
 
   const isStillCurrentRun = () =>
@@ -684,60 +1130,127 @@ export async function startMultiAsrFromUi(options: StartMultiAsrUiOptions = {}):
     initialFileGen === getFileSelectionGeneration();
 
   try {
-    let synthesisProvider: OllamaSynthesisProvider;
+    let synthesisProvider: OllamaSynthesisProvider | undefined;
+    let compareCorrectionProvider: CompareCorrectionProvider | undefined = options.compareCorrectionProvider;
+    let compareCorrectionInitError: string | undefined;
     let correctionMode: CorrectionMode | undefined;
-    try {
-      const resolved = await resolveCorrectionProvider(invokeFn);
-      if (!resolved || !resolved.model) {
-        throw new Error("LLM補正プロバイダーまたはモデルが設定されていません。設定画面でLLMプロバイダーとモデルを設定してください。");
+    let dictionary: CorrectionDictionaryEntry[] | undefined;
+    let context: CorrectionContext | undefined;
+
+    if (executionMode === "synthesis") {
+      try {
+        const resolved = await resolveCorrectionProvider(invokeFn);
+        if (!resolved || !resolved.model) {
+          throw new Error("LLM補正プロバイダーまたはモデルが設定されていません。設定画面でLLMプロバイダーとモデルを設定してください。");
+        }
+        correctionMode = resolved.mode;
+        synthesisProvider = new OllamaSynthesisProvider({
+          baseUrl: resolved.baseUrl,
+          model: resolved.model,
+          invokeTauri: invokeFn,
+        });
+      } catch (e) {
+        const errorMsg = e instanceof Error ? e.message : String(e);
+        await showDialog({
+          title: "エラー",
+          message: `LLM補正プロバイダーの初期化に失敗しました: ${errorMsg}`,
+          type: "error",
+        });
+        return;
       }
-      correctionMode = resolved.mode;
-      synthesisProvider = new OllamaSynthesisProvider({
-        baseUrl: resolved.baseUrl,
-        model: resolved.model,
-        invokeTauri: invokeFn,
+
+      if (!isStillCurrentRun() || isCancelled()) {
+        return;
+      }
+
+      let useDictionary = options.useDictionary;
+      if (useDictionary === undefined) {
+        const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
+        useDictionary = dictCheckbox ? dictCheckbox.checked : true;
+      }
+
+      let useBackground = options.useBackground;
+      if (useBackground === undefined) {
+        const bgCheckbox = document.getElementById("correctionBgCheckbox") as HTMLInputElement | null;
+        useBackground = bgCheckbox ? bgCheckbox.checked : true;
+      }
+
+      const contextLoadResult = await loadCorrectionContext({
+        useDictionary,
+        useBackground,
+        invokeFn,
       });
-    } catch (e) {
-      const errorMsg = e instanceof Error ? e.message : String(e);
-      await showDialog({
-        title: "エラー",
-        message: `LLM補正プロバイダーの初期化に失敗しました: ${errorMsg}`,
-        type: "error",
-      });
-      return;
-    }
 
-    if (!isStillCurrentRun() || isCancelled()) {
-      return;
-    }
+      if (contextLoadResult.status !== "success") {
+        throw new Error(contextLoadResult.message || "用語辞書・背景情報の読み込みに失敗しました");
+      }
 
-    let useDictionary = options.useDictionary;
-    if (useDictionary === undefined) {
-      const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
-      useDictionary = dictCheckbox ? dictCheckbox.checked : true;
-    }
+      dictionary = contextLoadResult.dictionary;
+      context = contextLoadResult.context;
 
-    let useBackground = options.useBackground;
-    if (useBackground === undefined) {
-      const bgCheckbox = document.getElementById("correctionBgCheckbox") as HTMLInputElement | null;
-      useBackground = bgCheckbox ? bgCheckbox.checked : true;
-    }
+      if (!isStillCurrentRun() || isCancelled()) {
+        return;
+      }
+    } else if (executionMode === "compare") {
+      if (!compareCorrectionProvider) {
+        try {
+          const resolved = await resolveCorrectionProvider(invokeFn);
+          if (!resolved || !resolved.model) {
+            throw new Error("LLM補正プロバイダーまたはモデルが設定されていません。設定画面でLLMプロバイダーとモデルを設定してください。");
+          }
+          correctionMode = resolved.mode;
+          compareCorrectionProvider = new OllamaCompareCorrectionProvider({
+            baseUrl: resolved.baseUrl,
+            model: resolved.model,
+            invokeTauri: invokeFn,
+          });
+        } catch (e) {
+          compareCorrectionInitError = e instanceof Error ? e.message : String(e);
+        }
+      } else {
+        const resolved = await resolveCorrectionProvider(invokeFn).catch(() => null);
+        if (resolved) {
+          correctionMode = resolved.mode;
+        }
+      }
 
-    const contextLoadResult = await loadCorrectionContext({
-      useDictionary,
-      useBackground,
-      invokeFn,
-    });
+      if (!isStillCurrentRun() || isCancelled()) {
+        return;
+      }
 
-    if (contextLoadResult.status !== "success") {
-      throw new Error(contextLoadResult.message || "用語辞書・背景情報の読み込みに失敗しました");
-    }
+      let useDictionary = options.useDictionary;
+      if (useDictionary === undefined) {
+        const dictCheckbox = document.getElementById("correctionDictCheckbox") as HTMLInputElement | null;
+        useDictionary = dictCheckbox ? dictCheckbox.checked : true;
+      }
 
-    const dictionary = contextLoadResult.dictionary;
-    const context = contextLoadResult.context;
+      let useBackground = options.useBackground;
+      if (useBackground === undefined) {
+        const bgCheckbox = document.getElementById("correctionBgCheckbox") as HTMLInputElement | null;
+        useBackground = bgCheckbox ? bgCheckbox.checked : true;
+      }
 
-    if (!isStillCurrentRun() || isCancelled()) {
-      return;
+      try {
+        const contextLoadResult = await loadCorrectionContext({
+          useDictionary,
+          useBackground,
+          invokeFn,
+        });
+        if (contextLoadResult.status === "success") {
+          dictionary = contextLoadResult.dictionary;
+          context = contextLoadResult.context;
+        } else if (!compareCorrectionInitError) {
+          compareCorrectionInitError = contextLoadResult.message || "用語辞書・背景情報の読み込みに失敗しました";
+        }
+      } catch (e) {
+        if (!compareCorrectionInitError) {
+          compareCorrectionInitError = e instanceof Error ? e.message : String(e);
+        }
+      }
+
+      if (!isStillCurrentRun() || isCancelled()) {
+        return;
+      }
     }
 
     const result = await runMultiAsrOrchestration({
@@ -745,7 +1258,12 @@ export async function startMultiAsrFromUi(options: StartMultiAsrUiOptions = {}):
       mediaFileName: targetFilePath.split(/[\\/]/).pop() ?? targetFilePath,
       expectedDurationSec: duration,
       engines,
+      executionMode,
+      anchorEngineId,
       synthesisProvider,
+      compareCorrectionProvider,
+      compareCorrectionInitError,
+      rawGoogleResponses,
       dictionary,
       context,
       mode: correctionMode,
@@ -759,7 +1277,11 @@ export async function startMultiAsrFromUi(options: StartMultiAsrUiOptions = {}):
     });
 
     if (isStillCurrentRun()) {
-      if (result.status === "success" || result.status === "partial_asr_only") {
+      if (
+        result.status === "success" ||
+        result.status === "partial_asr_only" ||
+        result.status === "compare_ready"
+      ) {
         setMultiAsrStaging({
           runId,
           generation: runGeneration,

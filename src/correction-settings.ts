@@ -22,6 +22,11 @@ export interface SavedAppSettings {
   correction_mode?: CorrectionMode | string;
   correction_use_dictionary?: boolean;
   correction_use_background?: boolean;
+  asr_execution_mode?: "single" | "compare" | string;
+  multi_asr_mode?: "synthesis" | "compare" | string;
+  multi_asr_engines?: string[];
+  multi_asr_source_mode?: "local" | "cloud" | string;
+  multi_asr_anchor_index?: number;
 }
 
 export interface SavedCorrectionSettings {
@@ -31,6 +36,11 @@ export interface SavedCorrectionSettings {
   correction_mode?: CorrectionMode;
   correction_use_dictionary?: boolean;
   correction_use_background?: boolean;
+  asr_execution_mode?: "single" | "compare" | string;
+  multi_asr_mode?: "synthesis" | "compare" | string;
+  multi_asr_engines?: string[];
+  multi_asr_source_mode?: "local" | "cloud" | string;
+  multi_asr_anchor_index?: number;
 }
 
 export interface ResolvedCorrectionProvider {

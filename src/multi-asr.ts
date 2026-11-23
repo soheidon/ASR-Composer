@@ -279,7 +279,10 @@ export function validateSegmentTimestamps(
 /**
  * MultiEngineSession のメタデータおよび同一音声整合性を検証する
  */
-export function validateMultiEngineSession(session: MultiEngineSession): {
+export function validateMultiEngineSession(
+  session: MultiEngineSession,
+  options?: { requireAnchor?: boolean }
+): {
   valid: boolean;
   errors: string[];
   warnings: string[];
@@ -312,7 +315,8 @@ export function validateMultiEngineSession(session: MultiEngineSession): {
     return { valid: false, errors, warnings };
   }
 
-  if (!session.anchorEngineId || !session.results[session.anchorEngineId]) {
+  const requireAnchor = options?.requireAnchor ?? true;
+  if (requireAnchor && (!session.anchorEngineId || !session.results[session.anchorEngineId])) {
     errors.push(`Anchor engine "${session.anchorEngineId}" does not exist in session results.`);
   }
 

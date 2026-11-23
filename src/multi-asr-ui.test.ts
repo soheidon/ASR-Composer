@@ -19,9 +19,14 @@ import {
   setAudioFactoryForTest,
   setSelectedAudioDurationSecForTest,
   startMultiAsrFromUi,
+  createMultiAsrEnginesByOrder,
+  renderStagingCardHtml,
+  prepareHandoffData,
+  buildCompareExportPayload,
   type StagedMultiAsrResult,
 } from "./multi-asr-ui";
 import * as editorModule from "./editor";
+import { runMultiAsrOrchestration } from "./multi-asr-orchestrator";
 
 function createMockDocument(
   mediaPath: string,
@@ -69,6 +74,58 @@ describe("multi-asr-ui", () => {
         <div id="multiAsrResultSection" style="display: none;"></div>
       </div>
     `;
+  });
+
+  it("runs configured cloud ASR engines sequentially and treats their text-only output as untimed", async () => {
+    const calls: string[] = [];
+    const invoke = (async <T>(command: string, _args?: Record<string, unknown>): Promise<T> => {
+      calls.push(command);
+      if (command === "load_api_settings") {
+        return {
+          providers: {
+            google_stt: { options: { project_id: "project", location: "us-central1" } },
+            xiaomi_mimo_asr: { env_name: "XIAOMI_API_KEY", base_url: "https://api.xiaomimimo.com/v1" },
+          },
+        } as T;
+      }
+      if (command === "google_stt_recognize") return { transcript: "Google result" } as T;
+      if (command === "xiaomi_mimo_asr_recognize") return { transcript: "Xiaomi result" } as T;
+      throw new Error(`unexpected command ${command}`);
+    }) as <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+    const engines = createMultiAsrEnginesByOrder(
+      ["cloud:google_stt", "cloud:xiaomi_mimo_asr"], invoke, undefined, "ja",
+    );
+    const result = await runMultiAsrOrchestration({
+      mediaPath: "C:/audio.wav",
+      mediaFileName: "audio.wav",
+      expectedDurationSec: 20,
+      engines,
+      executionMode: "compare",
+    });
+
+    expect(calls.filter((command) => command.endsWith("recognize"))).toEqual([
+      "google_stt_recognize",
+      "xiaomi_mimo_asr_recognize",
+    ]);
+    expect(result.status).toBe("compare_ready");
+    if (result.status === "compare_ready") {
+      expect(result.anchorUnavailableReason).toBe("no_segment_timing_anchor");
+      expect(result.session.results["cloud:google_stt"].document.transcriptTextWithoutTiming).toBe("Google result");
+      expect(result.session.results["cloud:xiaomi_mimo_asr"].document.transcriptTextWithoutTiming).toBe("Xiaomi result");
+      expect(result.session.results["cloud:google_stt"].document.segments).toEqual([]);
+      expect(result.session.results["cloud:google_stt"].timingGranularity).toBe("segment");
+      const staging = {
+        runId: "cloud-compare",
+        generation: 1,
+        createdAt: new Date().toISOString(),
+        result,
+      } as StagedMultiAsrResult;
+      const html = renderStagingCardHtml(staging);
+      expect(html).toContain("[時間情報なし]");
+      expect(html).not.toContain('id="btnOpenMultiAsrInEditor"');
+      expect(prepareHandoffData(staging)).toBeNull();
+    }
+    expect(calls.indexOf("google_stt_recognize")).toBeLessThan(calls.indexOf("xiaomi_mimo_asr_recognize"));
   });
 
   afterEach(() => {
@@ -664,6 +721,453 @@ describe("multi-asr-ui", () => {
       expect(staging?.result.status).toBe("partial_asr_only");
 
       orchSpy.mockRestore();
+    });
+  });
+
+  describe("Compare Mode UI & Export", () => {
+    it("Test UI-CMP-1: Compare mode runs without LLM provider configured and preserves engine order", async () => {
+      const invokedEngines: string[] = [];
+      const mockInvoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd === "load_api_settings") {
+          // LLM未設定状態
+          return {
+            providers: {},
+            asr_mode: "local",
+            asr_engine: "kotoba-whisper",
+            asr_languages: {},
+            speaker_diarization: false,
+            num_speakers: "auto",
+            output_path: "",
+            correction_enabled: false,
+            correction_provider: "ollama",
+            correction_model: "",
+          };
+        }
+        if (cmd === "local_asr_transcribe") {
+          const eng = String(args?.engine ?? "");
+          invokedEngines.push(eng);
+          return {
+            document: {
+              schemaVersion: 1,
+              mediaPath: "C:/test.wav",
+              mediaFileName: "test.wav",
+              segments: [
+                {
+                  id: `${eng}-1`,
+                  start: 0.0,
+                  end: eng === "kotoba-whisper" ? 2.5 : 10.0,
+                  speaker: null,
+                  text: `${eng} raw output`,
+                },
+              ],
+            },
+          };
+        }
+        if (cmd === "call_ollama_chat") {
+          throw new Error("LLM must not be called in compare mode");
+        }
+        return null;
+      });
+
+      setSelectedAudioDurationSecForTest(10);
+
+      await startMultiAsrFromUi({
+        targetFilePath: "C:/test.wav",
+        duration: 10,
+        executionMode: "compare",
+        engineOrder: ["reazonspeech", "kotoba-whisper"],
+        invokeFn: mockInvoke as any,
+      });
+
+      expect(invokedEngines).toEqual(["reazonspeech", "kotoba-whisper"]);
+      expect(mockInvoke).not.toHaveBeenCalledWith("call_ollama_chat", expect.anything());
+
+      const staging = getMultiAsrStaging();
+      expect(staging).not.toBeNull();
+      expect(staging?.result.status).toBe("compare_ready");
+      if (staging && staging.result.status === "compare_ready") {
+        expect(staging.result.designatedAnchorEngineId).toBe("local:reazonspeech");
+        expect(staging.result.anchorAvailable).toBe(false);
+        expect(staging.result.anchorUnavailableReason).toBe("no_segment_timing_anchor");
+
+        const html = renderStagingCardHtml(staging);
+        expect(html).toContain("ReazonSpeech v2.0");
+        expect(html).toContain("Kotoba Whisper v2.0");
+        expect(html).toContain("reazonspeech raw output");
+        expect(html).toContain("kotoba-whisper raw output");
+      }
+    });
+
+    it("renders AI 1 as the fixed timestamp anchor", () => {
+      const staging = {
+        runId: "run-anchor-2",
+        generation: 1,
+        createdAt: new Date().toISOString(),
+        result: {
+          status: "compare_ready" as const,
+          engineOrder: ["local:reazonspeech", "cloud:google_stt"],
+          designatedAnchorEngineId: "local:reazonspeech",
+          anchorAvailable: true,
+          engineRecords: [
+            { engineId: "local:reazonspeech", displayName: "ReazonSpeech", status: "success" as const, timingGranularity: "whole_audio" as const },
+            { engineId: "cloud:google_stt", displayName: "Google STT", status: "success" as const, timingGranularity: "segment" as const },
+          ],
+          session: {
+            sessionId: "anchor-2",
+            mediaPath: "C:/test.wav",
+            mediaFileName: "test.wav",
+            expectedDurationSec: 10,
+            anchorEngineId: "local:reazonspeech",
+            results: {
+              "local:reazonspeech": { engineId: "local:reazonspeech", displayName: "ReazonSpeech", durationSec: 10, completedAt: new Date().toISOString(), timingGranularity: "whole_audio" as const, document: { schemaVersion: 1, mediaPath: "C:/test.wav", mediaFileName: "test.wav", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), language: "ja", sourceEngine: "reazonspeech", sourceRunId: "a", segments: [], transcriptTextWithoutTiming: "local result" } },
+              "cloud:google_stt": { engineId: "cloud:google_stt", displayName: "Google STT", durationSec: 10, completedAt: new Date().toISOString(), timingGranularity: "segment" as const, document: { schemaVersion: 1, mediaPath: "C:/test.wav", mediaFileName: "test.wav", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), language: "ja", sourceEngine: "google_stt", sourceRunId: "b", segments: [{ id: "g1", start: 0, end: 2, text: "api result", speaker: null, originalSpeaker: null, originalText: "api result", sourceEngine: "google_stt", sourceSegmentId: "g1", sourceRunId: "b", status: "raw" as const }] } },
+            },
+            createdAt: new Date().toISOString(),
+          },
+        },
+      } as StagedMultiAsrResult;
+      const html = renderStagingCardHtml(staging);
+      expect(html).toContain("基準エンジン: ASRエンジン 1");
+      expect(html).toContain("ASRエンジン 1 (基準)");
+      expect(html).toContain("Google単語タイムスタンプ");
+    });
+
+    it("Test UI-CMP-2: Compare export payload and failed-anchor rendering do not promote 2nd engine", async () => {
+      const staging = {
+        runId: "run-cmp",
+        generation: 1,
+        createdAt: "2026-11-23T00:00:00.000Z",
+        result: {
+          status: "compare_ready" as const,
+          engineOrder: ["kotoba-whisper", "reazonspeech"],
+          designatedAnchorEngineId: "kotoba-whisper",
+          anchorAvailable: false,
+          anchorUnavailableReason: "first_engine_failed" as const,
+          engineRecords: [
+            { engineId: "kotoba-whisper", displayName: "Kotoba Whisper v2.0", status: "failed" as const, error: "OOM" },
+            { engineId: "reazonspeech", displayName: "ReazonSpeech v2.0", status: "success" as const, timingGranularity: "whole_audio" as const },
+          ],
+          session: {
+            sessionId: "sess-1",
+            mediaPath: "C:/test.wav",
+            mediaFileName: "test.wav",
+            expectedDurationSec: 10,
+            anchorEngineId: "",
+            results: {
+              reazonspeech: {
+                engineId: "reazonspeech",
+                displayName: "ReazonSpeech v2.0",
+                durationSec: 10,
+                completedAt: "2026-11-23T00:00:00.000Z",
+                timingGranularity: "whole_audio" as const,
+                document: {
+                  schemaVersion: 1 as const,
+                  mediaPath: "C:/test.wav",
+                  mediaFileName: "test.wav",
+                  createdAt: "2026-11-23T00:00:00.000Z",
+                  updatedAt: "2026-11-23T00:00:00.000Z",
+                  language: "ja",
+                  sourceEngine: "reazonspeech",
+                  sourceRunId: "run-cmp",
+                  segments: [
+                    {
+                      id: "r1",
+                      start: 0,
+                      end: 10,
+                      speaker: null,
+                      text: "Reazon only",
+                      originalSpeaker: null,
+                      originalText: "Reazon only",
+                      sourceEngine: "reazonspeech",
+                      sourceSegmentId: "r1",
+                      sourceRunId: "run-cmp",
+                      status: "raw" as const,
+                    },
+                  ],
+                },
+              },
+            },
+            createdAt: "2026-11-23T00:00:00.000Z",
+          },
+        },
+      };
+
+      const html = renderStagingCardHtml(staging);
+      expect(html).toContain("もう一方を自動で基準へ切り替えず");
+      expect(html).toContain("Reazon only");
+      expect(html).toContain("OOM");
+
+      const payload = buildCompareExportPayload(staging.result);
+      expect(payload.mode).toBe("compare");
+      expect(payload.anchorEngineId).toBe("kotoba-whisper");
+      expect(payload.anchorAvailable).toBe(false);
+      expect(payload.engineOrder).toEqual(["kotoba-whisper", "reazonspeech"]);
+      expect(payload.results).toHaveLength(2);
+    });
+
+    it("Test UI-CMP-3: Invalid timestamps render as --:--.- and invalid_anchor_timestamps displays explicit warning", async () => {
+      const { formatCompareTimestamp } = await import("./multi-asr-ui");
+      expect(formatCompareTimestamp(-1)).toBe("--:--.-");
+      expect(formatCompareTimestamp(Number.NaN)).toBe("--:--.-");
+      expect(formatCompareTimestamp(12.3)).toBe("00:12.3");
+
+      const invalidStaging = {
+        runId: "run-inv",
+        generation: 1,
+        createdAt: "2026-11-23T00:00:00.000Z",
+        result: {
+          status: "compare_ready" as const,
+          engineOrder: ["kotoba-whisper", "reazonspeech"],
+          designatedAnchorEngineId: "kotoba-whisper",
+          anchorAvailable: false,
+          anchorUnavailableReason: "invalid_anchor_timestamps" as const,
+          engineRecords: [
+            { engineId: "kotoba-whisper", displayName: "Kotoba Whisper v2.0", status: "success" as const, timingGranularity: "segment" as const },
+            { engineId: "reazonspeech", displayName: "ReazonSpeech v2.0", status: "success" as const, timingGranularity: "whole_audio" as const },
+          ],
+          session: {
+            sessionId: "sess-inv",
+            mediaPath: "C:/test.wav",
+            mediaFileName: "test.wav",
+            expectedDurationSec: 10,
+            anchorEngineId: "",
+            results: {
+              "kotoba-whisper": {
+                engineId: "kotoba-whisper",
+                displayName: "Kotoba Whisper v2.0",
+                durationSec: 10,
+                completedAt: "2026-11-23T00:00:00.000Z",
+                timingGranularity: "segment" as const,
+                document: {
+                  schemaVersion: 1 as const,
+                  mediaPath: "C:/test.wav",
+                  mediaFileName: "test.wav",
+                  createdAt: "2026-11-23T00:00:00.000Z",
+                  updatedAt: "2026-11-23T00:00:00.000Z",
+                  language: "ja",
+                  sourceEngine: "kotoba-whisper",
+                  sourceRunId: "run-inv",
+                  segments: [
+                    {
+                      id: "k1",
+                      start: -2,
+                      end: 3,
+                      speaker: null,
+                      text: "Bad timing",
+                      originalSpeaker: null,
+                      originalText: "Bad timing",
+                      sourceEngine: "kotoba-whisper",
+                      sourceSegmentId: "k1",
+                      sourceRunId: "run-inv",
+                      status: "raw" as const,
+                    },
+                  ],
+                },
+              },
+            },
+            createdAt: "2026-11-23T00:00:00.000Z",
+          },
+        },
+      };
+      const html = renderStagingCardHtml(invalidStaging);
+      expect(html).toContain("基準利用不可 (タイムスタンプ不正)");
+      expect(html).toContain("--:--.-");
+      expect(html).toContain("タイムスタンプが不正");
+      expect(html).not.toContain("基準結果を開く");
+      expect(html).not.toContain("btnOpenMultiAsrInEditor");
+
+      const { prepareHandoffData } = await import("./multi-asr-ui");
+      expect(prepareHandoffData(invalidStaging)).toBeNull();
+    });
+
+    it("Test UI-CMP-4: renders partial failure notice with survivor handoff, and blocks handoff when LLM compare correction fails", async () => {
+      const { prepareHandoffData } = await import("./multi-asr-ui");
+
+      const sharedSession = {
+        sessionId: "s-partial",
+        mediaPath: "C:/test.wav",
+        mediaFileName: "test.wav",
+        expectedDurationSec: 10,
+        anchorEngineId: "",
+        results: {
+          "local:reazonspeech": {
+            engineId: "local:reazonspeech",
+            displayName: "ReazonSpeech v2.0",
+            durationSec: 10,
+            completedAt: "2026-11-23T00:00:00.000Z",
+            timingGranularity: "segment" as const,
+            document: {
+              schemaVersion: 1 as const,
+              mediaPath: "C:/test.wav",
+              mediaFileName: "test.wav",
+              createdAt: "2026-11-23T00:00:00.000Z",
+              updatedAt: "2026-11-23T00:00:00.000Z",
+              language: "ja",
+              sourceEngine: "local:reazonspeech",
+              sourceRunId: "r-surv",
+              segments: [
+                {
+                  id: "r1",
+                  start: 0,
+                  end: 2,
+                  speaker: null,
+                  text: "生存結果",
+                  originalSpeaker: null,
+                  originalText: "生存結果",
+                  sourceEngine: "local:reazonspeech",
+                  sourceSegmentId: "r1",
+                  sourceRunId: "r-surv",
+                  status: "raw" as const,
+                },
+              ],
+            },
+          },
+        },
+        createdAt: "2026-11-23T00:00:00.000Z",
+      };
+
+      const partialStaging: StagedMultiAsrResult = {
+        runId: "run-partial",
+        generation: 1,
+        createdAt: "2026-11-23T00:00:00.000Z",
+        result: {
+          status: "compare_ready",
+          engineOrder: ["local:kotoba-whisper", "local:reazonspeech"],
+          designatedAnchorEngineId: "local:kotoba-whisper",
+          anchorAvailable: false,
+          anchorUnavailableReason: "first_engine_failed",
+          correctionStatus: "skipped_partial_failure",
+          partialAsrFailure: true,
+          engineRecords: [
+            { engineId: "local:kotoba-whisper", displayName: "Kotoba Whisper v2.0", status: "failed", error: "CUDA OOM" },
+            { engineId: "local:reazonspeech", displayName: "ReazonSpeech v2.0", status: "success", timingGranularity: "segment" },
+          ],
+          session: sharedSession,
+        },
+      };
+
+      const partialHtml = renderStagingCardHtml(partialStaging);
+      expect(partialHtml).toContain("Kotoba Whisper v2.0");
+      expect(partialHtml).toContain("CUDA OOM");
+      expect(prepareHandoffData(partialStaging)?.document.segments[0].text).toBe("生存結果");
+
+      // Google 基準自体が失敗した部分成功でも、生存側結果を保存・引き継ぎ可能
+      const googleFailedPartialStaging: StagedMultiAsrResult = {
+        runId: "run-google-partial",
+        generation: 1,
+        createdAt: "2026-11-23T00:00:00.000Z",
+        result: {
+          status: "compare_ready",
+          engineOrder: ["cloud:google_stt", "local:reazonspeech"],
+          designatedAnchorEngineId: "cloud:google_stt",
+          anchorAvailable: false,
+          anchorUnavailableReason: "first_engine_failed",
+          correctionStatus: "skipped_partial_failure",
+          partialAsrFailure: true,
+          engineRecords: [
+            { engineId: "cloud:google_stt", displayName: "Google Cloud Speech-to-Text", status: "failed", error: "403 Forbidden" },
+            { engineId: "local:reazonspeech", displayName: "ReazonSpeech v2.0", status: "success", timingGranularity: "segment" },
+          ],
+          session: sharedSession,
+        },
+      };
+      const googleFailedHtml = renderStagingCardHtml(googleFailedPartialStaging);
+      expect(googleFailedHtml).toContain('id="btnOpenMultiAsrInEditor"');
+      expect(prepareHandoffData(googleFailedPartialStaging)?.document.segments[0].text).toBe("生存結果");
+
+      const failedLlmStaging: StagedMultiAsrResult = {
+        runId: "run-llm-fail",
+        generation: 1,
+        createdAt: "2026-11-23T00:00:00.000Z",
+        result: {
+          status: "compare_ready",
+          engineOrder: ["local:kotoba-whisper", "local:reazonspeech"],
+          designatedAnchorEngineId: "local:kotoba-whisper",
+          anchorAvailable: true,
+          correctionStatus: "failed",
+          correctionError: "Ollama model missing",
+          engineRecords: [
+            { engineId: "local:kotoba-whisper", displayName: "Kotoba Whisper v2.0", status: "success", timingGranularity: "segment" },
+            { engineId: "local:reazonspeech", displayName: "ReazonSpeech v2.0", status: "success", timingGranularity: "segment" },
+          ],
+          session: sharedSession,
+        },
+      };
+      const failedHtml = renderStagingCardHtml(failedLlmStaging);
+      expect(failedHtml).toContain("Ollama model missing");
+      expect(prepareHandoffData(failedLlmStaging)).toBeNull();
+    });
+
+    it.each([
+      { modeInput: "minimal", expectedMode: "minimal" },
+      { modeInput: "aggressive", expectedMode: "aggressive" },
+    ])("Test UI-CMP-5: Compare mode propagates resolved correctionMode ($modeInput -> $expectedMode) through startMultiAsrFromUi", async ({ modeInput, expectedMode }) => {
+      const doc1 = createMockDocument("C:/test.wav", "test.wav", [
+        { id: "s1", start: 0, end: 2, text: "生結果1" },
+      ]);
+      const doc2 = createMockDocument("C:/test.wav", "test.wav", [
+        { id: "s2", start: 0, end: 2, text: "生結果2" },
+      ]);
+      const engines = [
+        {
+          engineId: "local:kotoba-whisper",
+          displayName: "Kotoba Whisper v2.0",
+          timingGranularity: "segment" as const,
+          runTranscription: vi.fn().mockResolvedValue(doc1),
+        },
+        {
+          engineId: "local:reazonspeech",
+          displayName: "ReazonSpeech v2.0",
+          timingGranularity: "segment" as const,
+          runTranscription: vi.fn().mockResolvedValue(doc2),
+        },
+      ];
+
+      let capturedMode: string | undefined;
+      const mockInvoke = vi.fn().mockImplementation(async (cmd: string, args?: any) => {
+        if (cmd === "load_api_settings") {
+          return {
+            providers: {
+              ollama: {
+                base_url: "http://localhost:11434",
+                default_model: "qwen2.5:7b-instruct",
+              },
+            },
+            correction_model: "qwen2.5:7b-instruct",
+            correction_mode: modeInput,
+            correction_use_dictionary: false,
+            correction_use_background: false,
+          };
+        }
+        if (cmd === "get_context_files") {
+          return [];
+        }
+        if (cmd === "call_ollama_chat") {
+          const userMsg = args?.messages?.find((m: any) => m.role === "user")?.content ?? "";
+          capturedMode = JSON.parse(userMsg).mode;
+          return {
+            message: {
+              content: JSON.stringify({
+                corrections: [{ segmentId: "s1", correctedText: "補正済み" }],
+              }),
+            },
+          };
+        }
+        return null;
+      });
+
+      setSelectedAudioDurationSecForTest(10);
+      await startMultiAsrFromUi({
+        targetFilePath: "C:/test.wav",
+        duration: 10,
+        executionMode: "compare",
+        engines,
+        invokeFn: mockInvoke,
+        useDictionary: false,
+        useBackground: false,
+      });
+
+      expect(capturedMode).toBe(expectedMode);
     });
   });
 });

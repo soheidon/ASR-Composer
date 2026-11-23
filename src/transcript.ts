@@ -27,6 +27,8 @@ export interface TranscriptDocument {
   sourceEngine: string | null;
   sourceRunId: string | null;
   segments: TranscriptSegment[];
+  /** Text-only cloud ASR output; kept separate so it is never mistaken for timed segments. */
+  transcriptTextWithoutTiming?: string;
 }
 
 /**

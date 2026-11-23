@@ -68,7 +68,10 @@ import {
   syncMultiAsrUiFromState,
   executeEditorHandoff,
   startMultiAsrFromUi,
+  buildCompareExportPayload,
+  MULTI_ASR_ENGINE_CATALOG,
 } from "./multi-asr-ui";
+import type { MultiAsrExecutionMode } from "./multi-asr-orchestrator";
 
 function getAppElement(): HTMLElement | null {
   return document.getElementById("app");
@@ -413,7 +416,17 @@ const transcribePage = `
 
       <section class="section-card">
         <h3 class="section-header"><span class="section-title">音声認識設定</span></h3>
-        <div class="engine-row">
+        <div class="engine-row" id="asrExecutionModeRow">
+          <label class="field-label" for="asrExecutionModeSelect">実行方式</label>
+          <div class="engine-select-wrap engine-select-wrap-execution-mode">
+            <select class="engine-select" id="asrExecutionModeSelect">
+              <option value="single" selected>1エンジン</option>
+              <option value="compare">2エンジン（比較）</option>
+            </select>
+            <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+          </div>
+        </div>
+        <div class="engine-row" id="singleAsrEngineRow">
           <label class="field-label">ASRエンジン</label>
           <div class="engine-select-wrap engine-select-wrap-mode">
             <select class="engine-select" id="asrModeSelect">
@@ -431,6 +444,52 @@ const transcribePage = `
           <button class="btn-icon" id="asrEngineSettingsBtn" title="ASRエンジン設定">
             <span class="material-symbols-outlined">tune</span>
           </button>
+        </div>
+        <div class="dual-asr-engine-group" id="dualAsrEngineRow" style="display:none;">
+          <div class="engine-row dual-asr-engine-row">
+            <label class="field-label dual-asr-engine-label" for="multiAsrFirstEngineSelect">
+              <span>ASRエンジン 1</span>
+            </label>
+            <div class="engine-select-wrap engine-select-wrap-mode">
+              <select class="engine-select" id="multiAsrFirstSourceModeSelect" aria-label="ASRエンジン1の実行先">
+                <option value="local">ローカル</option>
+                <option value="cloud">API</option>
+              </select>
+              <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+            </div>
+            <div class="engine-select-wrap engine-select-wrap-dual">
+              <select class="engine-select" id="multiAsrFirstEngineSelect"></select>
+              <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+            </div>
+          </div>
+          <div class="engine-row dual-asr-engine-row">
+            <label class="field-label dual-asr-engine-label" for="multiAsrSecondEngineSelect">ASRエンジン 2</label>
+            <div class="engine-select-wrap engine-select-wrap-mode">
+              <select class="engine-select" id="multiAsrSecondSourceModeSelect" aria-label="ASRエンジン2の実行先">
+                <option value="local">ローカル</option>
+                <option value="cloud">API</option>
+              </select>
+              <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+            </div>
+            <div class="engine-select-wrap engine-select-wrap-dual">
+              <select class="engine-select" id="multiAsrSecondEngineSelect"></select>
+              <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+            </div>
+          </div>
+          <div class="engine-row dual-asr-engine-row" id="dualAsrAnchorRow">
+            <label class="field-label dual-asr-engine-label" for="multiAsrAnchorSelect">タイムスタンプ基準</label>
+            <div class="engine-select-wrap engine-select-wrap-dual">
+              <select class="engine-select" id="multiAsrAnchorSelect" aria-label="タイムスタンプ基準エンジン">
+                <option value="1">ASRエンジン 1</option>
+                <option value="2">ASRエンジン 2</option>
+              </select>
+              <span class="material-symbols-outlined engine-select-arrow">arrow_drop_down</span>
+            </div>
+          </div>
+          <p class="dual-asr-duplicate-warning" id="dualAsrAnchorWarning" style="display:none;"></p>
+          <p class="dual-asr-duplicate-warning" id="dualAsrDuplicateWarning" style="display:none;">
+            ASRエンジン1と2に同じエンジンは設定できません（別のエンジンを選択してください）。
+          </p>
         </div>
         <div class="engine-row">
           <label class="field-label">音声の言語</label>
@@ -569,17 +628,13 @@ const transcribePage = `
           <span class="material-symbols-outlined">play_circle</span>
           <span class="btn-primary-text">文字起こしを開始</span>
         </button>
-        <button class="btn-primary btn-multi-asr" id="startMultiAsrBtn" disabled title="音声ファイルを選択するとMulti-ASRを実行できます">
-          <span class="material-symbols-outlined">auto_awesome</span>
-          <span class="btn-primary-text">Multi-ASRで文字起こし</span>
-        </button>
         <button class="btn-danger" id="cancelBtn" style="display:none">
           <span class="material-symbols-outlined">cancel</span>
           <span>中止</span>
         </button>
         <button class="btn-danger" id="cancelMultiAsrBtn" style="display:none">
           <span class="material-symbols-outlined">cancel</span>
-          <span>Multi-ASR中止</span>
+          <span>中止</span>
         </button>
       </div>
 
@@ -1283,6 +1338,25 @@ async function restoreAsrSelection(): Promise<void> {
     const outputInput = document.getElementById("outputPathInput") as HTMLInputElement | null;
     if (outputInput) outputInput.value = settings.output_path;
   }
+
+  const execModeSelect = document.getElementById("asrExecutionModeSelect") as HTMLSelectElement | null;
+  if (execModeSelect) {
+    execModeSelect.value = settings.asr_execution_mode === "compare" ? "compare" : "single";
+  }
+  const firstMultiSelect = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement | null;
+  const secondMultiSelect = document.getElementById("multiAsrSecondEngineSelect") as HTMLSelectElement | null;
+  if (firstMultiSelect && secondMultiSelect) {
+    const saved = Array.isArray(settings.multi_asr_engines) ? settings.multi_asr_engines : [];
+    await populateDualAsrEngineOptions(saved, settings.multi_asr_source_mode === "cloud" ? "cloud" : "local");
+  }
+  const anchorSelect = document.getElementById("multiAsrAnchorSelect") as HTMLSelectElement | null;
+  if (anchorSelect) {
+    anchorSelect.value = settings.multi_asr_anchor_index === 2 ? "2" : "1";
+    lastValidAnchorValue = anchorSelect.value;
+  }
+  syncDualAsrOptionAvailability();
+  syncAsrExecutionModeVisibility();
+  syncDualAsrAnchorUi();
 }
 
 async function loadAsrLanguages(): Promise<Record<string, string>> {
@@ -2525,6 +2599,52 @@ function bindStartButton(): void {
       return;
     }
 
+    const { asrExecutionMode, executionMode, engineOrder, anchorEngineId, anchorError, hasDuplicate, hasTwoEngines } =
+      getSelectedMultiAsrOptions();
+    if (asrExecutionMode === "compare") {
+      if (hasDuplicate || !hasTwoEngines) {
+        syncDualAsrOptionAvailability();
+        const { showAppDialog } = await import("./status");
+        showAppDialog({
+          title: "エラー",
+          message: hasDuplicate
+            ? "第1と第2に同一エンジンは設定できません。別のエンジンを選択してください。"
+            : "選択した方式で実行できるエンジンが2つ必要です。API設定を確認してください。",
+          type: "error",
+        });
+        return;
+      }
+      if (anchorError) {
+        syncDualAsrAnchorUi();
+        const { showAppDialog } = await import("./status");
+        showAppDialog({
+          title: "エラー",
+          message: anchorError,
+          type: "error",
+        });
+        return;
+      }
+      multiAsrCancelRequested = false;
+      await startMultiAsrFromUi({
+        targetFilePath: selectedFilePath ?? undefined,
+        duration: getSelectedAudioDurationSec(),
+        executionMode,
+        engineOrder,
+        anchorEngineId,
+        language: (document.getElementById("langSelect") as HTMLSelectElement | null)?.value || "ja",
+        invokeFn: invokeTauri,
+        showDialogFn: async (dialog) => {
+          const { showAppDialog } = await import("./status");
+          await showAppDialog(dialog);
+        },
+        onJobIdChange: (jobId, engineId) => {
+          activeMultiAsrJobId = engineId?.startsWith("local:") ? jobId : null;
+        },
+        isCancelled: () => multiAsrCancelRequested,
+      });
+      return;
+    }
+
     const outputPath =
       (document.getElementById("outputPathInput") as HTMLInputElement | null)
         ?.value.trim() ?? "";
@@ -2624,34 +2744,284 @@ export function getActiveMultiAsrJobIdForTest(): string | null {
   return activeMultiAsrJobId;
 }
 
+let dualAsrOptionsGeneration = 0;
+
 export function resetMultiAsrMainStateForTest(): void {
   activeMultiAsrJobId = null;
   activeMultiAsrRunId = null;
   multiAsrCancelRequested = false;
+  dualAsrOptionsGeneration = 0;
+}
+
+async function populateDualAsrEngineOptions(
+  preferredOrder?: string[],
+  legacySourceMode: "local" | "cloud" = "local",
+): Promise<void> {
+  const generation = ++dualAsrOptionsGeneration;
+  const firstSelect = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement | null;
+  const secondSelect = document.getElementById("multiAsrSecondEngineSelect") as HTMLSelectElement | null;
+  const firstSource = document.getElementById("multiAsrFirstSourceModeSelect") as HTMLSelectElement | null;
+  const secondSource = document.getElementById("multiAsrSecondSourceModeSelect") as HTMLSelectElement | null;
+  if (!firstSelect || !secondSelect || !firstSource || !secondSource) return;
+  const previous = preferredOrder?.length ? preferredOrder : [
+    `${firstSource.value}:${firstSelect.value}`,
+    `${secondSource.value}:${secondSelect.value}`,
+  ];
+  const parseChoice = (value: string): { source: "local" | "cloud"; id: string } => {
+    const idx = value.indexOf(":");
+    if (idx > 0) {
+      const source = value.slice(0, idx);
+      if ((source === "local" || source === "cloud") && value.slice(idx + 1)) {
+        return { source, id: value.slice(idx + 1) };
+      }
+    }
+    const isApi = value === "google_stt" || value === "xiaomi_mimo_asr";
+    return { source: isApi || legacySourceMode === "cloud" ? "cloud" : "local", id: value };
+  };
+  const decoded = previous.map((value) => parseChoice(value ?? ""));
+  firstSource.value = decoded[0]?.source ?? "local";
+  secondSource.value = decoded[1]?.source ?? "local";
+
+  let configuredApis: Array<{ engineId: string; displayName: string }> = [];
+  if (firstSource.value === "cloud" || secondSource.value === "cloud") {
+    try {
+      configuredApis = (await loadConfiguredAsrProviders())
+        .filter((provider) => provider.id === "google_stt" || provider.id === "xiaomi_mimo_asr")
+        .map((provider) => ({ engineId: provider.id, displayName: provider.displayName }));
+    } catch (error) {
+      console.error("Unable to load configured cloud ASR providers:", error);
+    }
+  }
+  if (generation !== dualAsrOptionsGeneration) return;
+
+  const optionsFor = (source: "local" | "cloud") => source === "local"
+    ? MULTI_ASR_ENGINE_CATALOG.map(({ engineId, displayName }) => ({ engineId, displayName }))
+    : configuredApis;
+  const setOptions = (select: HTMLSelectElement, source: "local" | "cloud", preferred: string, fallback: string) => {
+    const engines = optionsFor(source);
+    select.innerHTML = engines.length
+      ? engines.map((engine) => `<option value="${escapeHtml(engine.engineId)}">${escapeHtml(engine.displayName)}</option>`).join("")
+      : `<option value="" disabled>設定済みで実行可能なASR APIがありません</option>`;
+    const available = new Set(engines.map((engine) => engine.engineId));
+    select.value = available.has(preferred) ? preferred : available.has(fallback) ? fallback : engines[0]?.engineId ?? "";
+    return engines;
+  };
+  const firstEngines = setOptions(firstSelect, firstSource.value as "local" | "cloud", decoded[0]?.id ?? "", firstSource.value === "local" ? "kotoba-whisper" : "google_stt");
+  const secondEngines = setOptions(secondSelect, secondSource.value as "local" | "cloud", decoded[1]?.id ?? "", secondSource.value === "local" ? "reazonspeech" : "xiaomi_mimo_asr");
+  if (secondEngines.length === 0) {
+    secondSelect.insertAdjacentHTML("beforeend", '<option value="" disabled>この方式の実行可能なASRを設定してください</option>');
+    secondSelect.value = "";
+  }
+  if (firstEngines.length === 0) firstSelect.value = "";
+
+  syncDualAsrOptionAvailability();
+}
+
+function syncDualAsrOptionAvailability(): boolean {
+  const firstSelect = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement | null;
+  const secondSelect = document.getElementById("multiAsrSecondEngineSelect") as HTMLSelectElement | null;
+  const warningEl = document.getElementById("dualAsrDuplicateWarning") as HTMLElement | null;
+  if (!firstSelect || !secondSelect) {
+    return false;
+  }
+
+  const firstVal = firstSelect.value;
+  const secondVal = secondSelect.value;
+  const hasDuplicate = Boolean(firstVal && secondVal && firstVal === secondVal);
+
+  for (const opt of Array.from(firstSelect.options)) {
+    const isTakenBySecond = opt.value === secondVal && opt.value !== firstVal;
+    opt.disabled = !opt.value || isTakenBySecond;
+    opt.title = isTakenBySecond ? "第2エンジンで選択中のため選択できません" : "";
+  }
+  for (const opt of Array.from(secondSelect.options)) {
+    const isTakenByFirst = opt.value === firstVal && opt.value !== secondVal;
+    opt.disabled = !opt.value || isTakenByFirst;
+    opt.title = isTakenByFirst ? "第1エンジンで選択中のため選択できません" : "";
+  }
+
+  if (warningEl) {
+    warningEl.style.display = hasDuplicate ? "" : "none";
+  }
+  return hasDuplicate;
+}
+
+function syncAsrExecutionModeVisibility(): void {
+  const execModeSelect = document.getElementById("asrExecutionModeSelect") as HTMLSelectElement | null;
+  const singleRow = document.getElementById("singleAsrEngineRow") as HTMLElement | null;
+  const dualRow = document.getElementById("dualAsrEngineRow") as HTMLElement | null;
+  const isCompare = execModeSelect?.value === "compare";
+  if (singleRow) singleRow.style.display = isCompare ? "none" : "";
+  if (dualRow) dualRow.style.display = isCompare ? "" : "none";
+  syncDualAsrOptionAvailability();
+}
+
+let lastValidAnchorValue = "1";
+
+export function validateDualAsrAnchorSelection(
+  engineOrder: string[],
+  anchorIndex: 1 | 2,
+): string | null {
+  const anchorEngine = anchorIndex === 2 ? engineOrder[1] : engineOrder[0];
+  const hasGoogle = engineOrder.includes("cloud:google_stt");
+  if (hasGoogle && anchorEngine !== "cloud:google_stt") {
+    return "Google Speech-to-Textを比較に含める場合は、Googleをタイムスタンプ基準に選択してください。";
+  }
+  if (anchorEngine === "cloud:xiaomi_mimo_asr") {
+    return "Xiaomi MiMo Speech Recognitionはタイムスタンプを返さないため、基準エンジンに選択できません。";
+  }
+  return null;
+}
+
+function syncDualAsrAnchorUi(overrideMessage?: string | null): string | null {
+  const anchorSelect = document.getElementById("multiAsrAnchorSelect") as HTMLSelectElement | null;
+  const warningEl = document.getElementById("dualAsrAnchorWarning") as HTMLElement | null;
+  const { engineOrder, anchorIndex, anchorError } = getSelectedMultiAsrOptions();
+
+  if (anchorSelect) {
+    const opt1 = anchorSelect.querySelector<HTMLOptionElement>('option[value="1"]');
+    const opt2 = anchorSelect.querySelector<HTMLOptionElement>('option[value="2"]');
+    const e1IsXiaomi = engineOrder[0] === "cloud:xiaomi_mimo_asr";
+    const e2IsXiaomi = engineOrder[1] === "cloud:xiaomi_mimo_asr";
+    if (opt1) {
+      opt1.disabled = e1IsXiaomi && anchorIndex !== 1;
+    }
+    if (opt2) {
+      opt2.disabled = e2IsXiaomi && anchorIndex !== 2;
+    }
+  }
+
+  const displayMessage = overrideMessage ?? anchorError;
+  if (warningEl) {
+    warningEl.textContent = displayMessage ?? "";
+    warningEl.style.display = displayMessage ? "" : "none";
+  }
+  if (!anchorError && anchorSelect) {
+    lastValidAnchorValue = anchorSelect.value;
+  }
+  return anchorError;
+}
+
+function getSelectedMultiAsrOptions(): {
+  asrExecutionMode: "single" | "compare";
+  executionMode: MultiAsrExecutionMode;
+  engineOrder: string[];
+  anchorIndex: 1 | 2;
+  anchorEngineId: string;
+  anchorError: string | null;
+  hasDuplicate: boolean;
+  hasTwoEngines: boolean;
+} {
+  const execModeSelect = document.getElementById("asrExecutionModeSelect") as HTMLSelectElement | null;
+  const firstSelect = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement | null;
+  const secondSelect = document.getElementById("multiAsrSecondEngineSelect") as HTMLSelectElement | null;
+  const firstSource = document.getElementById("multiAsrFirstSourceModeSelect") as HTMLSelectElement | null;
+  const secondSource = document.getElementById("multiAsrSecondSourceModeSelect") as HTMLSelectElement | null;
+  const anchorSelect = document.getElementById("multiAsrAnchorSelect") as HTMLSelectElement | null;
+  const asrExecutionMode = execModeSelect?.value === "compare" ? "compare" : "single";
+  const executionMode: MultiAsrExecutionMode = asrExecutionMode === "compare" ? "compare" : "synthesis";
+  const first = firstSelect?.value || "";
+  const second = secondSelect?.value || "";
+  const source1 = firstSource?.value === "cloud" ? "cloud" : "local";
+  const source2 = secondSource?.value === "cloud" ? "cloud" : "local";
+  const engineOrder = [first ? `${source1}:${first}` : "", second ? `${source2}:${second}` : ""];
+  const anchorIndex: 1 | 2 = anchorSelect?.value === "2" ? 2 : 1;
+  const anchorEngineId = anchorIndex === 2 ? engineOrder[1] : engineOrder[0];
+  const anchorError = validateDualAsrAnchorSelection(engineOrder, anchorIndex);
+  return {
+    asrExecutionMode,
+    executionMode,
+    engineOrder,
+    anchorIndex,
+    anchorEngineId,
+    anchorError,
+    hasDuplicate: Boolean(engineOrder[0] && engineOrder[1] && engineOrder[0] === engineOrder[1]),
+    hasTwoEngines: Boolean(engineOrder[0] && engineOrder[1] && engineOrder[0] !== engineOrder[1]),
+  };
+}
+
+let multiAsrSaveQueue: Promise<void> = Promise.resolve();
+let multiAsrSaveGeneration = 0;
+
+function saveMultiAsrSelection(): Promise<void> {
+  const gen = ++multiAsrSaveGeneration;
+  multiAsrSaveQueue = multiAsrSaveQueue
+    .catch(() => {})
+    .then(async () => {
+      if (gen !== multiAsrSaveGeneration) {
+        return;
+      }
+      const { asrExecutionMode, executionMode, engineOrder, anchorIndex, anchorError, hasDuplicate, hasTwoEngines } =
+        getSelectedMultiAsrOptions();
+      if (hasDuplicate || !hasTwoEngines || anchorError) {
+        return;
+      }
+      try {
+        await invokeTauri("save_multi_asr_settings", {
+          executionMode: asrExecutionMode,
+          mode: executionMode,
+          sourceMode: "mixed",
+          engines: engineOrder,
+          anchorIndex,
+        });
+      } catch (error) {
+        console.error("save_multi_asr_settings error:", error);
+      }
+    });
+  return multiAsrSaveQueue;
 }
 
 function bindMultiAsrButtons(): void {
-  const startMultiBtn = document.getElementById("startMultiAsrBtn");
   const cancelMultiBtn = document.getElementById("cancelMultiAsrBtn") as HTMLButtonElement | null;
   const resultSection = document.getElementById("multiAsrResultSection");
+  const execModeSelect = document.getElementById("asrExecutionModeSelect") as HTMLSelectElement | null;
+  const firstSourceSelect = document.getElementById("multiAsrFirstSourceModeSelect") as HTMLSelectElement | null;
+  const secondSourceSelect = document.getElementById("multiAsrSecondSourceModeSelect") as HTMLSelectElement | null;
+  const firstSelect = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement | null;
+  const secondSelect = document.getElementById("multiAsrSecondEngineSelect") as HTMLSelectElement | null;
+  const anchorSelect = document.getElementById("multiAsrAnchorSelect") as HTMLSelectElement | null;
 
-  startMultiBtn?.addEventListener("click", async () => {
-    multiAsrCancelRequested = false;
-    await startMultiAsrFromUi({
-      targetFilePath: selectedFilePath ?? undefined,
-      duration: getSelectedAudioDurationSec(),
-      invokeFn: invokeTauri,
-      showDialogFn: async (dialog) => {
-        const { showAppDialog } = await import("./status");
-        await showAppDialog(dialog);
-      },
-      onJobIdChange: (jobId) => {
-        activeMultiAsrJobId = jobId;
-      },
-      isCancelled: () => multiAsrCancelRequested,
-    });
+  execModeSelect?.addEventListener("change", () => {
+    syncAsrExecutionModeVisibility();
+    syncDualAsrAnchorUi();
+    void saveMultiAsrSelection();
   });
-
+  const onEngineSourceChange = () => {
+    const current = getSelectedMultiAsrOptions();
+    void populateDualAsrEngineOptions(current.engineOrder, "local")
+      .then(() => {
+        syncDualAsrAnchorUi();
+        return saveMultiAsrSelection();
+      });
+  };
+  firstSourceSelect?.addEventListener("change", onEngineSourceChange);
+  secondSourceSelect?.addEventListener("change", onEngineSourceChange);
+  firstSelect?.addEventListener("change", () => {
+    const hasDuplicate = syncDualAsrOptionAvailability();
+    syncDualAsrAnchorUi();
+    if (!hasDuplicate) {
+      void saveMultiAsrSelection();
+    }
+  });
+  secondSelect?.addEventListener("change", () => {
+    const hasDuplicate = syncDualAsrOptionAvailability();
+    syncDualAsrAnchorUi();
+    if (!hasDuplicate) {
+      void saveMultiAsrSelection();
+    }
+  });
+  anchorSelect?.addEventListener("change", () => {
+    const { engineOrder, anchorIndex } = getSelectedMultiAsrOptions();
+    const err = validateDualAsrAnchorSelection(engineOrder, anchorIndex);
+    if (err) {
+      anchorSelect.value = lastValidAnchorValue;
+      syncDualAsrAnchorUi(err);
+      return;
+    }
+    lastValidAnchorValue = anchorSelect.value;
+    syncDualAsrAnchorUi(null);
+    void saveMultiAsrSelection();
+  });
   cancelMultiBtn?.addEventListener("click", async () => {
     multiAsrCancelRequested = true;
     cancelMultiBtn.disabled = true;
@@ -2668,6 +3038,20 @@ function bindMultiAsrButtons(): void {
   });
 
   resultSection?.addEventListener("click", async (e) => {
+    const copyBtn = (e.target as HTMLElement).closest<HTMLElement>("#btnCopyMultiAsrCompareJson");
+    if (copyBtn) {
+      const staging = getMultiAsrStaging();
+      if (staging && staging.result.status === "compare_ready") {
+        const payload = buildCompareExportPayload(staging.result);
+        try {
+          await navigator.clipboard?.writeText(JSON.stringify(payload, null, 2));
+        } catch (err) {
+          console.error("Failed to copy compare JSON:", err);
+        }
+      }
+      return;
+    }
+
     const target = (e.target as HTMLElement).closest<HTMLElement>("#btnOpenMultiAsrInEditor");
     if (!target) return;
     const staging = getMultiAsrStaging();

@@ -54,6 +54,26 @@ fn default_true() -> bool {
     true
 }
 
+fn default_asr_execution_mode() -> String {
+    "single".to_string()
+}
+
+fn default_multi_asr_mode() -> String {
+    "synthesis".to_string()
+}
+
+fn default_multi_asr_engines() -> Vec<String> {
+    vec!["kotoba-whisper".to_string(), "reazonspeech".to_string()]
+}
+
+fn default_multi_asr_source_mode() -> String {
+    "local".to_string()
+}
+
+fn default_multi_asr_anchor_index() -> u8 {
+    1
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppSettings {
     pub providers: HashMap<String, ProviderSettings>,
@@ -81,6 +101,16 @@ pub struct AppSettings {
     pub correction_use_dictionary: bool,
     #[serde(default = "default_true")]
     pub correction_use_background: bool,
+    #[serde(default = "default_asr_execution_mode")]
+    pub asr_execution_mode: String, // "single" | "compare"
+    #[serde(default = "default_multi_asr_mode")]
+    pub multi_asr_mode: String, // "synthesis" | "compare"
+    #[serde(default = "default_multi_asr_engines")]
+    pub multi_asr_engines: Vec<String>, // 実行順の2エンジンID
+    #[serde(default = "default_multi_asr_source_mode")]
+    pub multi_asr_source_mode: String, // legacy source mode; "mixed" means per-engine source selection
+    #[serde(default = "default_multi_asr_anchor_index")]
+    pub multi_asr_anchor_index: u8, // 1 or 2 (default 1)
 }
 
 impl Default for AppSettings {
@@ -99,6 +129,11 @@ impl Default for AppSettings {
             correction_mode: "standard".to_string(),
             correction_use_dictionary: true,
             correction_use_background: true,
+            asr_execution_mode: default_asr_execution_mode(),
+            multi_asr_mode: default_multi_asr_mode(),
+            multi_asr_engines: default_multi_asr_engines(),
+            multi_asr_source_mode: default_multi_asr_source_mode(),
+            multi_asr_anchor_index: default_multi_asr_anchor_index(),
         }
     }
 }
@@ -332,6 +367,114 @@ fn save_correction_settings(
     if let Some(ub) = use_background {
         settings.correction_use_background = ub;
     }
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+fn validate_and_normalize_multi_asr_settings(
+    mode: &str,
+    engines: &[String],
+    legacy_source_mode: &str,
+) -> Result<(String, Vec<String>), String> {
+    let normalized_mode = match mode.trim() {
+        "synthesis" => "synthesis".to_string(),
+        "compare" => "compare".to_string(),
+        other => return Err(format!("未対応のMulti-ASRモードです: {other}")),
+    };
+    if engines.len() != 2 {
+        return Err("Multi-ASRエンジンは2つ指定してください".to_string());
+    }
+    let normalize_engine = |value: &str| -> Result<String, String> {
+        let (source, id) = if let Some((prefix, id)) = value.trim().split_once(':') {
+            (prefix, id)
+        } else {
+            let id = value.trim();
+            let source = match legacy_source_mode.trim() {
+                "mixed" if ["google_stt", "xiaomi_mimo_asr"].contains(&id) => "cloud",
+                "mixed" => "local",
+                other => other,
+            };
+            (source, id)
+        };
+        let is_allowed = match source {
+            "local" => ["kotoba-whisper", "reazonspeech", "qwen3-asr"].contains(&id),
+            "cloud" => ["google_stt", "xiaomi_mimo_asr"].contains(&id),
+            _ => false,
+        };
+        if !is_allowed {
+            return Err("未対応のASRエンジンが含まれています".to_string());
+        }
+        Ok(format!("{source}:{id}"))
+    };
+    let first = normalize_engine(&engines[0])?;
+    let second = normalize_engine(&engines[1])?;
+    if first == second {
+        return Err("第1エンジンと第2エンジンには異なるエンジンを選択してください".to_string());
+    }
+    Ok((normalized_mode, vec![first, second]))
+}
+
+fn validate_multi_asr_anchor_index(
+    engines: &[String],
+    anchor_index: u8,
+) -> Result<u8, String> {
+    if anchor_index != 1 && anchor_index != 2 {
+        return Err("タイムスタンプ基準は 1 または 2 を指定してください".to_string());
+    }
+    let anchor_engine = &engines[(anchor_index - 1) as usize];
+    if engines.iter().any(|e| e == "cloud:google_stt") && anchor_engine != "cloud:google_stt" {
+        return Err(
+            "Google Speech-to-Textを比較に含める場合は、Googleをタイムスタンプ基準に指定してください"
+                .to_string(),
+        );
+    }
+    if anchor_engine == "cloud:xiaomi_mimo_asr" {
+        return Err(
+            "Xiaomi MiMo ASRは時刻情報を持たないため、タイムスタンプ基準に選択できません"
+                .to_string(),
+        );
+    }
+    Ok(anchor_index)
+}
+
+#[tauri::command]
+fn save_multi_asr_settings(
+    app: tauri::AppHandle,
+    mode: String,
+    engines: Vec<String>,
+    execution_mode: Option<String>,
+    source_mode: Option<String>,
+    anchor_index: Option<u8>,
+) -> Result<(), String> {
+    let normalized_source_mode = match source_mode.as_deref().unwrap_or("local").trim() {
+        "local" => "local",
+        "cloud" => "cloud",
+        "mixed" => "mixed",
+        other => return Err(format!("未対応のASR方式です: {other}")),
+    };
+    let (normalized_mode, normalized_engines) =
+        validate_and_normalize_multi_asr_settings(&mode, &engines, normalized_source_mode)?;
+    let normalized_anchor_index = match anchor_index {
+        Some(idx) => Some(validate_multi_asr_anchor_index(&normalized_engines, idx)?),
+        None => None,
+    };
+    let normalized_exec_mode = match execution_mode.as_deref().map(str::trim) {
+        None => None,
+        Some("single") => Some("single".to_string()),
+        Some("compare") => Some("compare".to_string()),
+        Some(other) => return Err(format!("未対応の実行方式です: {other}")),
+    };
+    let path = settings_path(&app);
+    let mut settings = load_settings(&app);
+    if let Some(em) = normalized_exec_mode {
+        settings.asr_execution_mode = em;
+    }
+    if let Some(ai) = normalized_anchor_index {
+        settings.multi_asr_anchor_index = ai;
+    }
+    settings.multi_asr_mode = normalized_mode;
+    settings.multi_asr_engines = normalized_engines;
+    settings.multi_asr_source_mode = normalized_source_mode.to_string();
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     fs::write(&path, json).map_err(|e| e.to_string())
 }
@@ -3157,8 +3300,19 @@ pub struct GoogleSttRecognizeInput {
 #[serde(rename_all = "camelCase")]
 pub struct GoogleSttRecognizeSegment {
     pub transcript: String,
+    pub start_offset: Option<String>,
+    pub end_offset: Option<String>,
+    pub words: Vec<GoogleSttWordInfo>,
     pub confidence: Option<f64>,
     pub language_code: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleSttWordInfo {
+    pub word: String,
+    pub start_offset: Option<String>,
+    pub end_offset: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -3166,6 +3320,7 @@ pub struct GoogleSttRecognizeSegment {
 pub struct GoogleSttRecognizeResult {
     pub transcript: String,
     pub segments: Vec<GoogleSttRecognizeSegment>,
+    pub raw_response: serde_json::Value,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -3523,6 +3678,7 @@ fn build_google_stt_request_body(
             "autoDecodingConfig": {},
             "languageCodes": [language_code],
             "model": model,
+            "features": { "enableWordTimeOffsets": true },
         },
         "content": base64_audio,
     })
@@ -3558,6 +3714,35 @@ fn parse_google_stt_response(json: &serde_json::Value) -> Result<GoogleSttRecogn
                 .get("languageCode")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let words: Vec<GoogleSttWordInfo> = alt
+                .get("words")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|word| {
+                            let text = word.get("word").and_then(|v| v.as_str())?;
+                            Some(GoogleSttWordInfo {
+                                word: text.to_string(),
+                                start_offset: word
+                                    .get("startOffset")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                end_offset: word
+                                    .get("endOffset")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let start_offset = words.iter().find_map(|w| w.start_offset.clone());
+            let end_offset = result
+                .get("resultEndOffset")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| words.iter().rev().find_map(|w| w.end_offset.clone()));
 
             if !transcript.is_empty() {
                 full_transcript.push_str(&transcript);
@@ -3565,6 +3750,9 @@ fn parse_google_stt_response(json: &serde_json::Value) -> Result<GoogleSttRecogn
 
             segments.push(GoogleSttRecognizeSegment {
                 transcript,
+                start_offset,
+                end_offset,
+                words,
                 confidence,
                 language_code,
             });
@@ -3574,6 +3762,7 @@ fn parse_google_stt_response(json: &serde_json::Value) -> Result<GoogleSttRecogn
     Ok(GoogleSttRecognizeResult {
         transcript: full_transcript,
         segments,
+        raw_response: json.clone(),
     })
 }
 
@@ -5770,6 +5959,7 @@ pub fn run() {
             save_asr_selection,
             save_output_path,
             save_correction_settings,
+            save_multi_asr_settings,
             fetch_models,
             test_connection_ollama,
             call_ollama_chat,
@@ -6802,6 +6992,77 @@ mod tests {
     fn test_build_google_stt_request_body_content_is_base64() {
         let body = build_google_stt_request_body("dGVzdA==", "chirp_2", "ja-JP");
         assert_eq!(body.get("content").unwrap().as_str().unwrap(), "dGVzdA==");
+    }
+
+    #[test]
+    fn test_build_google_stt_request_body_enables_word_time_offsets() {
+        let body = build_google_stt_request_body("dGVzdA==", "chirp_2", "ja-JP");
+        let enabled = body
+            .get("config")
+            .and_then(|c| c.get("features"))
+            .and_then(|f| f.get("enableWordTimeOffsets"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(enabled, Some(true));
+    }
+
+    #[test]
+    fn test_parse_google_stt_response_preserves_raw_json_and_word_offsets() {
+        let raw = serde_json::json!({
+            "results": [
+                {
+                    "alternatives": [
+                        {
+                            "transcript": "こんにちは 世界",
+                            "confidence": 0.95,
+                            "words": [
+                                { "word": "こんにちは", "startOffset": "0.100s", "endOffset": "0.850s" },
+                                { "word": "世界", "startOffset": "0.900s", "endOffset": "1.500s" }
+                            ]
+                        }
+                    ],
+                    "resultEndOffset": "1.600s",
+                    "languageCode": "ja-JP"
+                }
+            ],
+            "metadata": { "totalBilledDuration": "2s" }
+        });
+
+        let parsed = parse_google_stt_response(&raw).unwrap();
+        assert_eq!(parsed.transcript, "こんにちは 世界");
+        assert_eq!(parsed.raw_response, raw);
+        assert_eq!(parsed.segments.len(), 1);
+        assert_eq!(parsed.segments[0].start_offset.as_deref(), Some("0.100s"));
+        assert_eq!(parsed.segments[0].end_offset.as_deref(), Some("1.600s"));
+        assert_eq!(parsed.segments[0].words.len(), 2);
+        assert_eq!(parsed.segments[0].words[0].word, "こんにちは");
+        assert_eq!(parsed.segments[0].words[0].start_offset.as_deref(), Some("0.100s"));
+        assert_eq!(parsed.segments[0].words[0].end_offset.as_deref(), Some("0.850s"));
+        assert_eq!(parsed.segments[0].words[1].word, "世界");
+        assert_eq!(parsed.segments[0].words[1].start_offset.as_deref(), Some("0.900s"));
+        assert_eq!(parsed.segments[0].words[1].end_offset.as_deref(), Some("1.500s"));
+    }
+
+    #[test]
+    fn test_multi_asr_anchor_index_defaults_and_constraints() {
+        let json = r#"{"providers":{}}"#;
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.multi_asr_anchor_index, 1);
+
+        // Googleを含む場合はGoogleを基準にしないと拒否される
+        let engines = vec![
+            "local:kotoba-whisper".to_string(),
+            "cloud:google_stt".to_string(),
+        ];
+        assert!(validate_multi_asr_anchor_index(&engines, 1).is_err());
+        assert_eq!(validate_multi_asr_anchor_index(&engines, 2).unwrap(), 2);
+
+        // Xiaomi MiMoは基準に選べない
+        let mimo_engines = vec![
+            "cloud:xiaomi_mimo_asr".to_string(),
+            "local:kotoba-whisper".to_string(),
+        ];
+        assert!(validate_multi_asr_anchor_index(&mimo_engines, 1).is_err());
+        assert_eq!(validate_multi_asr_anchor_index(&mimo_engines, 2).unwrap(), 2);
     }
 
     #[test]
@@ -9368,6 +9629,82 @@ mod tests {
         let json = serde_json::to_string_pretty(&settings).unwrap();
         let restored: AppSettings = serde_json::from_str(&json).unwrap();
         assert!(!restored.speaker_diarization);
+    }
+
+    #[test]
+    fn test_multi_asr_settings_backward_compatible_defaults() {
+        let json = r#"{"providers":{}}"#;
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.asr_execution_mode, "single");
+        assert_eq!(settings.multi_asr_mode, "synthesis");
+        assert_eq!(settings.multi_asr_source_mode, "local");
+        assert_eq!(
+            settings.multi_asr_engines,
+            vec!["kotoba-whisper".to_string(), "reazonspeech".to_string()]
+        );
+
+        let mut cloud = AppSettings::default();
+        cloud.multi_asr_source_mode = "cloud".to_string();
+        cloud.multi_asr_mode = "compare".to_string();
+        cloud.multi_asr_engines = vec!["google_stt".to_string(), "xiaomi_mimo_asr".to_string()];
+        let restored: AppSettings = serde_json::from_str(&serde_json::to_string(&cloud).unwrap()).unwrap();
+        assert_eq!(restored.multi_asr_source_mode, "cloud");
+        assert_eq!(restored.multi_asr_engines, cloud.multi_asr_engines);
+    }
+
+    #[test]
+    fn test_validate_and_normalize_multi_asr_settings() {
+        let (mode, engines) = validate_and_normalize_multi_asr_settings(
+            "compare",
+            &["reazonspeech".to_string(), "kotoba-whisper".to_string()],
+            "local",
+        )
+        .unwrap();
+        assert_eq!(mode, "compare");
+        assert_eq!(engines, vec!["local:reazonspeech", "local:kotoba-whisper"]);
+
+        assert!(validate_and_normalize_multi_asr_settings(
+            "invalid",
+            &["kotoba-whisper".to_string(), "reazonspeech".to_string()],
+            "local",
+        )
+        .is_err());
+
+        assert!(validate_and_normalize_multi_asr_settings(
+            "compare",
+            &["kotoba-whisper".to_string(), "kotoba-whisper".to_string()],
+            "local",
+        )
+        .is_err());
+        assert_eq!(
+            validate_and_normalize_multi_asr_settings(
+                "compare",
+                &["google_stt".to_string(), "xiaomi_mimo_asr".to_string()],
+                "cloud",
+            ).unwrap().1,
+            vec!["cloud:google_stt", "cloud:xiaomi_mimo_asr"]
+        );
+        assert!(validate_and_normalize_multi_asr_settings(
+            "compare",
+            &["google_stt".to_string(), "kotoba-whisper".to_string()],
+            "cloud",
+        ).is_err());
+        assert_eq!(
+            validate_and_normalize_multi_asr_settings(
+                "compare",
+                &["local:kotoba-whisper".to_string(), "cloud:xiaomi_mimo_asr".to_string()],
+                "mixed",
+            ).unwrap().1,
+            vec!["local:kotoba-whisper", "cloud:xiaomi_mimo_asr"]
+        );
+        assert_eq!(
+            validate_and_normalize_multi_asr_settings(
+                "compare",
+                &["google_stt".to_string(), "reazonspeech".to_string()],
+                "mixed",
+            ).unwrap().1,
+            vec!["cloud:google_stt", "local:reazonspeech"]
+        );
     }
 
     #[test]

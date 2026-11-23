@@ -465,6 +465,74 @@ html, body {
   flex: 0 0 130px;
 }
 
+.engine-select-wrap-execution-mode {
+  flex: 0 1 220px;
+  min-width: 180px;
+}
+
+.engine-select-wrap-dual {
+  flex: 1 1 260px;
+  max-width: 420px;
+  min-width: 220px;
+}
+
+.dual-asr-engine-group {
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.dual-asr-engine-row {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.dual-asr-engine-label {
+  width: 120px;
+  flex: 0 0 120px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  letter-spacing: 0;
+}
+
+.dual-asr-info {
+  color: var(--on-surface-variant);
+  font-size: 19px;
+  cursor: help;
+}
+
+.dual-asr-engine-label .dual-asr-info {
+  flex: 0 0 auto;
+  font-size: 16px;
+}
+
+.dual-asr-duplicate-warning {
+  margin: 4px 0 0 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: #dc2626;
+}
+
+@media (max-width: 680px) {
+  .dual-asr-engine-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+
+  .dual-asr-engine-label {
+    width: auto;
+    flex: 0 0 auto;
+  }
+
+  .engine-select-wrap-dual {
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+}
+
 .engine-select-wrap-compact {
   flex: 0 0 100px;
 }

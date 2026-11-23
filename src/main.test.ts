@@ -2107,6 +2107,343 @@ describe("Persistent Workspace DOM Retention", () => {
     expect(opt!.disabled).toBe(false);
     expect(engineSelect.value).toBe("reazonspeech");
   });
+
+  it("Case PW-U: Unified execution mode selector switches 1/2 engine rows, removes #startMultiAsrBtn, prevents duplicates without mutating peer, and preserves other settings", async () => {
+    let savedMultiArgs: unknown = null;
+    let saveCount = 0;
+    setTauriInvokeForTest((async (command: string, args?: unknown) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          asr_execution_mode: "compare",
+          multi_asr_mode: "compare",
+          multi_asr_engines: ["qwen3-asr", "kotoba-whisper"],
+          speaker_diarization: false,
+          num_speakers: "2",
+        };
+      }
+      if (command === "save_multi_asr_settings") {
+        saveCount += 1;
+        savedMultiArgs = args;
+        return null;
+      }
+      if (command === "local_asr_get_status") {
+        return [];
+      }
+      if (command === "hf_token_get_status") {
+        return { configured: false, maskedValue: null };
+      }
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    const execModeSelect = document.getElementById("asrExecutionModeSelect") as HTMLSelectElement;
+    const singleRow = document.getElementById("singleAsrEngineRow") as HTMLElement;
+    const dualRow = document.getElementById("dualAsrEngineRow") as HTMLElement;
+    const firstSelect = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement;
+    const secondSelect = document.getElementById("multiAsrSecondEngineSelect") as HTMLSelectElement;
+    const duplicateWarning = document.getElementById("dualAsrDuplicateWarning") as HTMLElement;
+    const speakerSelect = document.getElementById("speakerDiarizationSelect") as HTMLSelectElement;
+    const numSpeakersSelect = document.getElementById("numSpeakersSelect") as HTMLSelectElement;
+
+    expect(document.getElementById("startBtn")).not.toBeNull();
+    expect(document.getElementById("startMultiAsrBtn")).toBeNull();
+    expect(execModeSelect.value).toBe("compare");
+    expect(singleRow.style.display).toBe("none");
+    expect(dualRow.style.display).toBe("");
+    expect((document.getElementById("multiAsrFirstSourceModeSelect") as HTMLSelectElement).value).toBe("local");
+    expect((document.getElementById("multiAsrSecondSourceModeSelect") as HTMLSelectElement).value).toBe("local");
+    expect(document.querySelector('label[for="multiAsrFirstEngineSelect"]')?.textContent).toContain("ASRエンジン 1");
+    expect((document.getElementById("multiAsrAnchorSelect") as HTMLSelectElement | null)?.value).toBe("1");
+    expect(document.getElementById("dualAsrGuidance")).toBeNull();
+    expect(firstSelect.closest(".engine-select-wrap")?.classList.contains("engine-select-wrap-dual")).toBe(true);
+    expect(secondSelect.closest(".engine-select-wrap")?.classList.contains("engine-select-wrap-dual")).toBe(true);
+    expect(firstSelect.value).toBe("qwen3-asr");
+    expect(secondSelect.value).toBe("kotoba-whisper");
+
+    // 相手側で選択済みの候補は無効化される
+    expect(firstSelect.querySelector<HTMLOptionElement>('option[value="kotoba-whisper"]')?.disabled).toBe(true);
+    expect(secondSelect.querySelector<HTMLOptionElement>('option[value="qwen3-asr"]')?.disabled).toBe(true);
+
+    // 仮に重複値が選択されても相手側の値は暗黙変更されず、警告表示のうえ保存しない
+    firstSelect.value = "kotoba-whisper";
+    firstSelect.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(secondSelect.value).toBe("kotoba-whisper");
+    expect(duplicateWarning.style.display).toBe("");
+    expect(saveCount).toBe(0);
+
+    // 別エンジンを選択すると警告が消え、相手側の値を維持したまま保存する
+    firstSelect.value = "reazonspeech";
+    firstSelect.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(secondSelect.value).toBe("kotoba-whisper");
+    expect(duplicateWarning.style.display).toBe("none");
+    expect(saveCount).toBe(1);
+    expect(savedMultiArgs).toEqual({
+      executionMode: "compare",
+      mode: "compare",
+      sourceMode: "mixed",
+      engines: ["local:reazonspeech", "local:kotoba-whisper"],
+      anchorIndex: 1,
+    });
+
+    // 1エンジンへ切り替えても他の認識設定値（話者分離・話者数）は維持される
+    execModeSelect.value = "single";
+    execModeSelect.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(singleRow.style.display).toBe("");
+    expect(dualRow.style.display).toBe("none");
+    expect(speakerSelect.value).toBe("false");
+    expect(numSpeakersSelect.value).toBe("2");
+    expect(savedMultiArgs).toEqual({
+      executionMode: "single",
+      mode: "synthesis",
+      sourceMode: "mixed",
+      engines: ["local:reazonspeech", "local:kotoba-whisper"],
+      anchorIndex: 1,
+    });
+  });
+
+  it("restores independent mixed local/API choices with AI 1 fixed as the anchor", async () => {
+    let savedArgs: any;
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: { options: { project_id: "project", location: "us-central1" } },
+            xiaomi_mimo_asr: { env_name: "XIAOMI_API_KEY" },
+          },
+          asr_execution_mode: "compare",
+          multi_asr_mode: "compare",
+          multi_asr_source_mode: "mixed",
+          multi_asr_engines: ["cloud:google_stt", "local:reazonspeech"],
+        };
+      }
+      if (command === "save_multi_asr_settings") {
+        savedArgs = args;
+        return null;
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    const firstSource = document.getElementById("multiAsrFirstSourceModeSelect") as HTMLSelectElement;
+    const secondSource = document.getElementById("multiAsrSecondSourceModeSelect") as HTMLSelectElement;
+    const first = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement;
+    const second = document.getElementById("multiAsrSecondEngineSelect") as HTMLSelectElement;
+    expect(firstSource.value).toBe("cloud");
+    expect(secondSource.value).toBe("local");
+    expect(first.value).toBe("google_stt");
+    expect(second.value).toBe("reazonspeech");
+    expect(Array.from(first.options).map((option) => option.value)).toContain("google_stt");
+
+    firstSource.value = "local";
+    firstSource.dispatchEvent(new Event("change"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(first.value).toBe("kotoba-whisper");
+    expect(second.value).toBe("reazonspeech");
+    expect(savedArgs).toEqual({
+      executionMode: "compare",
+      mode: "compare",
+      sourceMode: "mixed",
+      engines: ["local:kotoba-whisper", "local:reazonspeech"],
+      anchorIndex: 1,
+    });
+  });
+
+  it("allows one API engine together with one local engine", async () => {
+    let savedArgs: unknown;
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: { options: { project_id: "project", location: "us-central1" } },
+          },
+          asr_execution_mode: "compare",
+          multi_asr_source_mode: "mixed",
+          multi_asr_engines: ["kotoba-whisper", "reazonspeech"],
+        };
+      }
+      if (command === "save_multi_asr_settings") {
+        savedArgs = args;
+        return null;
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    const secondMode = document.getElementById("multiAsrSecondSourceModeSelect") as HTMLSelectElement;
+    const second = document.getElementById("multiAsrSecondEngineSelect") as HTMLSelectElement;
+    const anchorSelect = document.getElementById("multiAsrAnchorSelect") as HTMLSelectElement;
+    const anchorWarning = document.getElementById("dualAsrAnchorWarning") as HTMLElement;
+    secondMode.value = "cloud";
+    secondMode.dispatchEvent(new Event("change"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(second.value).toBe("google_stt");
+    // Google を比較に含めた時点で基準がエンジン1のままだと保存をブロックして理由を表示する
+    expect(savedArgs).toBeUndefined();
+    expect(anchorWarning.style.display).toBe("");
+    // 基準を Google (エンジン2) へ選び直すと保存される
+    anchorSelect.value = "2";
+    anchorSelect.dispatchEvent(new Event("change"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(anchorWarning.style.display).toBe("none");
+    expect(savedArgs).toEqual({
+      executionMode: "compare",
+      mode: "compare",
+      sourceMode: "mixed",
+      engines: ["local:kotoba-whisper", "cloud:google_stt"],
+      anchorIndex: 2,
+    });
+  });
+
+  it("Case PW-V: Rapid consecutive Multi-ASR setting changes serialize saves and preserve the latest selection", async () => {
+    const savedCalls: unknown[] = [];
+    let inFlight = 0;
+    let maxConcurrent = 0;
+    let releaseFirstSave!: () => void;
+
+    setTauriInvokeForTest((async (command: string, args?: unknown) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          asr_execution_mode: "compare",
+          multi_asr_mode: "compare",
+          multi_asr_engines: ["kotoba-whisper", "reazonspeech"],
+        };
+      }
+      if (command === "save_multi_asr_settings") {
+        inFlight += 1;
+        maxConcurrent = Math.max(maxConcurrent, inFlight);
+        savedCalls.push(args);
+        if (savedCalls.length === 1) {
+          await new Promise<void>((resolve) => {
+            releaseFirstSave = resolve;
+          });
+        }
+        inFlight -= 1;
+        return null;
+      }
+      if (command === "local_asr_get_status") {
+        return [];
+      }
+      if (command === "hf_token_get_status") {
+        return { configured: false, maskedValue: null };
+      }
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    const firstSelect = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement;
+    const secondSelect = document.getElementById("multiAsrSecondEngineSelect") as HTMLSelectElement;
+
+    // 1回目の保存を開始した直後（完了前）に連続で2回・3回目の変更を発火
+    firstSelect.value = "qwen3-asr";
+    firstSelect.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    secondSelect.value = "kotoba-whisper";
+    secondSelect.dispatchEvent(new Event("change"));
+    firstSelect.value = "reazonspeech";
+    firstSelect.dispatchEvent(new Event("change"));
+
+    releaseFirstSave();
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(maxConcurrent).toBe(1);
+    expect(savedCalls[savedCalls.length - 1]).toEqual({
+      executionMode: "compare",
+      mode: "compare",
+      sourceMode: "mixed",
+      engines: ["local:reazonspeech", "local:kotoba-whisper"],
+      anchorIndex: 1,
+    });
+  });
+
+  it("Case PW-W: restores violating Google+non-Google-anchor config without auto-fixing, blocks save until fixed, and rejects Xiaomi MiMo anchor", async () => {
+    let savedArgs: any;
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: { options: { project_id: "project", location: "us-central1" } },
+            xiaomi_mimo_asr: { env_name: "XIAOMI_API_KEY" },
+          },
+          asr_execution_mode: "compare",
+          multi_asr_mode: "compare",
+          multi_asr_source_mode: "mixed",
+          multi_asr_engines: ["local:kotoba-whisper", "cloud:google_stt"],
+          multi_asr_anchor_index: 1,
+        };
+      }
+      if (command === "save_multi_asr_settings") {
+        savedArgs = args;
+        return null;
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    const first = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement;
+    const second = document.getElementById("multiAsrSecondEngineSelect") as HTMLSelectElement;
+    const anchorSelect = document.getElementById("multiAsrAnchorSelect") as HTMLSelectElement;
+    const anchorWarning = document.getElementById("dualAsrAnchorWarning") as HTMLElement;
+
+    // 既存設定を自動修正しない
+    expect(first.value).toBe("kotoba-whisper");
+    expect(second.value).toBe("google_stt");
+    expect(anchorSelect.value).toBe("1");
+    expect(anchorWarning.style.display).toBe("");
+    expect(anchorWarning.textContent).toContain("Google");
+    expect(savedArgs).toBeUndefined();
+
+    // Google (2) を基準に選び直すと保存可能になる
+    anchorSelect.value = "2";
+    anchorSelect.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(anchorWarning.style.display).toBe("none");
+    expect(savedArgs).toMatchObject({ anchorIndex: 2 });
+
+    // Google 以外へ戻そうとすると拒否されて元の値 (2) に戻る
+    anchorSelect.value = "1";
+    anchorSelect.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(anchorSelect.value).toBe("2");
+    expect(anchorWarning.style.display).toBe("");
+
+    // Xiaomi MiMo は基準に選べない (まずエンジン2を xiaomi_mimo_asr にして基準1へ戻したあと、基準2への変更を試みる)
+    second.value = "xiaomi_mimo_asr";
+    second.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(anchorWarning.style.display).toBe("");
+    expect(anchorWarning.textContent).toContain("Xiaomi MiMo");
+
+    anchorSelect.value = "1";
+    anchorSelect.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(anchorSelect.value).toBe("1");
+    expect(anchorWarning.style.display).toBe("none");
+
+    anchorSelect.value = "2";
+    anchorSelect.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(anchorSelect.value).toBe("1");
+    expect(anchorWarning.style.display).toBe("");
+    expect(anchorWarning.textContent).toContain("Xiaomi MiMo");
+  });
 });
 
 
