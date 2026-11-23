@@ -10,6 +10,7 @@ export interface DockerStatus {
   desktopPath: string | null;
   errorKind: string | null;
   errorMessage: string | null;
+  dockerContext?: string | null;
 }
 
 export type DockerUiState = "checking" | "not-installed" | "cli-missing" | "stopped" | "ready" | "error";
@@ -211,6 +212,25 @@ export function renderHuggingFaceTokenSection(status: HuggingFaceTokenStatus | n
 
 // ---- Local ASR Engine ----
 
+export type LocalAsrBackendState =
+  | "cli_missing"
+  | "engine_stopped"
+  | "context_error"
+  | "image_list_error"
+  | "image_missing"
+  | "update_required"
+  | "ready";
+
+const VALID_LOCAL_ASR_STATES: ReadonlySet<string> = new Set<LocalAsrBackendState>([
+  "cli_missing",
+  "engine_stopped",
+  "context_error",
+  "image_list_error",
+  "image_missing",
+  "update_required",
+  "ready",
+]);
+
 export interface LocalAsrEngineStatus {
   engine: string;
   displayName: string;
@@ -223,8 +243,94 @@ export interface LocalAsrEngineStatus {
   modelName: string | null;
   dockerAvailable: boolean;
   dockerRunning: boolean;
-  errorKind: string | null; // "daemon-unavailable" | "inspect-error" | null
+  errorKind: string | null;
   errorMessage: string | null;
+  state?: LocalAsrBackendState | string;
+  dockerContext?: string | null;
+  reason?: string | null;
+}
+
+export function resolveLocalAsrState(status: LocalAsrEngineStatus): LocalAsrBackendState {
+  if (status.state && VALID_LOCAL_ASR_STATES.has(status.state)) {
+    return status.state as LocalAsrBackendState;
+  }
+  if (!status.dockerAvailable) return "cli_missing";
+  if (status.errorKind === "context_error") return "context_error";
+  if (!status.dockerRunning || status.errorKind === "daemon-unavailable" || status.errorKind === "engine_stopped") {
+    return "engine_stopped";
+  }
+  if (status.errorKind === "inspect-error" || status.errorKind === "image_list_error") {
+    return "image_list_error";
+  }
+  if (!status.installed) return "image_missing";
+  if (status.needsUpdate) return "update_required";
+  return "ready";
+}
+
+export interface LocalAsrOptionPresentation {
+  engine: string;
+  label: string;
+  selectable: boolean;
+  state: LocalAsrBackendState;
+  reason: string | null;
+}
+
+export function getLocalAsrOptionPresentation(
+  status: LocalAsrEngineStatus,
+): LocalAsrOptionPresentation {
+  const state = resolveLocalAsrState(status);
+  const reason = status.reason ?? status.errorMessage ?? null;
+  switch (state) {
+    case "ready":
+      return {
+        engine: status.engine,
+        label: status.displayName,
+        selectable: true,
+        state,
+        reason: null,
+      };
+    case "image_missing":
+      return {
+        engine: status.engine,
+        label: `${status.displayName}（未インストール）`,
+        selectable: false,
+        state,
+        reason: reason ?? "未インストール",
+      };
+    case "update_required":
+      return {
+        engine: status.engine,
+        label: `${status.displayName}（更新が必要）`,
+        selectable: false,
+        state,
+        reason: reason ?? "更新が必要",
+      };
+    case "cli_missing":
+      return {
+        engine: status.engine,
+        label: `${status.displayName}（Docker未導入）`,
+        selectable: false,
+        state,
+        reason: reason ?? "Docker CLIが見つかりません",
+      };
+    case "engine_stopped":
+      return {
+        engine: status.engine,
+        label: `${status.displayName}（Docker未起動）`,
+        selectable: false,
+        state,
+        reason: reason ?? "Docker Engineが起動していません",
+      };
+    case "context_error":
+    case "image_list_error":
+      return {
+        engine: status.engine,
+        label: `${status.displayName}（状態取得失敗・要再試行）`,
+        selectable: false,
+        state,
+        reason: reason ?? "Dockerイメージの状態を取得できませんでした",
+      };
+  }
 }
 
 export type LocalAsrUiState =
@@ -257,11 +363,15 @@ export function getLocalAsrUiState(
   status: LocalAsrEngineStatus | null,
   installState?: LocalAsrInstallState,
 ): LocalAsrUiState {
-  // Docker異常は常に最優先
-  if (status && !status.dockerAvailable) return "no-docker";
-  if (status && !status.dockerRunning) return "docker-stopped";
-  if (status?.errorKind === "daemon-unavailable") return "daemon-unavailable";
-  if (status?.errorKind === "inspect-error") return "inspect-error";
+  if (status) {
+    const resolved = resolveLocalAsrState(status);
+    // Docker異常は常に最優先
+    if (resolved === "cli_missing") return "no-docker";
+    if (resolved === "engine_stopped") {
+      return !status.dockerRunning ? "docker-stopped" : "daemon-unavailable";
+    }
+    if (resolved === "context_error" || resolved === "image_list_error") return "inspect-error";
+  }
 
   // インストール状態（loading より優先）
   if (installState?.status === "installing") return "installing";
@@ -272,8 +382,9 @@ export function getLocalAsrUiState(
 
   // 通常判定
   if (!status) return "loading";
-  if (!status.installed) return "not-installed";
-  if (status.needsUpdate) return "needs-update";
+  const resolved = resolveLocalAsrState(status);
+  if (resolved === "image_missing") return "not-installed";
+  if (resolved === "update_required") return "needs-update";
   return "installed";
 }
 
@@ -576,13 +687,14 @@ export function renderLocalAsrEngineCard(e: LocalAsrEngineStatus, installState?:
         </div>`;
       break;
     }
-    case "daemon-unavailable":
+    case "daemon-unavailable": {
+      const desc = e.reason ?? e.errorMessage ?? "Docker Desktopの起動完了後に再確認してください。";
       statusHtml = `
         <div class="docker-status-row">
           <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-warning, #f59e0b);">warning</span>
           <span>Docker Engineへ接続できませんでした</span>
         </div>
-        <p class="docker-status-desc">Docker Desktopの起動完了後に再確認してください。</p>
+        <p class="docker-status-desc">${escapeHtml(desc)}</p>
         <div class="docker-status-actions">
           <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
             <span class="material-symbols-outlined">refresh</span>
@@ -590,13 +702,17 @@ export function renderLocalAsrEngineCard(e: LocalAsrEngineStatus, installState?:
           </button>
         </div>`;
       break;
-    case "inspect-error":
+    }
+    case "inspect-error": {
+      const desc = e.reason ?? e.errorMessage ?? "しばらく待ってから再確認してください。";
+      const ctxLine = e.dockerContext ? `<p class="docker-detail-item">Docker context: ${escapeHtml(e.dockerContext)}</p>` : "";
       statusHtml = `
         <div class="docker-status-row">
           <span class="material-symbols-outlined" style="font-size: 18px; color: var(--color-error, #ef4444);">error</span>
           <span>インストール状態を確認できませんでした</span>
         </div>
-        <p class="docker-status-desc">しばらく待ってから再確認してください。</p>
+        <p class="docker-status-desc">${escapeHtml(desc)}</p>
+        ${ctxLine ? `<div class="local-asr-details">${ctxLine}</div>` : ""}
         <div class="docker-status-actions">
           <button class="btn-docker-refresh" type="button" data-local-asr-refresh>
             <span class="material-symbols-outlined">refresh</span>
@@ -604,6 +720,7 @@ export function renderLocalAsrEngineCard(e: LocalAsrEngineStatus, installState?:
           </button>
         </div>`;
       break;
+    }
   }
 
   return `

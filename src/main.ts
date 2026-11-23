@@ -25,6 +25,8 @@ import {
   renderLocalAsrEngineCard,
   getLocalAsrProgressDisplay,
   getLocalAsrDisplayName,
+  getLocalAsrOptionPresentation,
+  resolveLocalAsrState,
   escapeHtml,
 } from "./docker";
 import type { DockerStatus, HuggingFaceTokenStatus, HuggingFaceTokenSaveResult, LocalAsrEngineStatus, LocalAsrProgress, LocalAsrInstallState } from "./docker";
@@ -929,6 +931,36 @@ const localAsrInstallStates = new Map<string, LocalAsrInstallState>();
 const localAsrInstallPromises = new Map<string, Promise<void>>();
 let localAsrProgressListenerPromise: Promise<void> | null = null;
 let cachedLocalAsrStatuses: LocalAsrEngineStatus[] = [];
+let cachedLocalAsrStatusesValid = false;
+let transcribeLocalEnginesNeedRefresh = true;
+let localAsrCacheEpoch = 0;
+let localAsrTranscribePopulateRevision = 0;
+
+function invalidateLocalAsrStatusCache(): void {
+  localAsrCacheEpoch += 1;
+  cachedLocalAsrStatusesValid = false;
+  transcribeLocalEnginesNeedRefresh = true;
+}
+
+function hasTransientLocalAsrFailure(statuses: readonly LocalAsrEngineStatus[]): boolean {
+  return statuses.some((s) => {
+    const state = resolveLocalAsrState(s);
+    return (
+      state === "cli_missing" ||
+      state === "engine_stopped" ||
+      state === "context_error" ||
+      state === "image_list_error"
+    );
+  });
+}
+
+function shouldRefreshTranscribeLocalEngines(): boolean {
+  return (
+    !cachedLocalAsrStatusesValid ||
+    transcribeLocalEnginesNeedRefresh ||
+    hasTransientLocalAsrFailure(cachedLocalAsrStatuses)
+  );
+}
 
 // ---- Provider Config: Dirty / Revision / Save Queue ----
 
@@ -1060,37 +1092,107 @@ async function populateCloudEngines(select: HTMLSelectElement): Promise<void> {
     .join("");
 }
 
-async function populateLocalEngines(select: HTMLSelectElement): Promise<void> {
-  const statuses = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status");
-  const available = statuses.filter((status) => status.installed && !status.needsUpdate);
-  if (available.length === 0) {
+async function populateLocalEngines(
+  select: HTMLSelectElement,
+  expectedNavId?: number,
+): Promise<void> {
+  const populateRevision = ++localAsrTranscribePopulateRevision;
+  const epochAtStart = localAsrCacheEpoch;
+  let statuses: LocalAsrEngineStatus[];
+  try {
+    statuses = await fetchLocalAsrStatuses(epochAtStart);
+  } catch (e) {
+    console.error("populateLocalEngines error:", e);
+    if (
+      populateRevision !== localAsrTranscribePopulateRevision ||
+      (expectedNavId !== undefined && expectedNavId !== navigationGeneration) ||
+      !select.isConnected
+    ) {
+      return;
+    }
+    transcribeLocalEnginesNeedRefresh = true;
+    cachedLocalAsrStatusesValid = false;
     select.innerHTML = `
       <option value="" selected disabled>
-        利用可能なローカルASRがありません（要インストールまたは更新）
+        ローカルASR状態の確認に失敗しました（再試行してください）
       </option>
     `;
     select.value = "";
     return;
   }
-  select.innerHTML = statuses
-    .map((status) => {
-      let label = status.displayName;
-      let isSelectable = false;
-      if (!status.installed) {
-        label = `${status.displayName}（未インストール）`;
-      } else if (status.needsUpdate) {
-        label = `${status.displayName}（更新が必要）`;
-      } else {
-        isSelectable = true;
-      }
-      const disabled = isSelectable ? "" : "disabled";
+
+  if (
+    populateRevision !== localAsrTranscribePopulateRevision ||
+    (expectedNavId !== undefined && expectedNavId !== navigationGeneration) ||
+    !select.isConnected
+  ) {
+    return;
+  }
+  const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement | null;
+  if (modeSelect && modeSelect.value !== "local") {
+    return;
+  }
+
+  const presentations = statuses.map((status) => getLocalAsrOptionPresentation(status));
+  const available = presentations.filter((p) => p.selectable);
+  const optionHtml = presentations
+    .map((p) => {
+      const disabled = p.selectable ? "" : "disabled";
+      const titleAttr = p.reason ? ` title="${escapeHtml(p.reason)}"` : "";
       return (
-        `<option value="${escapeHtml(status.engine)}" ${disabled}>` +
-        `${escapeHtml(label)}` +
+        `<option value="${escapeHtml(p.engine)}" ${disabled}${titleAttr}>` +
+        `${escapeHtml(p.label)}` +
         `</option>`
       );
     })
     .join("");
+
+  if (available.length === 0) {
+    const hasFailure = presentations.some(
+      (p) =>
+        p.state === "cli_missing" ||
+        p.state === "engine_stopped" ||
+        p.state === "context_error" ||
+        p.state === "image_list_error",
+    );
+    const placeholder = hasFailure
+      ? "Docker状態の確認に失敗しました（設定確認・再試行してください）"
+      : "利用可能なローカルASRがありません（要インストールまたは更新）";
+    select.innerHTML =
+      `<option value="" selected disabled>${escapeHtml(placeholder)}</option>` +
+      optionHtml;
+    select.value = "";
+    if (epochAtStart === localAsrCacheEpoch) {
+      transcribeLocalEnginesNeedRefresh = hasTransientLocalAsrFailure(statuses);
+    }
+    return;
+  }
+
+  select.innerHTML = optionHtml;
+  if (epochAtStart === localAsrCacheEpoch) {
+    transcribeLocalEnginesNeedRefresh = hasTransientLocalAsrFailure(statuses);
+  }
+}
+
+async function refreshTranscribeLocalEnginesIfActive(expectedNavId?: number): Promise<void> {
+  const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement | null;
+  const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement | null;
+  if (!modeSelect || !engineSelect || modeSelect.value !== "local") {
+    return;
+  }
+  const previousValue = engineSelect.value || lastLocalEngine;
+  await populateLocalEngines(engineSelect, expectedNavId);
+  if (
+    (expectedNavId !== undefined && expectedNavId !== navigationGeneration) ||
+    !engineSelect.isConnected ||
+    modeSelect.value !== "local"
+  ) {
+    return;
+  }
+  if (hasSelectableOption(engineSelect, previousValue)) {
+    engineSelect.value = previousValue;
+  }
+  lastLocalEngine = engineSelect.value || "";
 }
 
 function hasSelectableOption(select: HTMLSelectElement, value: string): boolean {
@@ -1917,6 +2019,7 @@ export async function navigateTo(page: PageName): Promise<NavigationResult> {
 
   const activeWorkspace = getWorkspaceForPage(page);
   const workspaceKey = `workspace:${activeWorkspace}`;
+  const wasWorkspaceAlreadyMounted = pageMounts.has(workspaceKey);
 
   const workspaceMounted = await ensureMountedForNavigation(
     workspaceKey,
@@ -1952,7 +2055,14 @@ export async function navigateTo(page: PageName): Promise<NavigationResult> {
   if (navId !== navigationGeneration) return "superseded";
 
   if (page === "settings-docker") {
+    invalidateLocalAsrStatusCache();
     void loadDockerPageStatuses();
+  } else if (
+    page === "transcribe" &&
+    wasWorkspaceAlreadyMounted &&
+    shouldRefreshTranscribeLocalEngines()
+  ) {
+    await refreshTranscribeLocalEnginesIfActive(navId);
   }
 
   updateHeaderActiveNav(page);
@@ -4465,6 +4575,7 @@ async function doLocalAsrInstall(engine: string): Promise<void> {
     });
 
     // installed=true を短時間ポーリングで確認
+    invalidateLocalAsrStatusCache();
     const confirmed = await confirmLocalAsrInstalled(engine);
     if (confirmed) {
       localAsrInstallStates.delete(engine);
@@ -4472,9 +4583,12 @@ async function doLocalAsrInstall(engine: string): Promise<void> {
 
     if (currentPage === "settings-docker") {
       await loadAndRenderLocalAsrStatus();
+    } else {
+      await refreshTranscribeLocalEnginesIfActive();
     }
   } catch (e) {
     console.error("Local ASR installation failed:", e);
+    invalidateLocalAsrStatusCache();
 
     localAsrInstallStates.set(engine, {
       engine,
@@ -4512,7 +4626,9 @@ async function handleLocalAsrUninstall(
 
   try {
     await invokeTauri("local_asr_uninstall", { engine });
+    invalidateLocalAsrStatusCache();
     await loadAndRenderLocalAsrStatus();
+    await refreshTranscribeLocalEnginesIfActive();
   } catch (e) {
     console.error("local_asr_uninstall error:", e);
 
@@ -4586,17 +4702,29 @@ function reconcileConfirmedInstalls(statuses: LocalAsrEngineStatus[]): void {
   }
 }
 
-async function fetchLocalAsrStatuses(): Promise<LocalAsrEngineStatus[]> {
+async function fetchLocalAsrStatuses(expectedEpoch?: number): Promise<LocalAsrEngineStatus[]> {
+  const epochAtStart = expectedEpoch ?? localAsrCacheEpoch;
   const statuses = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status");
-  cachedLocalAsrStatuses = statuses;
-  reconcileConfirmedInstalls(statuses);
+  if (epochAtStart === localAsrCacheEpoch) {
+    cachedLocalAsrStatuses = statuses;
+    cachedLocalAsrStatusesValid = true;
+    reconcileConfirmedInstalls(statuses);
+  }
   return statuses;
 }
 
-async function fetchLocalAsrStatusesFast(): Promise<LocalAsrEngineStatus[]> {
-  const statuses = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status_fast");
-  cachedLocalAsrStatuses = statuses;
-  reconcileConfirmedInstalls(statuses);
+async function fetchLocalAsrStatusesFast(
+  dockerContext?: string | null,
+  expectedEpoch?: number,
+): Promise<LocalAsrEngineStatus[]> {
+  const epochAtStart = expectedEpoch ?? localAsrCacheEpoch;
+  const args = dockerContext !== undefined && dockerContext !== null ? { dockerContext } : undefined;
+  const statuses = await invokeTauri<LocalAsrEngineStatus[]>("local_asr_get_status_fast", args);
+  if (epochAtStart === localAsrCacheEpoch) {
+    cachedLocalAsrStatuses = statuses;
+    cachedLocalAsrStatusesValid = true;
+    reconcileConfirmedInstalls(statuses);
+  }
   return statuses;
 }
 
@@ -4667,6 +4795,7 @@ async function confirmLocalAsrInstalled(engine: string): Promise<boolean> {
 
 async function loadDockerPageStatuses(): Promise<void> {
   const revision = ++dockerPageLoadRevision;
+  invalidateLocalAsrStatusCache();
   const container = document.getElementById("localAsrContainer");
   if (!container) return;
 
@@ -4699,28 +4828,37 @@ async function loadDockerPageStatuses(): Promise<void> {
   }
 
   if (!dockerStatus.cliFound) {
+    invalidateLocalAsrStatusCache();
     container.innerHTML = renderLocalAsrSection({ kind: "docker-unavailable" });
     return;
   }
 
   if (!dockerStatus.daemonRunning) {
+    invalidateLocalAsrStatusCache();
     container.innerHTML = renderLocalAsrSection({ kind: "docker-stopped" });
     return;
   }
 
-  // 3. Local ASR状態を取得し、キャッシュ更新 + ストアと統合（daemon確認済みなのでfast使用）
-  await loadAndRenderLocalAsrStatus(revision, true);
+  // 3. Local ASR状態を取得し、キャッシュ更新 + ストアと統合（docker_check_statusで解決した同一contextを引き継ぐ）
+  await loadAndRenderLocalAsrStatus(revision, true, dockerStatus.dockerContext);
 }
 
-async function loadAndRenderLocalAsrStatus(revision?: number, useFast: boolean = false): Promise<void> {
+async function loadAndRenderLocalAsrStatus(
+  revision?: number,
+  useFast: boolean = false,
+  dockerContext?: string | null,
+): Promise<void> {
   const container = document.getElementById("localAsrContainer");
   if (!container?.isConnected) return;
 
   // 1. checking状態を表示
   container.innerHTML = renderLocalAsrSection({ kind: "loading" });
 
+  const epochAtStart = localAsrCacheEpoch;
   try {
-    const engines = useFast ? await fetchLocalAsrStatusesFast() : await fetchLocalAsrStatuses();
+    const engines = useFast
+      ? await fetchLocalAsrStatusesFast(dockerContext, epochAtStart)
+      : await fetchLocalAsrStatuses(epochAtStart);
 
     if (revision !== undefined && (revision !== dockerPageLoadRevision || currentPage !== "settings-docker")) return;
     if (!container?.isConnected) return;

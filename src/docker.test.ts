@@ -6,6 +6,8 @@ import {
   renderDockerStatusContent,
   renderHuggingFaceTokenSection,
   getLocalAsrUiState,
+  resolveLocalAsrState,
+  getLocalAsrOptionPresentation,
   renderLocalAsrSection,
   getLocalAsrProgressDisplay,
   getLocalAsrDisplayName,
@@ -779,6 +781,69 @@ describe("getLocalAsrDisplayName", () => {
 
   it("falls back to engine id when unknown", () => {
     expect(getLocalAsrDisplayName("unknown-engine")).toBe("unknown-engine");
+  });
+});
+
+describe("resolveLocalAsrState & getLocalAsrOptionPresentation", () => {
+  const base: LocalAsrEngineStatus = {
+    engine: "reazonspeech",
+    displayName: "ReazonSpeech",
+    installed: false,
+    needsUpdate: false,
+    imageName: "asr-composer-reazonspeech:cu126",
+    imageId: null,
+    environmentVersion: null,
+    expectedEnvironmentVersion: "2.1.0",
+    modelName: null,
+    dockerAvailable: true,
+    dockerRunning: true,
+    errorKind: null,
+    errorMessage: null,
+  };
+
+  it("handles all 7 unified states consistently", () => {
+    expect(resolveLocalAsrState({ ...base, state: "cli_missing", dockerAvailable: false, dockerRunning: false })).toBe("cli_missing");
+    expect(resolveLocalAsrState({ ...base, state: "engine_stopped", dockerRunning: false })).toBe("engine_stopped");
+    expect(resolveLocalAsrState({ ...base, state: "context_error", dockerRunning: false })).toBe("context_error");
+    expect(resolveLocalAsrState({ ...base, state: "image_list_error" })).toBe("image_list_error");
+    expect(resolveLocalAsrState({ ...base, state: "image_missing" })).toBe("image_missing");
+    expect(resolveLocalAsrState({ ...base, state: "update_required", installed: true, needsUpdate: true })).toBe("update_required");
+    expect(resolveLocalAsrState({ ...base, state: "ready", installed: true, needsUpdate: false })).toBe("ready");
+  });
+
+  it("distinguishes query failures from not-installed in option presentation", () => {
+    const ctxErr = getLocalAsrOptionPresentation({
+      ...base,
+      state: "context_error",
+      dockerRunning: false,
+      reason: "context取得失敗",
+    });
+    expect(ctxErr.selectable).toBe(false);
+    expect(ctxErr.label).toContain("状態取得失敗");
+    expect(ctxErr.reason).toBe("context取得失敗");
+
+    const ready = getLocalAsrOptionPresentation({
+      ...base,
+      state: "ready",
+      installed: true,
+      needsUpdate: false,
+    });
+    expect(ready.selectable).toBe(true);
+    expect(ready.label).toBe("ReazonSpeech");
+  });
+
+  it("renders reason and dockerContext in inspect-error card", () => {
+    const html = renderLocalAsrSection({
+      kind: "engines",
+      statuses: [{
+        ...base,
+        state: "image_list_error",
+        dockerContext: "desktop-linux",
+        reason: "docker image ls failed",
+      }],
+    });
+    expect(html).toContain("docker image ls failed");
+    expect(html).toContain("desktop-linux");
   });
 });
 

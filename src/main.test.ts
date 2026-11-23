@@ -1722,6 +1722,391 @@ describe("Persistent Workspace DOM Retention", () => {
     expect(kotobaOpt).toBeTruthy();
     expect(kotobaOpt!.disabled).toBe(false);
   });
+
+  it("Case PW-P: Transcribe #engineSelect distinguishes query failures from image_missing and refreshes after settings-docker visit", async () => {
+    let phase: "error" | "ready" = "error";
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          asr_mode: "local",
+        };
+      }
+      if (command === "docker_check_status") {
+        return {
+          cliFound: true,
+          cliVersion: "24.0.5",
+          daemonRunning: phase === "ready",
+          serverVersion: phase === "ready" ? "24.0.5" : null,
+          desktopFound: true,
+          cliPath: "C:\\docker.exe",
+          desktopPath: null,
+          errorKind: phase === "ready" ? null : "daemon_not_running",
+          errorMessage: phase === "ready" ? null : "Docker Engineに接続できません",
+          dockerContext: "desktop-linux",
+        };
+      }
+      if (command === "local_asr_get_status" || command === "local_asr_get_status_fast") {
+        if (phase === "error") {
+          return [
+            {
+              engine: "reazonspeech",
+              displayName: "ReazonSpeech",
+              installed: false,
+              needsUpdate: false,
+              imageName: "asr-composer-reazonspeech:cu126",
+              imageId: null,
+              environmentVersion: null,
+              expectedEnvironmentVersion: "2.1.0",
+              modelName: null,
+              dockerAvailable: true,
+              dockerRunning: false,
+              errorKind: "context_error",
+              errorMessage: "docker context show failed",
+              state: "context_error",
+              reason: "docker context show failed",
+            },
+          ];
+        }
+        return [
+          {
+            engine: "reazonspeech",
+            displayName: "ReazonSpeech",
+            installed: true,
+            needsUpdate: false,
+            imageName: "asr-composer-reazonspeech:cu126",
+            imageId: "sha256:ready",
+            environmentVersion: "2.1.0",
+            expectedEnvironmentVersion: "2.1.0",
+            modelName: "reazon-research/reazonspeech-espnet-v2",
+            dockerAvailable: true,
+            dockerRunning: true,
+            errorKind: null,
+            errorMessage: null,
+            state: "ready",
+            dockerContext: "desktop-linux",
+            reason: null,
+          },
+        ];
+      }
+      if (command === "hf_token_get_status") {
+        return { configured: false, maskedValue: null };
+      }
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    expect(engineSelect.options[0].textContent).toContain("Docker状態の確認に失敗しました");
+    expect(engineSelect.options[0].textContent).not.toContain("要インストールまたは更新");
+    expect(engineSelect.options[1].textContent).toContain("状態取得失敗");
+    expect(engineSelect.options[1].disabled).toBe(true);
+
+    // Visit settings-docker while Docker is still stopped (invalidates cache), then Docker becomes ready and return to transcribe
+    await navigateTo("settings-docker");
+    phase = "ready";
+    await navigateTo("transcribe");
+    // Wait for async refreshTranscribeLocalEnginesIfActive
+    await new Promise((r) => setTimeout(r, 0));
+
+    const refreshedOpt = Array.from(engineSelect.options).find((o) => o.value === "reazonspeech");
+    expect(refreshedOpt).toBeTruthy();
+    expect(refreshedOpt!.disabled).toBe(false);
+    expect(refreshedOpt!.textContent).toBe("ReazonSpeech");
+  });
+
+  it("Case PW-Q: settings-docker forwards resolved dockerContext from docker_check_status to local_asr_get_status_fast", async () => {
+    let receivedFastArgs: unknown = undefined;
+    setTauriInvokeForTest((async (command: string, args?: unknown) => {
+      if (command === "load_api_settings") {
+        return defaultMockSettings;
+      }
+      if (command === "docker_check_status") {
+        return {
+          cliFound: true,
+          cliVersion: "24.0.5",
+          daemonRunning: true,
+          serverVersion: "24.0.5",
+          desktopFound: true,
+          cliPath: "C:\\docker.exe",
+          desktopPath: null,
+          errorKind: null,
+          errorMessage: null,
+          dockerContext: "custom-wsl-context",
+        };
+      }
+      if (command === "local_asr_get_status_fast") {
+        receivedFastArgs = args;
+        return [
+          {
+            engine: "reazonspeech",
+            displayName: "ReazonSpeech",
+            installed: true,
+            needsUpdate: false,
+            imageName: "asr-composer-reazonspeech:cu126",
+            imageId: "sha256:ready",
+            environmentVersion: "2.1.0",
+            expectedEnvironmentVersion: "2.1.0",
+            modelName: "reazon-research/reazonspeech-espnet-v2",
+            dockerAvailable: true,
+            dockerRunning: true,
+            errorKind: null,
+            errorMessage: null,
+            state: "ready",
+            dockerContext: "custom-wsl-context",
+            reason: null,
+          },
+        ];
+      }
+      if (command === "hf_token_get_status") {
+        return { configured: false, maskedValue: null };
+      }
+      return null;
+    }) as any);
+
+    await navigateTo("settings-docker");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(receivedFastArgs).toEqual({ dockerContext: "custom-wsl-context" });
+  });
+
+  it("Case PW-R: Returning to transcribe after settings-docker confirms Docker running refreshes #engineSelect and avoids redundant queries once ready", async () => {
+    let dockerRunning = false;
+    let statusQueryCount = 0;
+    const makeEngineStatus = (running: boolean) => [
+      {
+        engine: "reazonspeech",
+        displayName: "ReazonSpeech",
+        installed: running,
+        needsUpdate: false,
+        imageName: "asr-composer-reazonspeech:cu126",
+        imageId: running ? "sha256:ready" : null,
+        environmentVersion: running ? "2.1.0" : null,
+        expectedEnvironmentVersion: "2.1.0",
+        modelName: running ? "reazon-research/reazonspeech-espnet-v2" : null,
+        dockerAvailable: true,
+        dockerRunning: running,
+        errorKind: running ? null : "engine_stopped",
+        errorMessage: running ? null : "Docker Engineが起動していません",
+        state: running ? "ready" : "engine_stopped",
+        dockerContext: "desktop-linux",
+        reason: running ? null : "Docker Engineが起動していません",
+      },
+    ];
+
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        return { ...defaultMockSettings, asr_mode: "local", asr_engine: "reazonspeech" };
+      }
+      if (command === "docker_check_status") {
+        return {
+          cliFound: true,
+          cliVersion: "24.0.5",
+          daemonRunning: dockerRunning,
+          serverVersion: dockerRunning ? "24.0.5" : null,
+          desktopFound: true,
+          cliPath: "C:\\docker.exe",
+          desktopPath: null,
+          errorKind: dockerRunning ? null : "daemon_not_running",
+          errorMessage: dockerRunning ? null : "Docker Engineが起動していません",
+          dockerContext: "desktop-linux",
+        };
+      }
+      if (command === "local_asr_get_status" || command === "local_asr_get_status_fast") {
+        statusQueryCount += 1;
+        return makeEngineStatus(dockerRunning);
+      }
+      if (command === "hf_token_get_status") {
+        return { configured: false, maskedValue: null };
+      }
+      return null;
+    }) as any);
+
+    // 1. 初回起動時は Docker 停止中
+    await navigateTo("transcribe");
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    expect(engineSelect.options[0].textContent).toContain("Docker状態の確認に失敗しました");
+    expect(engineSelect.value).toBe("");
+    expect(statusQueryCount).toBe(1);
+
+    // 2. Docker 起動後に settings-docker を訪問し、loadDockerPageStatuses() が完了してキャッシュが ready で有効化される
+    dockerRunning = true;
+    await navigateTo("settings-docker");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(statusQueryCount).toBe(2);
+
+    // 3. transcribe へ戻ると、settings-docker でキャッシュが埋まっていても #engineSelect を再同期して選択可能になる
+    await navigateTo("transcribe");
+    const refreshedOpt = Array.from(engineSelect.options).find((o) => o.value === "reazonspeech");
+    expect(refreshedOpt).toBeTruthy();
+    expect(refreshedOpt!.disabled).toBe(false);
+    expect(engineSelect.value).toBe("reazonspeech");
+    expect(statusQueryCount).toBe(3);
+
+    // 4. すでに ready が反映済みなら、editor 往復で不要な再照会をしない
+    await navigateTo("editor");
+    await navigateTo("transcribe");
+    expect(statusQueryCount).toBe(3);
+  });
+
+  it("Case PW-S: Returning to transcribe while Docker remains stopped preserves stopped state without misreporting image_missing", async () => {
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        return { ...defaultMockSettings, asr_mode: "local" };
+      }
+      if (command === "docker_check_status") {
+        return {
+          cliFound: true,
+          cliVersion: "24.0.5",
+          daemonRunning: false,
+          serverVersion: null,
+          desktopFound: true,
+          cliPath: "C:\\docker.exe",
+          desktopPath: null,
+          errorKind: "daemon_not_running",
+          errorMessage: "Docker Engineが起動していません",
+          dockerContext: "desktop-linux",
+        };
+      }
+      if (command === "local_asr_get_status" || command === "local_asr_get_status_fast") {
+        return [
+          {
+            engine: "reazonspeech",
+            displayName: "ReazonSpeech",
+            installed: false,
+            needsUpdate: false,
+            imageName: "asr-composer-reazonspeech:cu126",
+            imageId: null,
+            environmentVersion: null,
+            expectedEnvironmentVersion: "2.1.0",
+            modelName: null,
+            dockerAvailable: true,
+            dockerRunning: false,
+            errorKind: "engine_stopped",
+            errorMessage: "Docker Engineが起動していません",
+            state: "engine_stopped",
+            dockerContext: "desktop-linux",
+            reason: "Docker Engineが起動していません",
+          },
+        ];
+      }
+      if (command === "hf_token_get_status") {
+        return { configured: false, maskedValue: null };
+      }
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    await navigateTo("settings-docker");
+    await new Promise((r) => setTimeout(r, 0));
+    await navigateTo("transcribe");
+
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    expect(engineSelect.options[0].textContent).toContain("Docker状態の確認に失敗しました");
+    expect(engineSelect.options[0].textContent).not.toContain("要インストールまたは更新");
+    expect(engineSelect.options[1].disabled).toBe(true);
+  });
+
+  it("Case PW-T: Stale async local_asr_get_status response does not roll back newer ready state", async () => {
+    let resolveStale!: (value: unknown) => void;
+    let callCount = 0;
+
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        return { ...defaultMockSettings, asr_mode: "local", asr_engine: "reazonspeech" };
+      }
+      if (command === "docker_check_status") {
+        return {
+          cliFound: true,
+          cliVersion: "24.0.5",
+          daemonRunning: true,
+          serverVersion: "24.0.5",
+          desktopFound: true,
+          cliPath: "C:\\docker.exe",
+          desktopPath: null,
+          errorKind: null,
+          errorMessage: null,
+          dockerContext: "desktop-linux",
+        };
+      }
+      if (command === "local_asr_get_status") {
+        callCount += 1;
+        if (callCount === 2) {
+          return await new Promise((resolve) => {
+            resolveStale = resolve;
+          });
+        }
+        return [
+          {
+            engine: "reazonspeech",
+            displayName: "ReazonSpeech",
+            installed: true,
+            needsUpdate: false,
+            imageName: "asr-composer-reazonspeech:cu126",
+            imageId: "sha256:ready",
+            environmentVersion: "2.1.0",
+            expectedEnvironmentVersion: "2.1.0",
+            modelName: "reazon-research/reazonspeech-espnet-v2",
+            dockerAvailable: true,
+            dockerRunning: true,
+            errorKind: null,
+            errorMessage: null,
+            state: "ready",
+            dockerContext: "desktop-linux",
+            reason: null,
+          },
+        ];
+      }
+      if (command === "local_asr_get_status_fast") {
+        return [];
+      }
+      if (command === "hf_token_get_status") {
+        return { configured: false, maskedValue: null };
+      }
+      return null;
+    }) as any);
+
+    // 1. 初回表示（transcribe マウント完了）
+    await navigateTo("transcribe");
+    await navigateTo("settings-docker");
+
+    // 2. transcribe 復帰時の再取得（callCount === 2）を未完了のままにし、別の再遷移（callCount === 3）を完了させる
+    const staleReturnNav = navigateTo("transcribe");
+    await new Promise((r) => setTimeout(r, 0));
+    await navigateTo("settings-docker");
+    await navigateTo("transcribe");
+
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    expect(engineSelect.value).toBe("reazonspeech");
+
+    // 3. 遅延して古い応答が返っても DOM やキャッシュを巻き戻さない
+    resolveStale([
+      {
+        engine: "reazonspeech",
+        displayName: "ReazonSpeech",
+        installed: false,
+        needsUpdate: false,
+        imageName: "asr-composer-reazonspeech:cu126",
+        imageId: null,
+        environmentVersion: null,
+        expectedEnvironmentVersion: "2.1.0",
+        modelName: null,
+        dockerAvailable: true,
+        dockerRunning: false,
+        errorKind: "engine_stopped",
+        errorMessage: "Docker Engineが起動していません",
+        state: "engine_stopped",
+        dockerContext: "desktop-linux",
+        reason: "Docker Engineが起動していません",
+      },
+    ]);
+    await staleReturnNav;
+    await new Promise((r) => setTimeout(r, 0));
+
+    const opt = Array.from(engineSelect.options).find((o) => o.value === "reazonspeech");
+    expect(opt).toBeTruthy();
+    expect(opt!.disabled).toBe(false);
+    expect(engineSelect.value).toBe("reazonspeech");
+  });
 });
 
 

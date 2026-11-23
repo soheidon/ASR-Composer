@@ -1030,6 +1030,141 @@ pub trait DockerRuntime: Send + Sync {
     fn inspect_container(&self, cname: &str) -> impl std::future::Future<Output = Result<ContainerPresence, DockerError>> + Send;
 }
 
+#[cfg(windows)]
+pub(crate) const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Windows上でコンソールウィンドウを表示せずに `std::process::Command` を生成する。
+pub(crate) fn new_hidden_std_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Windows上でコンソールウィンドウを表示せずに `tokio::process::Command` を生成する。
+pub(crate) fn new_hidden_tokio_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Docker CLI の stderr を安全なエラーカテゴリに分類する（秘密情報を含めない）。
+fn classify_docker_cli_error_category(stderr: &str) -> &'static str {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("permission denied") || lower.contains("access denied") {
+        "permission_denied"
+    } else if lower.contains("cannot connect")
+        || lower.contains("error during connect")
+        || lower.contains("is the docker daemon running")
+        || lower.contains("failed to connect")
+        || lower.contains("dockerdesktoplinuxengine")
+        || lower.contains("docker_desktop_linux_engine")
+        || (lower.contains("open //./pipe/docker")
+            && lower.contains("the system cannot find the file specified"))
+    {
+        "daemon_unavailable"
+    } else if lower.contains("no such image") || lower.contains("no such object") || lower.contains("not found") {
+        "not_found"
+    } else if lower.contains("is being used by") {
+        "image_in_use"
+    } else if lower.contains("context") && (lower.contains("does not exist") || lower.contains("unknown")) {
+        "invalid_context"
+    } else if stderr.trim() == "empty output" {
+        "empty_output"
+    } else {
+        "cli_error"
+    }
+}
+
+/// Docker CLI の失敗ログ行を秘密情報なしで生成する（テスト可能な純粋関数）。
+fn format_docker_cli_failure_log(
+    operation: &str,
+    docker_context: Option<&str>,
+    exit_code: Option<i32>,
+    stderr: &str,
+) -> String {
+    let category = classify_docker_cli_error_category(stderr);
+    let ctx_display = docker_context
+        .filter(|c| !c.is_empty())
+        .unwrap_or("<none>");
+    let code_display = exit_code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "[docker-status] op={operation} context={ctx_display} exit_code={code_display} category={category}"
+    )
+}
+
+/// Docker CLI の失敗を秘密情報を避けて構造化ログに出力する。
+fn log_docker_cli_failure(
+    operation: &str,
+    docker_context: Option<&str>,
+    exit_code: Option<i32>,
+    stderr: &str,
+) {
+    eprintln!(
+        "{}",
+        format_docker_cli_failure_log(operation, docker_context, exit_code, stderr)
+    );
+}
+
+/// ユーザー向けエラーメッセージを安全なカテゴリのみで構築する（生stderrを含めない）。
+fn format_safe_docker_cli_error(operation: &str, exit_code: Option<i32>, stderr: &str) -> String {
+    let category = classify_docker_cli_error_category(stderr);
+    match exit_code {
+        Some(code) => format!("{operation}が失敗しました（種別: {category}, 終了コード: {code}）"),
+        None => format!("{operation}が失敗しました（種別: {category}）"),
+    }
+}
+
+/// `std::io::ErrorKind` を安全な固定カテゴリへ分類する（生OSエラー文字列を含めない）。
+fn classify_io_error_category(err: &std::io::Error) -> &'static str {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => "io_not_found",
+        std::io::ErrorKind::PermissionDenied => "io_permission_denied",
+        std::io::ErrorKind::TimedOut => "io_timeout",
+        _ => "io_error",
+    }
+}
+
+/// Docker CLI の IO/起動失敗ログ行を秘密情報なしで生成する（テスト可能な純粋関数）。
+fn format_docker_cli_io_failure_log(
+    operation: &str,
+    docker_context: Option<&str>,
+    err: &std::io::Error,
+) -> String {
+    let category = classify_io_error_category(err);
+    let ctx_display = docker_context
+        .filter(|c| !c.is_empty())
+        .unwrap_or("<none>");
+    format!("[docker-status] op={operation} context={ctx_display} exit_code=none category={category}")
+}
+
+fn log_docker_cli_io_failure(
+    operation: &str,
+    docker_context: Option<&str>,
+    err: &std::io::Error,
+) {
+    eprintln!(
+        "{}",
+        format_docker_cli_io_failure_log(operation, docker_context, err)
+    );
+}
+
+/// ユーザー向け IO/起動エラーメッセージを安全な固定カテゴリのみで構築する。
+fn format_safe_docker_io_error(operation: &str, err: &std::io::Error) -> String {
+    let category = classify_io_error_category(err);
+    format!("{operation}の起動・実行に失敗しました（種別: {category}）")
+}
+
 #[derive(Clone)]
 pub struct RealDockerCliRuntime {
     pub docker_path: PathBuf,
@@ -1045,7 +1180,7 @@ impl DockerRuntime for RealDockerCliRuntime {
         env_vars: &[(String, String)],
         labels: &[(String, String)],
     ) -> Result<String, DockerError> {
-        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        let mut cmd = new_hidden_tokio_command(&self.docker_path);
         cmd.kill_on_drop(true);
         if !self.docker_context.is_empty() {
             cmd.arg("--context").arg(&self.docker_context);
@@ -1077,7 +1212,7 @@ impl DockerRuntime for RealDockerCliRuntime {
     }
 
     async fn start_container(&self, cname: &str) -> Result<(), DockerError> {
-        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        let mut cmd = new_hidden_tokio_command(&self.docker_path);
         cmd.kill_on_drop(true);
         if !self.docker_context.is_empty() {
             cmd.arg("--context").arg(&self.docker_context);
@@ -1099,7 +1234,7 @@ impl DockerRuntime for RealDockerCliRuntime {
         &self,
         cname: &str,
     ) -> Result<LogStreams, DockerError> {
-        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        let mut cmd = new_hidden_tokio_command(&self.docker_path);
         cmd.kill_on_drop(true);
         if !self.docker_context.is_empty() {
             cmd.arg("--context").arg(&self.docker_context);
@@ -1124,7 +1259,7 @@ impl DockerRuntime for RealDockerCliRuntime {
     }
 
     async fn wait_container(&self, cname: &str) -> Result<i32, DockerError> {
-        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        let mut cmd = new_hidden_tokio_command(&self.docker_path);
         cmd.kill_on_drop(true);
         if !self.docker_context.is_empty() {
             cmd.arg("--context").arg(&self.docker_context);
@@ -1145,7 +1280,7 @@ impl DockerRuntime for RealDockerCliRuntime {
     }
 
     async fn stop_container(&self, cname: &str, timeout_secs: u32) -> Result<(), DockerError> {
-        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        let mut cmd = new_hidden_tokio_command(&self.docker_path);
         cmd.kill_on_drop(true);
         if !self.docker_context.is_empty() {
             cmd.arg("--context").arg(&self.docker_context);
@@ -1164,7 +1299,7 @@ impl DockerRuntime for RealDockerCliRuntime {
     }
 
     async fn remove_container(&self, cname: &str) -> Result<(), DockerError> {
-        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        let mut cmd = new_hidden_tokio_command(&self.docker_path);
         cmd.kill_on_drop(true);
         if !self.docker_context.is_empty() {
             cmd.arg("--context").arg(&self.docker_context);
@@ -1183,7 +1318,7 @@ impl DockerRuntime for RealDockerCliRuntime {
     }
 
     async fn inspect_container(&self, cname: &str) -> Result<ContainerPresence, DockerError> {
-        let mut cmd = tokio::process::Command::new(&self.docker_path);
+        let mut cmd = new_hidden_tokio_command(&self.docker_path);
         cmd.kill_on_drop(true);
         if !self.docker_context.is_empty() {
             cmd.arg("--context").arg(&self.docker_context);
@@ -1564,8 +1699,24 @@ fn resolve_output_dir(output_path: &str) -> Result<std::path::PathBuf, String> {
 
 /// エンジンのLocalAsrEngineStatusから文字起こし実行可能性を判定する純粋関数（テスト可能）。
 fn validate_engine_status_for_transcribe(status: &LocalAsrEngineStatus) -> Result<(), String> {
+    if !status.docker_available {
+        return Err("Dockerがインストールされていません".to_string());
+    }
     if !status.docker_running {
+        if let Some(ref msg) = status.error_message {
+            if status.error_kind.as_deref() == Some("context_error") {
+                return Err(msg.clone());
+            }
+        }
         return Err("Docker Desktopが起動していません".to_string());
+    }
+    if let Some(ref kind) = status.error_kind {
+        if kind == "image_list_error" || kind == "inspect-error" || kind == "context_error" {
+            return Err(status
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "Dockerイメージの状態を確認できませんでした".to_string()));
+        }
     }
     if !status.installed {
         return Err(format!(
@@ -1583,20 +1734,26 @@ fn validate_engine_status_for_transcribe(status: &LocalAsrEngineStatus) -> Resul
 }
 
 /// 文字起こし開始前のエンジン状態確認（preflight guard）。
-/// 共通の LocalAsrEngineDef および evaluate_engine_image_status を再利用して判定する。
-fn validate_transcribe_engine_status(engine: &str) -> Result<(), String> {
-    let def = local_asr_engine_defs()
+/// 共通の Docker CLI・context 解決・状態判定ロジックを再利用し、解決済み `(docker_path, docker_context)` を返す。
+async fn validate_transcribe_engine_status(engine: &str) -> Result<(PathBuf, String), String> {
+    let docker_path_opt = find_docker_cli();
+    let statuses = resolve_local_asr_statuses_unified_with_cli_and_context(
+        docker_path_opt.clone(),
+        None,
+    )
+    .await;
+    let status = statuses
         .into_iter()
-        .find(|d| d.engine == engine)
-        .ok_or_else(|| format!("未対応のASRエンジンです: {}", engine))?;
-
-    let docker_path = match find_docker_cli() {
-        Some(p) => p,
-        None => return Err("Dockerがインストールされていません".to_string()),
-    };
-
-    let status = get_single_engine_status_fast(&docker_path, "", &def);
-    validate_engine_status_for_transcribe(&status)
+        .find(|s| s.engine == engine)
+        .ok_or_else(|| format!("不明なローカルASRエンジンです: {engine}"))?;
+    validate_engine_status_for_transcribe(&status)?;
+    let docker_path = docker_path_opt
+        .ok_or_else(|| "Dockerがインストールされていません".to_string())?;
+    let docker_context = status
+        .docker_context
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| "Docker contextが確定できませんでした".to_string())?;
+    Ok((docker_path, docker_context))
 }
 
 pub(crate) struct PreparedJob {
@@ -1644,10 +1801,12 @@ pub(crate) async fn prepare_job_with_base_dir(
         return Err("出力を1形式以上選択してください".to_string());
     }
 
-    // 3. Engine status validation
-    if validate_docker_engine {
-        validate_transcribe_engine_status(target_engine)?;
-    }
+    // 3. Engine status validation（解決済み CLI パスと context を引き継ぎ、暗黙フォールバックしない）
+    let validated_docker = if validate_docker_engine {
+        Some(validate_transcribe_engine_status(target_engine).await?)
+    } else {
+        None
+    };
 
     if ctrl.is_cancel_requested().await {
         return Err("Transcription cancelled".to_string());
@@ -1711,15 +1870,9 @@ pub(crate) async fn prepare_job_with_base_dir(
             return Err("Transcription cancelled".to_string());
         }
 
-        let (docker_path, docker_context) = if validate_docker_engine {
-            let p = match find_docker_cli() {
-                Some(p) => p,
-                None => return Err("Dockerがインストールされていません".to_string()),
-            };
-            let ctx = resolve_docker_context(&p).await.unwrap_or_default();
-            (p, ctx)
-        } else {
-            (PathBuf::from("docker"), String::new())
+        let (docker_path, docker_context) = match validated_docker.clone() {
+            Some((p, ctx)) => (p, ctx),
+            None => (PathBuf::from("docker"), String::new()),
         };
 
         let source_abs = fs::canonicalize(&source_dir).unwrap_or(source_dir.clone());
@@ -3883,6 +4036,8 @@ pub struct DockerStatus {
     pub desktop_path: Option<String>,
     pub error_kind: Option<String>,
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_context: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3923,7 +4078,7 @@ fn docker_error_to_status(err: DockerCheckError) -> (Option<String>, Option<Stri
         ),
         DockerCheckError::Io(e) => (
             Some("unknown".to_string()),
-            Some(format!("入出力エラー: {}", e)),
+            Some(format!("入出力エラー（種別: {}）", classify_io_error_category(&e))),
         ),
         DockerCheckError::UnexpectedOutput => (
             Some("unknown".to_string()),
@@ -3981,25 +4136,33 @@ fn docker_candidate_paths(
     candidates
 }
 
-/// PATH上から `docker` を検索する。
-fn find_docker_on_path() -> Option<std::path::PathBuf> {
-    for name in &["docker.exe", "docker"] {
-        if let Ok(output) = std::process::Command::new("cmd.exe")
-            .args(["/C", "where", name])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-        {
-            if output.status.success() {
-                let path_str = String::from_utf8_lossy(&output.stdout);
-                let first_line = path_str.lines().next().unwrap_or("").trim();
-                if !first_line.is_empty() {
-                    return Some(std::path::PathBuf::from(first_line));
-                }
+/// PATH環境変数から実行ファイルを探索する（シェルや `where` を起動しない純粋探索）。
+fn find_executable_in_path(
+    path_var: Option<&std::ffi::OsStr>,
+    names: &[&str],
+) -> Option<std::path::PathBuf> {
+    let path_os = path_var?;
+    for dir in std::env::split_paths(path_os) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
     }
     None
+}
+
+/// PATH上から `docker` を検索する（`cmd.exe /C where` を使わない）。
+fn find_docker_on_path() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    let names: &[&str] = &["docker.exe", "docker"];
+    #[cfg(not(windows))]
+    let names: &[&str] = &["docker"];
+    find_executable_in_path(std::env::var_os("PATH").as_deref(), names)
 }
 
 /// Docker CLIの実行ファイルを検出する。
@@ -4040,14 +4203,16 @@ fn find_docker_desktop() -> Option<std::path::PathBuf> {
 
 /// `docker --version` の出力を取得する（trimmed全文を返す）。
 fn read_docker_cli_version(docker_path: &std::path::Path) -> Result<String, DockerCheckError> {
-    let output = std::process::Command::new(docker_path)
+    let output = new_hidden_std_command(docker_path)
         .arg("--version")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .output()
         .map_err(DockerCheckError::Io)?;
 
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log_docker_cli_failure("docker --version", None, output.status.code(), &stderr);
         return Err(DockerCheckError::UnexpectedOutput);
     }
 
@@ -4059,32 +4224,48 @@ fn read_docker_cli_version(docker_path: &std::path::Path) -> Result<String, Dock
     Ok(version)
 }
 
-/// `docker version --format "{{.Server.Version}}"` でServer接続を確認する（タイムアウト5秒）。
-async fn read_docker_server_version(
+/// `docker --context <ctx> version --format "{{.Server.Version}}"` でServer接続を確認する（タイムアウト5秒）。
+async fn read_docker_server_version_with_context(
     docker_path: &std::path::Path,
+    docker_context: &str,
 ) -> Result<String, DockerCheckError> {
-    let mut command = tokio::process::Command::new(docker_path);
+    let mut command = new_hidden_tokio_command(docker_path);
+    if !docker_context.is_empty() {
+        command.arg("--context").arg(docker_context);
+    }
     command
         .args(["version", "--format", "{{.Server.Version}}"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await;
 
     let output = match result {
-        Ok(inner) => inner.map_err(DockerCheckError::Io)?,
-        Err(_) => return Err(DockerCheckError::Timeout),
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            log_docker_cli_io_failure("docker version", Some(docker_context), &e);
+            return Err(DockerCheckError::Io(e));
+        }
+        Err(_) => {
+            log_docker_cli_failure("docker version", Some(docker_context), None, "timeout (5s)");
+            return Err(DockerCheckError::Timeout);
+        }
     };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        // 権限エラーの判定
-        if stderr.contains("permission denied")
-            || stderr.contains("Got permission denied")
-            || stderr.contains("access denied")
-        {
-            return Err(DockerCheckError::PermissionDenied(stderr));
+        log_docker_cli_failure(
+            "docker version",
+            Some(docker_context),
+            output.status.code(),
+            &stderr,
+        );
+        let category = classify_docker_cli_error_category(&stderr);
+        if category == "permission_denied" {
+            return Err(DockerCheckError::PermissionDenied("権限エラー".to_string()));
         }
-        return Err(DockerCheckError::DaemonNotRunning(stderr));
+        return Err(DockerCheckError::DaemonNotRunning(format!("種別: {category}")));
     }
 
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -4125,6 +4306,7 @@ async fn docker_check_status() -> DockerStatus {
             } else {
                 Some("Docker Desktopが見つかりません。インストールしてください。".to_string())
             },
+            docker_context: None,
         };
     }
 
@@ -4136,9 +4318,28 @@ async fn docker_check_status() -> DockerStatus {
         Err(_) => None,
     };
 
-    // 5. Serverバージョン取得（タイムアウト付き）
+    // 5. Docker context取得（暗黙フォールバックしない）
+    let docker_context = match resolve_docker_context(cli_path_ref).await {
+        Ok(ctx) => ctx,
+        Err(msg) => {
+            return DockerStatus {
+                cli_found: true,
+                cli_version,
+                daemon_running: false,
+                server_version: None,
+                desktop_found,
+                cli_path: Some(cli_path_ref.to_string_lossy().to_string()),
+                desktop_path: desktop_path.map(|p| p.to_string_lossy().to_string()),
+                error_kind: Some("context_error".to_string()),
+                error_message: Some(msg),
+                docker_context: None,
+            };
+        }
+    };
+
+    // 6. Serverバージョン取得（取得した同一contextを使用、タイムアウト付き）
     let (daemon_running, server_version, error_kind, error_message) =
-        match read_docker_server_version(cli_path_ref).await {
+        match read_docker_server_version_with_context(cli_path_ref, &docker_context).await {
             Ok(v) => (true, Some(v), None, None),
             Err(e) => {
                 let (kind, msg) = docker_error_to_status(e);
@@ -4156,6 +4357,7 @@ async fn docker_check_status() -> DockerStatus {
         desktop_path: desktop_path.map(|p| p.to_string_lossy().to_string()),
         error_kind,
         error_message,
+        docker_context: Some(docker_context),
     }
 }
 
@@ -4183,7 +4385,8 @@ fn classify_docker_start_result(
         message: if detail.is_empty() {
             "Docker Desktopの起動に失敗しました。".to_string()
         } else {
-            format!("Docker Desktopの起動に失敗しました: {}", detail)
+            let category = classify_docker_cli_error_category(detail);
+            format!("Docker Desktopの起動に失敗しました（種別: {category}）。")
         },
     }
 }
@@ -4200,7 +4403,7 @@ async fn docker_start_desktop() -> DockerStartResult {
         }
     };
 
-    let output = match tokio::process::Command::new(&docker_path)
+    let output = match new_hidden_tokio_command(&docker_path)
         .args(["desktop", "start", "--detach"])
         .kill_on_drop(true)
         .output()
@@ -4208,18 +4411,26 @@ async fn docker_start_desktop() -> DockerStartResult {
     {
         Ok(output) => output,
         Err(e) => {
+            log_docker_cli_io_failure("desktop start", None, &e);
             return DockerStartResult {
                 launched: false,
-                message: format!("Docker Desktopの起動に失敗しました: {}", e),
+                message: format_safe_docker_io_error("Docker Desktopの起動", &e),
             };
         }
     };
 
-    classify_docker_start_result(
-        output.status.success(),
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    )
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        let detail_source = if stderr.trim().is_empty() {
+            stdout.as_ref()
+        } else {
+            stderr.as_ref()
+        };
+        log_docker_cli_failure("desktop start", None, output.status.code(), detail_source);
+    }
+
+    classify_docker_start_result(output.status.success(), &stdout, &stderr)
 }
 
 // ---- HuggingFace Token Management ----
@@ -4400,6 +4611,15 @@ pub struct LocalAsrEngineStatus {
     pub docker_running: bool,
     pub error_kind: Option<String>,
     pub error_message: Option<String>,
+    /// 統一状態分類:
+    /// `cli_missing` | `engine_stopped` | `context_error` | `image_list_error`
+    /// | `image_missing` | `update_required` | `ready`
+    #[serde(default)]
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 struct LocalAsrEngineDef {
@@ -4513,12 +4733,58 @@ fn parse_docker_image_inspect(stdout: &str) -> Result<DockerImageInfo, DockerIma
 }
 
 /// Dockerイメージの存在有無とラベル情報から、エンジンのインストール状態および更新要否を判定する純粋関数。
-fn evaluate_engine_image_status(
+fn evaluate_engine_image_status_with_context(
     inspect_result: DockerImageInspectResult,
     def: &LocalAsrEngineDef,
     docker_available: bool,
     docker_running: bool,
+    docker_context: Option<&str>,
 ) -> LocalAsrEngineStatus {
+    let ctx = docker_context.map(|s| s.to_string());
+    if !docker_available {
+        let msg = "Docker CLIが見つかりません。Docker Desktopをインストールしてください。".to_string();
+        return LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            needs_update: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            expected_environment_version: Some(def.expected_environment_version.to_string()),
+            model_name: None,
+            docker_available: false,
+            docker_running: false,
+            error_kind: Some("cli_missing".to_string()),
+            error_message: Some(msg.clone()),
+            state: "cli_missing".to_string(),
+            docker_context: ctx,
+            reason: Some(msg),
+        };
+    }
+
+    if !docker_running {
+        let msg = "Docker Engineへ接続できませんでした。Docker Desktopを起動してください。".to_string();
+        return LocalAsrEngineStatus {
+            engine: def.engine.to_string(),
+            display_name: def.display_name.to_string(),
+            installed: false,
+            needs_update: false,
+            image_name: def.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            expected_environment_version: Some(def.expected_environment_version.to_string()),
+            model_name: None,
+            docker_available: true,
+            docker_running: false,
+            error_kind: Some("engine_stopped".to_string()),
+            error_message: Some(msg.clone()),
+            state: "engine_stopped".to_string(),
+            docker_context: ctx,
+            reason: Some(msg),
+        };
+    }
+
     match inspect_result {
         DockerImageInspectResult::Found(info) => {
             let env_ver = info
@@ -4530,6 +4796,18 @@ fn evaluate_engine_image_status(
                 Some(v) => v.trim() != def.expected_environment_version,
                 None => true,
             };
+            let (state, reason) = if needs_update {
+                (
+                    "update_required".to_string(),
+                    Some(format!(
+                        "環境バージョンが一致しません（現在: {} / 必要: {}）",
+                        env_ver.as_deref().unwrap_or("不明"),
+                        def.expected_environment_version
+                    )),
+                )
+            } else {
+                ("ready".to_string(), None)
+            };
             LocalAsrEngineStatus {
                 engine: def.engine.to_string(),
                 display_name: def.display_name.to_string(),
@@ -4540,10 +4818,13 @@ fn evaluate_engine_image_status(
                 environment_version: env_ver,
                 expected_environment_version: Some(def.expected_environment_version.to_string()),
                 model_name: model,
-                docker_available,
-                docker_running,
+                docker_available: true,
+                docker_running: true,
                 error_kind: None,
                 error_message: None,
+                state,
+                docker_context: ctx,
+                reason,
             }
         }
         DockerImageInspectResult::NotFound => LocalAsrEngineStatus {
@@ -4556,52 +4837,82 @@ fn evaluate_engine_image_status(
             environment_version: None,
             expected_environment_version: Some(def.expected_environment_version.to_string()),
             model_name: None,
-            docker_available,
-            docker_running,
+            docker_available: true,
+            docker_running: true,
             error_kind: None,
             error_message: None,
+            state: "image_missing".to_string(),
+            docker_context: ctx,
+            reason: Some("未インストール".to_string()),
         },
-        DockerImageInspectResult::DaemonUnavailable => LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            needs_update: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            expected_environment_version: Some(def.expected_environment_version.to_string()),
-            model_name: None,
-            docker_available,
-            docker_running: false,
-            error_kind: Some("daemon-unavailable".to_string()),
-            error_message: Some("Docker Engineへ接続できませんでした".to_string()),
-        },
-        DockerImageInspectResult::InspectFailed => LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            needs_update: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            expected_environment_version: Some(def.expected_environment_version.to_string()),
-            model_name: None,
-            docker_available,
-            docker_running,
-            error_kind: Some("inspect-error".to_string()),
-            error_message: Some("Dockerイメージの状態を確認できませんでした".to_string()),
-        },
+        DockerImageInspectResult::DaemonUnavailable => {
+            let msg = "Docker Engineへ接続できませんでした".to_string();
+            LocalAsrEngineStatus {
+                engine: def.engine.to_string(),
+                display_name: def.display_name.to_string(),
+                installed: false,
+                needs_update: false,
+                image_name: def.image_name.to_string(),
+                image_id: None,
+                environment_version: None,
+                expected_environment_version: Some(def.expected_environment_version.to_string()),
+                model_name: None,
+                docker_available: true,
+                docker_running: false,
+                error_kind: Some("engine_stopped".to_string()),
+                error_message: Some(msg.clone()),
+                state: "engine_stopped".to_string(),
+                docker_context: ctx,
+                reason: Some(msg),
+            }
+        }
+        DockerImageInspectResult::InspectFailed => {
+            let msg = "Dockerイメージの状態を確認できませんでした".to_string();
+            LocalAsrEngineStatus {
+                engine: def.engine.to_string(),
+                display_name: def.display_name.to_string(),
+                installed: false,
+                needs_update: false,
+                image_name: def.image_name.to_string(),
+                image_id: None,
+                environment_version: None,
+                expected_environment_version: Some(def.expected_environment_version.to_string()),
+                model_name: None,
+                docker_available: true,
+                docker_running: true,
+                error_kind: Some("image_list_error".to_string()),
+                error_message: Some(msg.clone()),
+                state: "image_list_error".to_string(),
+                docker_context: ctx,
+                reason: Some(msg),
+            }
+        }
     }
 }
 
+#[cfg(test)]
+fn evaluate_engine_image_status(
+    inspect_result: DockerImageInspectResult,
+    def: &LocalAsrEngineDef,
+    docker_available: bool,
+    docker_running: bool,
+) -> LocalAsrEngineStatus {
+    evaluate_engine_image_status_with_context(
+        inspect_result,
+        def,
+        docker_available,
+        docker_running,
+        None,
+    )
+}
+
 /// `docker --context <ctx> image inspect <image_name>` を実行し、イメージ情報を取得する。
-/// contextが空の場合は--contextを付けない（後方互換）。
 fn inspect_docker_image_with_context(
     docker_path: &std::path::Path,
     docker_context: &str,
     image_name: &str,
 ) -> DockerImageInspectResult {
-    let mut cmd = std::process::Command::new(docker_path);
+    let mut cmd = new_hidden_std_command(docker_path);
     if !docker_context.is_empty() {
         cmd.arg("--context").arg(docker_context);
     }
@@ -4613,14 +4924,23 @@ fn inspect_docker_image_with_context(
     {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("docker image inspect 実行失敗: {e}");
+            log_docker_cli_io_failure("image inspect", Some(docker_context), &e);
             return DockerImageInspectResult::InspectFailed;
         }
     };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return classify_docker_inspect_failure(&stderr);
+        let classified = classify_docker_inspect_failure(&stderr);
+        if !matches!(classified, DockerImageInspectResult::NotFound) {
+            log_docker_cli_failure(
+                "image inspect",
+                Some(docker_context),
+                output.status.code(),
+                &stderr,
+            );
+        }
+        return classified;
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4630,126 +4950,55 @@ fn inspect_docker_image_with_context(
     }
 }
 
-/// `docker image inspect <image_name>` を実行し、イメージ情報を取得する。
-fn inspect_docker_image(
-    docker_path: &std::path::Path,
-    image_name: &str,
-) -> DockerImageInspectResult {
-    let output = match std::process::Command::new(docker_path)
-        .args(["image", "inspect", image_name])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("docker image inspect 実行失敗: {e}");
-            return DockerImageInspectResult::InspectFailed;
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return classify_docker_inspect_failure(&stderr);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    match parse_docker_image_inspect(&stdout) {
-        Ok(info) => DockerImageInspectResult::Found(info),
-        Err(result) => result,
-    }
-}
-
-/// 単一エンジンの状態を取得する（テスト可能、Docker実行を含む）。
-fn get_single_engine_status(
-    docker_path: &std::path::Path,
+/// 統一エラー状態配列を生成する純粋関数（`context_error` / `engine_stopped` / `image_list_error`）。
+fn build_error_statuses(
+    defs: &[LocalAsrEngineDef],
+    state: &str,
+    docker_available: bool,
     docker_running: bool,
-    def: &LocalAsrEngineDef,
-) -> LocalAsrEngineStatus {
-    if !docker_running {
-        return evaluate_engine_image_status(
-            DockerImageInspectResult::DaemonUnavailable,
-            def,
-            true,
-            false,
-        );
-    }
-
-    let inspect_result = inspect_docker_image(docker_path, def.image_name);
-    evaluate_engine_image_status(inspect_result, def, true, true)
-}
-
-fn local_asr_get_status_sync() -> Vec<LocalAsrEngineStatus> {
-    let defs = local_asr_engine_defs();
-    let docker_path = find_docker_cli();
-    let docker_available = docker_path.is_some();
-
-    if !docker_available {
-        return defs
-            .iter()
-            .map(|d| evaluate_engine_image_status(
-                DockerImageInspectResult::NotFound,
-                d,
-                false,
-                false,
-            ))
-            .collect();
-    }
-
-    let docker_path_ref = docker_path.as_ref().unwrap();
-
-    let t0 = std::time::Instant::now();
-    let docker_running = std::process::Command::new(docker_path_ref)
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    let version_ms = t0.elapsed().as_millis();
-    if version_ms > 1000 {
-        eprintln!("[status] docker version slow: {version_ms}ms");
-    }
-
-    let mut results = Vec::with_capacity(defs.len());
-    for d in &defs {
-        let t1 = std::time::Instant::now();
-        let status = get_single_engine_status(docker_path_ref, docker_running, d);
-        let elapsed = t1.elapsed().as_millis();
-        if elapsed > 1000 {
-            eprintln!("[status] inspect {} slow: {elapsed}ms", d.engine);
-        }
-        results.push(status);
-    }
-    results
+    docker_context: Option<&str>,
+    message: &str,
+) -> Vec<LocalAsrEngineStatus> {
+    defs.iter()
+        .map(|d| LocalAsrEngineStatus {
+            engine: d.engine.to_string(),
+            display_name: d.display_name.to_string(),
+            installed: false,
+            needs_update: false,
+            image_name: d.image_name.to_string(),
+            image_id: None,
+            environment_version: None,
+            expected_environment_version: Some(d.expected_environment_version.to_string()),
+            model_name: None,
+            docker_available,
+            docker_running,
+            error_kind: Some(state.to_string()),
+            error_message: Some(message.to_string()),
+            state: state.to_string(),
+            docker_context: docker_context.map(|s| s.to_string()),
+            reason: Some(message.to_string()),
+        })
+        .collect()
 }
 
 fn unavailable_local_asr_statuses() -> Vec<LocalAsrEngineStatus> {
     local_asr_engine_defs()
         .iter()
-        .map(|d| evaluate_engine_image_status(
+        .map(|d| evaluate_engine_image_status_with_context(
             DockerImageInspectResult::NotFound,
             d,
             false,
             false,
+            None,
         ))
         .collect()
 }
 
-#[tauri::command]
-async fn local_asr_get_status() -> Vec<LocalAsrEngineStatus> {
-    tauri::async_runtime::spawn_blocking(local_asr_get_status_sync)
-        .await
-        .unwrap_or_else(|_| unavailable_local_asr_statuses())
-}
-
 /// 現在のDocker contextを取得する。
 async fn resolve_docker_context(docker_path: &std::path::Path) -> Result<String, String> {
-    use tokio::process::Command;
-
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        Command::new(docker_path)
+        new_hidden_tokio_command(docker_path)
             .args(["context", "show"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -4757,33 +5006,43 @@ async fn resolve_docker_context(docker_path: &std::path::Path) -> Result<String,
             .output(),
     )
     .await
-    .map_err(|_| "docker context showがタイムアウトしました".to_string())?
-    .map_err(|e| format!("docker context showの実行に失敗しました: {e}"))?;
+    .map_err(|_| {
+        log_docker_cli_failure("context show", None, None, "timeout (5s)");
+        "docker context showがタイムアウトしました".to_string()
+    })?
+    .map_err(|e| {
+        log_docker_cli_io_failure("context show", None, &e);
+        format_safe_docker_io_error("docker context show", &e)
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("docker context showが失敗しました: {stderr}"));
+        log_docker_cli_failure("context show", None, output.status.code(), &stderr);
+        return Err(format_safe_docker_cli_error(
+            "docker context show",
+            output.status.code(),
+            &stderr,
+        ));
     }
 
     let context = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if context.is_empty() {
+        log_docker_cli_failure("context show", None, output.status.code(), "empty output");
         return Err("docker context showが空の結果を返しました".to_string());
     }
     Ok(context)
 }
 
-/// `docker image ls --no-trunc --format "{{.Repository}}\t{{.Tag}}\t{{.ID}}"` を実行し、
+/// `docker --context <ctx> image ls --no-trunc --format "{{.Repository}}\t{{.Tag}}\t{{.ID}}"` を実行し、
 /// (repository, tag, image_id) の一覧を返す。
 async fn list_docker_images(
     docker_path: &std::path::Path,
     docker_context: &str,
 ) -> Result<Vec<(String, String, String)>, String> {
-    use tokio::process::Command;
-
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         {
-            let mut cmd = Command::new(docker_path);
+            let mut cmd = new_hidden_tokio_command(docker_path);
             if !docker_context.is_empty() {
                 cmd.arg("--context").arg(docker_context);
             }
@@ -4795,12 +5054,28 @@ async fn list_docker_images(
         },
     )
     .await
-    .map_err(|_| "docker image lsがタイムアウトしました".to_string())?
-    .map_err(|e| format!("docker image lsの実行に失敗しました: {e}"))?;
+    .map_err(|_| {
+        log_docker_cli_failure("image ls", Some(docker_context), None, "timeout (5s)");
+        "docker image lsがタイムアウトしました".to_string()
+    })?
+    .map_err(|e| {
+        log_docker_cli_io_failure("image ls", Some(docker_context), &e);
+        format_safe_docker_io_error("docker image ls", &e)
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("docker image lsが失敗しました: {stderr}"));
+        log_docker_cli_failure(
+            "image ls",
+            Some(docker_context),
+            output.status.code(),
+            &stderr,
+        );
+        return Err(format_safe_docker_cli_error(
+            "docker image ls",
+            output.status.code(),
+            &stderr,
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4825,9 +5100,7 @@ async fn inspect_docker_image_by_id_async(
     image_id: String,
     def: &LocalAsrEngineDef,
 ) -> LocalAsrEngineStatus {
-    use tokio::process::Command;
-
-    let mut cmd = Command::new(&docker_path);
+    let mut cmd = new_hidden_tokio_command(&docker_path);
     if !docker_context.is_empty() {
         cmd.arg("--context").arg(docker_context);
     }
@@ -4840,6 +5113,8 @@ async fn inspect_docker_image_by_id_async(
     {
         Ok(c) => c,
         Err(e) => {
+            log_docker_cli_io_failure("image inspect", Some(docker_context), &e);
+            let msg = format_safe_docker_io_error("docker image inspect", &e);
             return LocalAsrEngineStatus {
                 engine: def.engine.to_string(),
                 display_name: def.display_name.to_string(),
@@ -4852,8 +5127,11 @@ async fn inspect_docker_image_by_id_async(
                 model_name: None,
                 docker_available: true,
                 docker_running: true,
-                error_kind: Some("inspect-error".to_string()),
-                error_message: Some(format!("Docker起動エラー: {e}")),
+                error_kind: Some("image_list_error".to_string()),
+                error_message: Some(msg.clone()),
+                state: "image_list_error".to_string(),
+                docker_context: Some(docker_context.to_string()),
+                reason: Some(msg),
             };
         }
     };
@@ -4869,85 +5147,189 @@ async fn inspect_docker_image_by_id_async(
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let inspect_result = classify_docker_inspect_failure(&stderr);
+                if !matches!(inspect_result, DockerImageInspectResult::NotFound) {
+                    log_docker_cli_failure(
+                        "image inspect",
+                        Some(docker_context),
+                        output.status.code(),
+                        &stderr,
+                    );
+                }
                 let docker_running = !matches!(inspect_result, DockerImageInspectResult::DaemonUnavailable);
-                evaluate_engine_image_status(inspect_result, def, true, docker_running)
+                evaluate_engine_image_status_with_context(
+                    inspect_result,
+                    def,
+                    true,
+                    docker_running,
+                    Some(docker_context),
+                )
             } else {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let inspect_result = match parse_docker_image_inspect(&stdout) {
                     Ok(info) => DockerImageInspectResult::Found(info),
                     Err(res) => res,
                 };
-                evaluate_engine_image_status(inspect_result, def, true, true)
+                evaluate_engine_image_status_with_context(
+                    inspect_result,
+                    def,
+                    true,
+                    true,
+                    Some(docker_context),
+                )
             }
         }
-        Ok(Err(e)) => LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            needs_update: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            expected_environment_version: Some(def.expected_environment_version.to_string()),
-            model_name: None,
-            docker_available: true,
-            docker_running: true,
-            error_kind: Some("inspect-error".to_string()),
-            error_message: Some(format!("Docker実行エラー: {e}")),
-        },
-        Err(_) => LocalAsrEngineStatus {
-            engine: def.engine.to_string(),
-            display_name: def.display_name.to_string(),
-            installed: false,
-            needs_update: false,
-            image_name: def.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            expected_environment_version: Some(def.expected_environment_version.to_string()),
-            model_name: None,
-            docker_available: true,
-            docker_running: true,
-            error_kind: Some("timeout".to_string()),
-            error_message: Some("Docker応答がタイムアウトしました（5秒）".to_string()),
-        },
+        Ok(Err(e)) => {
+            log_docker_cli_io_failure("image inspect", Some(docker_context), &e);
+            let msg = format_safe_docker_io_error("docker image inspect", &e);
+            LocalAsrEngineStatus {
+                engine: def.engine.to_string(),
+                display_name: def.display_name.to_string(),
+                installed: false,
+                needs_update: false,
+                image_name: def.image_name.to_string(),
+                image_id: None,
+                environment_version: None,
+                expected_environment_version: Some(def.expected_environment_version.to_string()),
+                model_name: None,
+                docker_available: true,
+                docker_running: true,
+                error_kind: Some("image_list_error".to_string()),
+                error_message: Some(msg.clone()),
+                state: "image_list_error".to_string(),
+                docker_context: Some(docker_context.to_string()),
+                reason: Some(msg),
+            }
+        }
+        Err(_) => {
+            log_docker_cli_failure("image inspect", Some(docker_context), None, "timeout (5s)");
+            let msg = "Docker応答がタイムアウトしました（5秒）".to_string();
+            LocalAsrEngineStatus {
+                engine: def.engine.to_string(),
+                display_name: def.display_name.to_string(),
+                installed: false,
+                needs_update: false,
+                image_name: def.image_name.to_string(),
+                image_id: None,
+                environment_version: None,
+                expected_environment_version: Some(def.expected_environment_version.to_string()),
+                model_name: None,
+                docker_available: true,
+                docker_running: true,
+                error_kind: Some("image_list_error".to_string()),
+                error_message: Some(msg.clone()),
+                state: "image_list_error".to_string(),
+                docker_context: Some(docker_context.to_string()),
+                reason: Some(msg),
+            }
+        }
     }
 }
 
-/// Docker daemon確認済みを前提に、3エンジンの状態を取得する。
-/// 最初に`docker image ls`で一覧を取得し、repository:tagの完全一致で存在判定する。
-/// 存在する場合はimage IDで`docker image inspect`を実行しラベルを取得する。
-#[tauri::command]
-async fn local_asr_get_status_fast() -> Vec<LocalAsrEngineStatus> {
+#[derive(Debug, PartialEq, Eq)]
+enum ExplicitDockerContext {
+    Unset,
+    Provided(String),
+    InvalidEmpty,
+}
+
+/// 明示指定された Docker context を解釈する（空文字・空白は Unset にフォールバックせず InvalidEmpty として扱う）。
+fn parse_explicit_docker_context(preferred_context: Option<&str>) -> ExplicitDockerContext {
+    match preferred_context {
+        None => ExplicitDockerContext::Unset,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                ExplicitDockerContext::InvalidEmpty
+            } else {
+                ExplicitDockerContext::Provided(trimmed.to_string())
+            }
+        }
+    }
+}
+
+/// イメージ一覧から定義済み全エンジンの状態を組み立てる（単一APIの共通処理）。
+async fn resolve_local_asr_statuses_unified_with_context(
+    preferred_context: Option<String>,
+) -> Vec<LocalAsrEngineStatus> {
+    resolve_local_asr_statuses_unified_with_cli_and_context(find_docker_cli(), preferred_context)
+        .await
+}
+
+async fn resolve_local_asr_statuses_unified_with_cli_and_context(
+    docker_path_opt: Option<PathBuf>,
+    preferred_context: Option<String>,
+) -> Vec<LocalAsrEngineStatus> {
     let defs = local_asr_engine_defs();
-    let docker_path = match find_docker_cli() {
+    let docker_path = match docker_path_opt {
         Some(p) => p,
         None => return unavailable_local_asr_statuses(),
     };
 
-    // 現在のDocker contextを1回だけ取得
-    let docker_context = match resolve_docker_context(&docker_path).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            return error_statuses(&defs, &format!("Docker contextの取得に失敗しました: {e}"));
+    // 1. 呼び出し元が解決済みのDocker contextを渡した場合はそれを固定使用し、空値時はフォールバックせず失敗する
+    let docker_context = match parse_explicit_docker_context(preferred_context.as_deref()) {
+        ExplicitDockerContext::Provided(ctx) => ctx,
+        ExplicitDockerContext::InvalidEmpty => {
+            return build_error_statuses(
+                &defs,
+                "context_error",
+                true,
+                false,
+                None,
+                "Docker contextが指定されていません（空の値）",
+            );
         }
+        ExplicitDockerContext::Unset => match resolve_docker_context(&docker_path).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                return build_error_statuses(
+                    &defs,
+                    "context_error",
+                    true,
+                    false,
+                    None,
+                    &format!("Docker contextの取得に失敗しました: {e}"),
+                );
+            }
+        },
     };
 
-    // image ls 一覧を1回だけ取得
+    // 2. 同一contextでEngine疎通を確認
+    if let Err(err) = read_docker_server_version_with_context(&docker_path, &docker_context).await {
+        let (_, msg) = docker_error_to_status(err);
+        let reason = msg.unwrap_or_else(|| "Docker Engineへ接続できませんでした".to_string());
+        return build_error_statuses(
+            &defs,
+            "engine_stopped",
+            true,
+            false,
+            Some(&docker_context),
+            &reason,
+        );
+    }
+
+    // 3. 同一contextでimage ls一覧を1回だけ取得
     let images = match list_docker_images(&docker_path, &docker_context).await {
         Ok(list) => list,
-        Err(e) => return error_statuses(&defs, &e),
+        Err(e) => {
+            return build_error_statuses(
+                &defs,
+                "image_list_error",
+                true,
+                true,
+                Some(&docker_context),
+                &e,
+            );
+        }
     };
 
     let mut results = Vec::with_capacity(defs.len());
     for def in defs {
-        // repository:tag の完全一致で検索
         let repo = format!("asr-composer-{}", def.engine);
         let tag = "cu126".to_string();
         let matched = images.iter().find(|(r, t, _)| r == &repo && t == &tag);
 
         match matched {
             Some((_, _, image_id)) => {
-                // IDでinspectしてラベル取得
                 let status = inspect_docker_image_by_id_async(
                     docker_path.clone(),
                     &docker_context,
@@ -4958,11 +5340,12 @@ async fn local_asr_get_status_fast() -> Vec<LocalAsrEngineStatus> {
                 results.push(status);
             }
             None => {
-                results.push(evaluate_engine_image_status(
+                results.push(evaluate_engine_image_status_with_context(
                     DockerImageInspectResult::NotFound,
                     &def,
                     true,
                     true,
+                    Some(&docker_context),
                 ));
             }
         }
@@ -4970,66 +5353,29 @@ async fn local_asr_get_status_fast() -> Vec<LocalAsrEngineStatus> {
     results
 }
 
-fn error_statuses(
-    defs: &[LocalAsrEngineDef],
-    message: &str,
-) -> Vec<LocalAsrEngineStatus> {
-    defs.iter()
-        .map(|d| LocalAsrEngineStatus {
-            engine: d.engine.to_string(),
-            display_name: d.display_name.to_string(),
-            installed: false,
-            needs_update: false,
-            image_name: d.image_name.to_string(),
-            image_id: None,
-            environment_version: None,
-            expected_environment_version: Some(d.expected_environment_version.to_string()),
-            model_name: None,
-            docker_available: true,
-            docker_running: false,
-            error_kind: Some("inspect-error".to_string()),
-            error_message: Some(message.to_string()),
-        })
-        .collect()
-}
-
-/// 個別確認用: docker version を省略し、inspect 1回だけ実行する。
-fn get_single_engine_status_fast(
-    docker_path: &std::path::Path,
-    docker_context: &str,
-    def: &LocalAsrEngineDef,
-) -> LocalAsrEngineStatus {
-    let inspect_result = inspect_docker_image_with_context(docker_path, docker_context, def.image_name);
-    evaluate_engine_image_status(inspect_result, def, true, true)
-}
-
-fn local_asr_get_engine_status_sync(engine: &str) -> Result<LocalAsrEngineStatus, String> {
-    let def = local_asr_engine_defs()
+async fn resolve_single_local_asr_status_unified(engine: &str) -> Result<LocalAsrEngineStatus, String> {
+    let statuses = resolve_local_asr_statuses_unified_with_context(None).await;
+    statuses
         .into_iter()
-        .find(|d| d.engine == engine)
-        .ok_or_else(|| format!("不明なローカルASRエンジンです: {engine}"))?;
+        .find(|s| s.engine == engine)
+        .ok_or_else(|| format!("不明なローカルASRエンジンです: {engine}"))
+}
 
-    let docker_path = match find_docker_cli() {
-        Some(path) => path,
-        None => {
-            return Ok(evaluate_engine_image_status(
-                DockerImageInspectResult::NotFound,
-                &def,
-                false,
-                false,
-            ));
-        }
-    };
+#[tauri::command]
+async fn local_asr_get_status() -> Vec<LocalAsrEngineStatus> {
+    resolve_local_asr_statuses_unified_with_context(None).await
+}
 
-    // 同期版ではcontextを明示しない（互換性維持）
-    Ok(get_single_engine_status_fast(&docker_path, "", &def))
+/// Docker daemon確認済みの場合も同一の統一状態解決を使用する。
+/// 呼び出し元（docker_check_status 等）で解決済みの context が渡された場合は同一 context を固定使用する。
+#[tauri::command]
+async fn local_asr_get_status_fast(docker_context: Option<String>) -> Vec<LocalAsrEngineStatus> {
+    resolve_local_asr_statuses_unified_with_context(docker_context).await
 }
 
 #[tauri::command]
 async fn local_asr_get_engine_status(engine: String) -> Result<LocalAsrEngineStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || local_asr_get_engine_status_sync(&engine))
-        .await
-        .map_err(|e| format!("ローカルASR状態確認タスクに失敗しました: {e}"))?
+    resolve_single_local_asr_status_unified(&engine).await
 }
 
 // ---- Local ASR Install ----
@@ -5075,6 +5421,7 @@ fn extract_asr_stage(line: &str) -> Option<&str> {
 /// Docker buildを実行し、stdoutからASR_PROGRESSマーカーを抽出して進捗をemitする。
 async fn run_docker_build(
     docker_path: &std::path::Path,
+    docker_context: &str,
     tag: &str,
     dockerfile: &str,
     context: &std::path::Path,
@@ -5095,7 +5442,10 @@ async fn run_docker_build(
     )
     .map_err(|e| format!("進捗通知に失敗しました: {e}"))?;
 
-    let mut command = tokio::process::Command::new(docker_path);
+    let mut command = new_hidden_tokio_command(docker_path);
+    if !docker_context.is_empty() {
+        command.arg("--context").arg(docker_context);
+    }
     command
         .args(["build", "--progress=plain", "-t", tag, "-f", dockerfile, "."])
         .current_dir(context)
@@ -5185,17 +5535,12 @@ async fn local_asr_install(
 
     // Docker CLI確認
     let docker_path = find_docker_cli().ok_or("Dockerがインストールされていません")?;
+    let docker_context = resolve_docker_context(&docker_path).await?;
 
-    // daemon確認
-    let daemon_ok = std::process::Command::new(&docker_path)
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !daemon_ok {
-        return Err("Docker Desktopが起動していません".to_string());
+    // daemon確認（同一context）
+    if let Err(err) = read_docker_server_version_with_context(&docker_path, &docker_context).await {
+        let (_, msg) = docker_error_to_status(err);
+        return Err(msg.unwrap_or_else(|| "Docker Desktopが起動していません".to_string()));
     }
 
     // checking
@@ -5233,6 +5578,7 @@ async fn local_asr_install(
     // base build
     run_docker_build(
         &docker_path,
+        &docker_context,
         "asr-composer-base:cu126",
         "base/Dockerfile",
         &local_asr_root,
@@ -5247,6 +5593,7 @@ async fn local_asr_install(
     // engine build
     run_docker_build(
         &docker_path,
+        &docker_context,
         &def.image_name,
         &format!("{}/Dockerfile", engine),
         &local_asr_root,
@@ -5269,7 +5616,14 @@ async fn local_asr_install(
     )
     .ok();
 
-    let status = get_single_engine_status(&docker_path, true, &def);
+    let inspect_result = inspect_docker_image_with_context(&docker_path, &docker_context, def.image_name);
+    let status = evaluate_engine_image_status_with_context(
+        inspect_result,
+        &def,
+        true,
+        true,
+        Some(&docker_context),
+    );
     if !status.installed {
         return Err(format!(
             "{}環境を構築しましたが、Dockerイメージを確認できませんでした",
@@ -5317,21 +5671,16 @@ async fn local_asr_uninstall(
 
     // Docker CLI確認
     let docker_path = find_docker_cli().ok_or("Dockerがインストールされていません")?;
+    let docker_context = resolve_docker_context(&docker_path).await?;
 
-    // daemon確認
-    let daemon_ok = std::process::Command::new(&docker_path)
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !daemon_ok {
-        return Err("Docker Desktopが起動していません".to_string());
+    // daemon確認（同一context）
+    if let Err(err) = read_docker_server_version_with_context(&docker_path, &docker_context).await {
+        let (_, msg) = docker_error_to_status(err);
+        return Err(msg.unwrap_or_else(|| "Docker Desktopが起動していません".to_string()));
     }
 
     // イメージ存在確認
-    match inspect_docker_image(&docker_path, &def.image_name) {
+    match inspect_docker_image_with_context(&docker_path, &docker_context, &def.image_name) {
         DockerImageInspectResult::NotFound => {
             return Err(format!("{}環境はインストールされていません", def.display_name));
         }
@@ -5345,12 +5694,19 @@ async fn local_asr_uninstall(
     }
 
     // docker image rm（-f なし）
-    let output = std::process::Command::new(&docker_path)
+    let mut rm_cmd = new_hidden_std_command(&docker_path);
+    if !docker_context.is_empty() {
+        rm_cmd.arg("--context").arg(&docker_context);
+    }
+    let output = rm_cmd
         .args(["image", "rm", &def.image_name])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|e| format!("Docker image rmの実行に失敗しました: {}", e))?;
+        .map_err(|e| {
+            log_docker_cli_io_failure("image rm", Some(&docker_context), &e);
+            format_safe_docker_io_error("docker image rm", &e)
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5360,10 +5716,15 @@ async fn local_asr_uninstall(
         } else {
             stderr.as_ref()
         };
-        let detail = tail_stderr(detail_source, 30);
+        log_docker_cli_failure(
+            "image rm",
+            Some(&docker_context),
+            output.status.code(),
+            detail_source,
+        );
 
-        // コンテナ参照による削除失敗を検出
-        if detail.contains("is being used") || detail.contains("running") {
+        // 既知の安全なエラー分類に基づいてコンテナ参照による削除失敗を判定
+        if classify_docker_cli_error_category(detail_source) == "image_in_use" {
             return Err(format!(
                 "{}イメージを使用しているDockerコンテナが残っています。\n\
                  Docker Desktopで対象コンテナを削除してから再試行してください。",
@@ -5372,13 +5733,14 @@ async fn local_asr_uninstall(
         }
 
         return Err(format!(
-            "{}環境の削除に失敗しました\n{}",
-            def.display_name, detail
+            "{}環境の削除に失敗しました（{}）",
+            def.display_name,
+            format_safe_docker_cli_error("docker image rm", output.status.code(), detail_source)
         ));
     }
 
     // 削除確認
-    match inspect_docker_image(&docker_path, &def.image_name) {
+    match inspect_docker_image_with_context(&docker_path, &docker_context, &def.image_name) {
         DockerImageInspectResult::Found(_) => {
             return Err("削除後もDockerイメージが確認されました".to_string());
         }
@@ -5388,7 +5750,13 @@ async fn local_asr_uninstall(
     }
 
     // 最新状態を返す
-    Ok(get_single_engine_status(&docker_path, true, &def))
+    Ok(evaluate_engine_image_status_with_context(
+        DockerImageInspectResult::NotFound,
+        &def,
+        true,
+        true,
+        Some(&docker_context),
+    ))
 }
 
 pub fn run() {
@@ -7794,6 +8162,7 @@ mod tests {
             desktop_path: Some("C:\\Docker Desktop.exe".to_string()),
             error_kind: None,
             error_message: None,
+            docker_context: Some("desktop-linux".to_string()),
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("cliFound"));
@@ -7819,6 +8188,7 @@ mod tests {
             desktop_path: None,
             error_kind: Some("cli_not_found".to_string()),
             error_message: Some("not found".to_string()),
+            docker_context: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("errorKind"));
@@ -8049,6 +8419,9 @@ mod tests {
             docker_running: true,
             error_kind: None,
             error_message: None,
+            state: "ready".to_string(),
+            docker_context: Some("desktop-linux".to_string()),
+            reason: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("displayName"));
@@ -8472,7 +8845,220 @@ mod tests {
             assert!(!s.installed);
             assert!(!s.docker_available);
             assert!(!s.docker_running);
+            assert_eq!(s.state, "cli_missing");
         }
+    }
+
+    #[test]
+    fn find_executable_in_path_finds_file_and_skips_dirs() {
+        let unique = format!(
+            "asr-composer-path-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let dir1 = root.join("dir1");
+        let dir2 = root.join("dir2");
+        std::fs::create_dir_all(dir1.join("docker.exe")).unwrap(); // directory, must be skipped
+        std::fs::create_dir_all(&dir2).unwrap();
+        let exe_path = dir2.join("docker.exe");
+        std::fs::write(&exe_path, b"").unwrap();
+
+        let joined = std::env::join_paths([&dir1, &dir2]).unwrap();
+        let found = find_executable_in_path(Some(joined.as_os_str()), &["docker.exe", "docker"]);
+        assert_eq!(found, Some(exe_path));
+
+        let not_found = find_executable_in_path(Some(dir1.as_os_str()), &["docker.exe", "docker"]);
+        assert_eq!(not_found, None);
+        assert_eq!(find_executable_in_path(None, &["docker.exe"]), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hidden_command_uses_create_no_window_flag() {
+        assert_eq!(WINDOWS_CREATE_NO_WINDOW, 0x0800_0000);
+        let std_cmd = new_hidden_std_command("docker.exe");
+        assert_eq!(std_cmd.get_program(), "docker.exe");
+        let _tokio_cmd = new_hidden_tokio_command("docker.exe");
+    }
+
+    #[test]
+    fn unified_seven_states_and_transcribe_validation() {
+        let defs = local_asr_engine_defs();
+        let def = &defs[0];
+
+        // 1. cli_missing
+        let cli_missing = evaluate_engine_image_status_with_context(
+            DockerImageInspectResult::NotFound,
+            def,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(cli_missing.state, "cli_missing");
+        assert!(validate_engine_status_for_transcribe(&cli_missing).is_err());
+
+        // 2. engine_stopped
+        let engine_stopped = evaluate_engine_image_status_with_context(
+            DockerImageInspectResult::NotFound,
+            def,
+            true,
+            false,
+            Some("desktop-linux"),
+        );
+        assert_eq!(engine_stopped.state, "engine_stopped");
+        assert_eq!(engine_stopped.docker_context.as_deref(), Some("desktop-linux"));
+        assert!(validate_engine_status_for_transcribe(&engine_stopped).is_err());
+
+        // 3. context_error
+        let ctx_err = build_error_statuses(
+            &defs,
+            "context_error",
+            true,
+            false,
+            None,
+            "context show failed",
+        );
+        assert_eq!(ctx_err[0].state, "context_error");
+        let err_msg = validate_engine_status_for_transcribe(&ctx_err[0]).unwrap_err();
+        assert!(err_msg.contains("context show failed"));
+
+        // 4. image_list_error
+        let img_list_err = build_error_statuses(
+            &defs,
+            "image_list_error",
+            true,
+            true,
+            Some("desktop-linux"),
+            "image ls failed",
+        );
+        assert_eq!(img_list_err[0].state, "image_list_error");
+        let err_msg2 = validate_engine_status_for_transcribe(&img_list_err[0]).unwrap_err();
+        assert!(err_msg2.contains("image ls failed"));
+
+        // 5. image_missing
+        let missing = evaluate_engine_image_status_with_context(
+            DockerImageInspectResult::NotFound,
+            def,
+            true,
+            true,
+            Some("desktop-linux"),
+        );
+        assert_eq!(missing.state, "image_missing");
+        assert!(!missing.installed);
+        assert!(validate_engine_status_for_transcribe(&missing).unwrap_err().contains("インストールされていません"));
+
+        // 6. update_required
+        let mut old_labels = HashMap::new();
+        old_labels.insert("com.asr-composer.environment-version".to_string(), "1.0.0".to_string());
+        let update_req = evaluate_engine_image_status_with_context(
+            DockerImageInspectResult::Found(DockerImageInfo {
+                image_id: "sha256:old".to_string(),
+                labels: old_labels,
+            }),
+            def,
+            true,
+            true,
+            Some("desktop-linux"),
+        );
+        assert_eq!(update_req.state, "update_required");
+        assert!(update_req.needs_update);
+        assert!(validate_engine_status_for_transcribe(&update_req).unwrap_err().contains("更新が必要"));
+
+        // 7. ready
+        let mut ok_labels = HashMap::new();
+        ok_labels.insert(
+            "com.asr-composer.environment-version".to_string(),
+            def.expected_environment_version.to_string(),
+        );
+        let ready = evaluate_engine_image_status_with_context(
+            DockerImageInspectResult::Found(DockerImageInfo {
+                image_id: "sha256:ok".to_string(),
+                labels: ok_labels,
+            }),
+            def,
+            true,
+            true,
+            Some("desktop-linux"),
+        );
+        assert_eq!(ready.state, "ready");
+        assert!(ready.installed);
+        assert!(!ready.needs_update);
+        assert!(validate_engine_status_for_transcribe(&ready).is_ok());
+    }
+
+    #[test]
+    fn docker_cli_failure_log_and_error_never_leak_stderr_secrets() {
+        let secret_stderr = "error during connect: Bearer eyJhbGciOiJIUzI1NiJ9.secret_payload https://user:supersecretpass@proxy.local hf_abc123456789 token=xyz987";
+        let log_line = format_docker_cli_failure_log(
+            "image ls",
+            Some("desktop-linux"),
+            Some(1),
+            secret_stderr,
+        );
+        let safe_err = format_safe_docker_cli_error("docker image ls", Some(1), secret_stderr);
+
+        for forbidden in ["eyJhbGciOiJIUzI1NiJ9", "supersecretpass", "hf_abc123456789", "xyz987", "Bearer"] {
+            assert!(!log_line.contains(forbidden), "log leaked secret: {log_line}");
+            assert!(!safe_err.contains(forbidden), "error leaked secret: {safe_err}");
+        }
+        assert!(log_line.contains("op=image ls"));
+        assert!(log_line.contains("context=desktop-linux"));
+        assert!(log_line.contains("exit_code=1"));
+        assert!(log_line.contains("category=daemon_unavailable"));
+
+        let defs = local_asr_engine_defs();
+        let statuses = build_error_statuses(
+            &defs,
+            "image_list_error",
+            true,
+            true,
+            Some("desktop-linux"),
+            &safe_err,
+        );
+        let serialized = serde_json::to_string(&statuses).unwrap();
+        assert!(!serialized.contains("hf_abc123456789"));
+        assert!(!serialized.contains("supersecretpass"));
+
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "os error with secret hf_io_secret_999",
+        );
+        let io_log = format_docker_cli_io_failure_log("context show", None, &io_err);
+        let io_msg = format_safe_docker_io_error("docker context show", &io_err);
+        assert!(!io_log.contains("hf_io_secret_999"));
+        assert!(!io_msg.contains("hf_io_secret_999"));
+        let (_, check_err_msg) = docker_error_to_status(DockerCheckError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "os error with secret hf_io_secret_999",
+        )));
+        let check_err_str = check_err_msg.unwrap();
+        assert!(!check_err_str.contains("hf_io_secret_999"));
+        assert!(check_err_str.contains("io_permission_denied"));
+    }
+
+    #[test]
+    fn explicit_docker_context_is_preserved_without_fallback() {
+        assert_eq!(
+            parse_explicit_docker_context(Some("  desktop-linux  ")),
+            ExplicitDockerContext::Provided("desktop-linux".to_string())
+        );
+        assert_eq!(
+            parse_explicit_docker_context(Some("")),
+            ExplicitDockerContext::InvalidEmpty
+        );
+        assert_eq!(
+            parse_explicit_docker_context(Some("   ")),
+            ExplicitDockerContext::InvalidEmpty
+        );
+        assert_eq!(
+            parse_explicit_docker_context(None),
+            ExplicitDockerContext::Unset
+        );
     }
 
     // ---- classify_docker_start_result ----
@@ -8486,17 +9072,27 @@ mod tests {
 
     #[test]
     fn classify_docker_start_failure_with_stderr() {
-        let result = classify_docker_start_result(false, "", "error: something went wrong");
+        let result = classify_docker_start_result(
+            false,
+            "",
+            "permission denied: Bearer secret_token_123",
+        );
         assert!(!result.launched);
         assert!(result.message.contains("起動に失敗しました"));
-        assert!(result.message.contains("something went wrong"));
+        assert!(result.message.contains("permission_denied"));
+        assert!(!result.message.contains("secret_token_123"));
     }
 
     #[test]
     fn classify_docker_start_failure_with_stdout_fallback() {
-        let result = classify_docker_start_result(false, "some output", "");
+        let result = classify_docker_start_result(
+            false,
+            "cannot connect to daemon hf_secret_456",
+            "",
+        );
         assert!(!result.launched);
-        assert!(result.message.contains("some output"));
+        assert!(result.message.contains("daemon_unavailable"));
+        assert!(!result.message.contains("hf_secret_456"));
     }
 
     #[test]
@@ -8509,9 +9105,16 @@ mod tests {
 
     #[test]
     fn classify_docker_start_stderr_preferred_over_stdout() {
-        let result = classify_docker_start_result(false, "stdout msg", "stderr msg");
-        assert!(result.message.contains("stderr msg"));
-        assert!(!result.message.contains("stdout msg"));
+        let result = classify_docker_start_result(
+            false,
+            "permission denied stdout_secret",
+            "cannot connect to the docker daemon stderr_secret",
+        );
+        assert!(!result.launched);
+        assert!(result.message.contains("daemon_unavailable"));
+        assert!(!result.message.contains("permission_denied"));
+        assert!(!result.message.contains("stderr_secret"));
+        assert!(!result.message.contains("stdout_secret"));
     }
 
     // ---- tail_stderr ----
