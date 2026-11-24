@@ -1,0 +1,6 @@
+{
+  "client_id": "YOUR_DESKTOP_CLIENT_ID.apps.googleusercontent.com",
+  "client_secret": "YOUR_DESKTOP_CLIENT_SECRET",
+  "secret_mode": "required",
+  "default_project_id": "your-project-id"
+}

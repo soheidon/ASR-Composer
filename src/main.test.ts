@@ -14,8 +14,10 @@ import {
   isForceClosingForTest,
   navigateTo,
   resetMountedPagesForTest,
+  resetMultiAsrMainStateForTest,
   pageMounts,
   setTauriInvokeForTest,
+  setSelectedAudioFileForTest,
   resetDockerStatusRevisionForTest,
   loadAndRenderDockerStatus,
 } from "./main";
@@ -1094,6 +1096,7 @@ describe("Persistent Workspace DOM Retention", () => {
     vi.restoreAllMocks();
     document.body.innerHTML = '<div id="app"></div>';
     resetMountedPagesForTest();
+    resetMultiAsrMainStateForTest();
     resetWindowCloseGuardForTest();
     resetDockerStatusRevisionForTest();
     setEditorDocument(null);
@@ -2216,13 +2219,26 @@ describe("Persistent Workspace DOM Retention", () => {
           ...defaultMockSettings,
           providers: {
             ...defaultMockSettings.providers,
-            google_stt: { options: { project_id: "project", location: "us-central1" } },
+            google_stt: { options: { location: "us-central1" } },
             xiaomi_mimo_asr: { env_name: "XIAOMI_API_KEY" },
           },
           asr_execution_mode: "compare",
           multi_asr_mode: "compare",
           multi_asr_source_mode: "mixed",
           multi_asr_engines: ["cloud:google_stt", "local:reazonspeech"],
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 1,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "project",
+          projectVerified: true,
         };
       }
       if (command === "save_multi_asr_settings") {
@@ -2266,11 +2282,24 @@ describe("Persistent Workspace DOM Retention", () => {
           ...defaultMockSettings,
           providers: {
             ...defaultMockSettings.providers,
-            google_stt: { options: { project_id: "project", location: "us-central1" } },
+            google_stt: { options: { location: "us-central1" } },
           },
           asr_execution_mode: "compare",
           multi_asr_source_mode: "mixed",
           multi_asr_engines: ["kotoba-whisper", "reazonspeech"],
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 1,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "project",
+          projectVerified: true,
         };
       }
       if (command === "save_multi_asr_settings") {
@@ -2378,7 +2407,7 @@ describe("Persistent Workspace DOM Retention", () => {
           ...defaultMockSettings,
           providers: {
             ...defaultMockSettings.providers,
-            google_stt: { options: { project_id: "project", location: "us-central1" } },
+            google_stt: { options: { location: "us-central1" } },
             xiaomi_mimo_asr: { env_name: "XIAOMI_API_KEY" },
           },
           asr_execution_mode: "compare",
@@ -2386,6 +2415,19 @@ describe("Persistent Workspace DOM Retention", () => {
           multi_asr_source_mode: "mixed",
           multi_asr_engines: ["local:kotoba-whisper", "cloud:google_stt"],
           multi_asr_anchor_index: 1,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 1,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "project",
+          projectVerified: true,
         };
       }
       if (command === "save_multi_asr_settings") {
@@ -2443,6 +2485,1952 @@ describe("Persistent Workspace DOM Retention", () => {
     expect(anchorSelect.value).toBe("1");
     expect(anchorWarning.style.display).toBe("");
     expect(anchorWarning.textContent).toContain("Xiaomi MiMo");
+  });
+
+  it("updates 1-engine and 2-engine Google STT options from google_auth_get_status across login, project confirm, switch, and logout without using legacy options.project_id", async () => {
+    let mockAuthStatus: any = {
+      state: "disconnected",
+      authGeneration: 1,
+      oauthClientIdFingerprint: "fp-test",
+      oauthClientConfigured: true,
+      canonicalScopes: [],
+      projectVerified: false,
+      legacyProjectCandidate: "legacy-proj-999",
+    };
+
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: { options: { project_id: "legacy-proj-999", location: "us-central1" } },
+            xiaomi_mimo_asr: { env_name: "XIAOMI_API_KEY" },
+          },
+          asr_mode: "cloud",
+          asr_execution_mode: "single",
+        };
+      }
+      if (command === "google_auth_get_status") return mockAuthStatus;
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    const execMode = document.getElementById("asrExecutionModeSelect") as HTMLSelectElement;
+    const firstSource = document.getElementById("multiAsrFirstSourceModeSelect") as HTMLSelectElement;
+    const firstEngine = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement;
+
+    expect(Array.from(engineSelect.options).map((o) => o.value)).not.toContain("google_stt");
+
+    mockAuthStatus = {
+      state: "connected",
+      authGeneration: 2,
+      oauthClientIdFingerprint: "fp-test",
+      oauthClientConfigured: true,
+      email: "a@example.com",
+      sub: "sub-A",
+      canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+      projectId: "proj-a-123",
+      projectVerified: false,
+    };
+    await navigateTo("transcribe");
+    expect(Array.from(engineSelect.options).map((o) => o.value)).toContain("google_stt");
+
+    execMode.value = "compare";
+    execMode.dispatchEvent(new Event("change"));
+    firstSource.value = "cloud";
+    firstSource.dispatchEvent(new Event("change"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(Array.from(firstEngine.options).map((o) => o.value)).toContain("google_stt");
+
+    mockAuthStatus = {
+      state: "connected",
+      authGeneration: 3,
+      oauthClientIdFingerprint: "fp-test",
+      oauthClientConfigured: true,
+      email: "b@example.com",
+      sub: "sub-B",
+      canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+      projectVerified: false,
+    };
+    await navigateTo("transcribe");
+    expect(Array.from(engineSelect.options).map((o) => o.value)).not.toContain("google_stt");
+
+    mockAuthStatus = {
+      state: "disconnected",
+      authGeneration: 4,
+      oauthClientIdFingerprint: "fp-test",
+      oauthClientConfigured: true,
+      canonicalScopes: [],
+      projectVerified: false,
+    };
+    await navigateTo("transcribe");
+    expect(Array.from(engineSelect.options).map((o) => o.value)).not.toContain("google_stt");
+  });
+
+  it("discards stale out-of-order connected google_auth_get_status after logout in both 1-engine and 2-engine selectors", async () => {
+    let resolveSlowStatus!: (val: any) => void;
+    const slowStatusPromise = new Promise((resolve) => {
+      resolveSlowStatus = resolve;
+    });
+    let statusCallCount = 0;
+
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: { options: { location: "us-central1" } },
+            xiaomi_mimo_asr: { env_name: "XIAOMI_API_KEY" },
+          },
+          asr_mode: "cloud",
+          asr_execution_mode: "single",
+        };
+      }
+      if (command === "google_auth_get_status") {
+        statusCallCount += 1;
+        if (statusCallCount === 2) {
+          // Slow response from before logout (generation 2, connected)
+          return slowStatusPromise;
+        }
+        // Initial mount (#1) and newer response after logout (#3+)
+        return {
+          state: "disconnected",
+          authGeneration: statusCallCount >= 3 ? 3 : 1,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          canonicalScopes: [],
+          projectVerified: false,
+        };
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    // Mount transcribe first
+    await navigateTo("transcribe");
+    const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement;
+
+    // Trigger slow cloud-engine refresh (#2, pre-logout)
+    modeSelect.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Trigger newer post-logout refresh (#3, generation 3 disconnected)
+    await navigateTo("transcribe");
+
+    // Now resolve the slow pre-logout connected response (generation 2)
+    resolveSlowStatus({
+      state: "connected",
+      authGeneration: 2,
+      oauthClientIdFingerprint: "fp-test",
+      oauthClientConfigured: true,
+      email: "a@example.com",
+      sub: "sub-A",
+      canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+      projectId: "proj-a-123",
+      projectVerified: true,
+    });
+    await new Promise((r) => setTimeout(r, 0));
+
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    expect(Array.from(engineSelect.options).map((o) => o.value)).not.toContain("google_stt");
+
+    // Also verify 2-engine selector remains disconnected
+    const execMode = document.getElementById("asrExecutionModeSelect") as HTMLSelectElement;
+    const firstSource = document.getElementById("multiAsrFirstSourceModeSelect") as HTMLSelectElement;
+    const firstEngine = document.getElementById("multiAsrFirstEngineSelect") as HTMLSelectElement;
+    execMode.value = "compare";
+    execMode.dispatchEvent(new Event("change"));
+    firstSource.value = "cloud";
+    firstSource.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(Array.from(firstEngine.options).map((o) => o.value)).not.toContain("google_stt");
+  });
+
+  it("executes Google STT in single-engine mode via google_stt_recognize, saves outputs, displays result, and triggers auto-correction", async () => {
+    const invokedCommands: string[] = [];
+    const savedTextPaths: string[] = [];
+    let savedDocPath = "";
+    let ollamaCalled = false;
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      invokedCommands.push(command);
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+            ollama: { base_url: "http://localhost:11434", default_model: "llama3" },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "C:/out",
+          correction_enabled: true,
+          correction_provider: "ollama",
+          correction_model: "llama3",
+          correction_use_dictionary: false,
+          correction_use_background: false,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 2,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-123",
+          projectVerified: true,
+        };
+      }
+      if (command === "resolve_output_directory") {
+        return args?.outputPath || "C:/Users/test/Downloads";
+      }
+      if (command === "google_stt_recognize") {
+        expect(args.input.projectId).toBe("proj-123");
+        expect(args.input.location).toBe("us-central1");
+        expect(args.input.audioPath).toBe("C:/audio/sample.wav");
+        return {
+          transcript: "こんにちは世界",
+          segments: [],
+          rawResponse: {
+            results: [
+              {
+                alternatives: [
+                  {
+                    transcript: "こんにちは世界",
+                    words: [
+                      { word: "こんにちは", startOffset: "0s", endOffset: "0.5s" },
+                      { word: "世界", startOffset: "0.5s", endOffset: "1.0s" },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      }
+      if (command === "save_text_file") {
+        savedTextPaths.push(args.path);
+        return null;
+      }
+      if (command === "save_transcript_document") {
+        savedDocPath = args.path;
+        return null;
+      }
+      if (command === "commit_staged_output_files") {
+        for (const f of args.files as Array<{ tempPath: string; finalPath: string }>) {
+          if (f.finalPath.endsWith(".asrc.json")) {
+            savedDocPath = f.finalPath;
+          } else {
+            savedTextPaths.push(f.finalPath);
+          }
+        }
+        return null;
+      }
+      if (command === "call_ollama_chat") {
+        ollamaCalled = true;
+        return JSON.stringify({
+          corrections: [],
+        });
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:/audio/sample.wav");
+
+    const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement;
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    expect(modeSelect.value).toBe("cloud");
+    expect(Array.from(engineSelect.options).map((o) => o.value)).toContain("google_stt");
+    engineSelect.value = "google_stt";
+
+    const startBtn = document.getElementById("startBtn") as HTMLButtonElement;
+    startBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(invokedCommands).not.toContain("local_asr_transcribe");
+    expect(invokedCommands).toContain("google_stt_recognize");
+    expect(savedTextPaths.some((p) => p.endsWith("sample.txt"))).toBe(true);
+    expect(savedDocPath).toMatch(/sample\.asrc\.json$/);
+    const resultText = document.getElementById("resultText") as HTMLTextAreaElement;
+    expect(resultText.value).toContain("こんにちは");
+    expect(ollamaCalled).toBe(true);
+  });
+
+  it("discards stale single-engine Google STT result without saving or displaying when user logs out in flight", async () => {
+    const invokedCommands: string[] = [];
+    let authStatusCalls = 0;
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      invokedCommands.push(command);
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "C:/out",
+          correction_enabled: true,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        authStatusCalls += 1;
+        // First two calls (mount + start of recognition): connected (gen 2)
+        if (authStatusCalls <= 2) {
+          return {
+            state: "connected",
+            authGeneration: 2,
+            oauthClientIdFingerprint: "fp-test",
+            oauthClientConfigured: true,
+            email: "u@example.com",
+            sub: "sub-1",
+            canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+            projectId: "proj-123",
+            projectVerified: true,
+          };
+        }
+        // Post-recognition check: logged out (gen 3)
+        return {
+          state: "disconnected",
+          authGeneration: 3,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          canonicalScopes: [],
+          projectVerified: false,
+        };
+      }
+      if (command === "resolve_output_directory") {
+        return args?.outputPath || "C:/Users/test/Downloads";
+      }
+      if (command === "google_stt_recognize") {
+        return {
+          transcript: "stale transcript",
+          segments: [],
+          authGeneration: 2,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+          rawResponse: {
+            results: [{ alternatives: [{ transcript: "stale transcript" }] }],
+          },
+        };
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:/audio/sample.wav");
+
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    engineSelect.value = "google_stt";
+
+    const startBtn = document.getElementById("startBtn") as HTMLButtonElement;
+    startBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(invokedCommands).toContain("google_stt_recognize");
+    expect(invokedCommands).not.toContain("save_text_file");
+    expect(invokedCommands).not.toContain("save_transcript_document");
+    expect(invokedCommands).not.toContain("call_ollama_chat");
+    const resultText = document.getElementById("resultText") as HTMLTextAreaElement;
+    expect(resultText.value).toBe("");
+  });
+
+  it("fails closed without saving or displaying when post-recognition google_auth_get_status fails", async () => {
+    const invokedCommands: string[] = [];
+    let authStatusCalls = 0;
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      invokedCommands.push(command);
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "C:/out",
+          correction_enabled: true,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        authStatusCalls += 1;
+        if (authStatusCalls <= 2) {
+          return {
+            state: "connected",
+            authGeneration: 2,
+            oauthClientIdFingerprint: "fp-test",
+            oauthClientConfigured: true,
+            email: "u@example.com",
+            sub: "sub-1",
+            canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+            projectId: "proj-123",
+            projectVerified: true,
+          };
+        }
+        throw new Error("auth status IPC unavailable");
+      }
+      if (command === "resolve_output_directory") {
+        return args?.outputPath || "C:/Users/test/Downloads";
+      }
+      if (command === "google_stt_recognize") {
+        return {
+          transcript: "unverified transcript",
+          segments: [],
+          authGeneration: 2,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+          rawResponse: {
+            results: [{ alternatives: [{ transcript: "unverified transcript" }] }],
+          },
+        };
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:/audio/sample.wav");
+
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    engineSelect.value = "google_stt";
+
+    const startBtn = document.getElementById("startBtn") as HTMLButtonElement;
+    startBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(invokedCommands).toContain("google_stt_recognize");
+    expect(invokedCommands).not.toContain("save_text_file");
+    expect(invokedCommands).not.toContain("save_transcript_document");
+    expect(invokedCommands).not.toContain("call_ollama_chat");
+    const resultText = document.getElementById("resultText") as HTMLTextAreaElement;
+    expect(resultText.value).toBe("");
+  });
+
+  it("resolves empty outputPath to Downloads folder via resolve_output_directory and saves all 6 output formats", async () => {
+    const savedFiles = new Map<string, string>();
+    let savedDocPath: string | null = null;
+    let resolvedArg: string | undefined;
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "",
+          correction_enabled: false,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 2,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-123",
+          projectVerified: true,
+        };
+      }
+      if (command === "resolve_output_directory") {
+        resolvedArg = args?.outputPath;
+        return "C:\\Users\\test\\Downloads";
+      }
+      if (command === "google_stt_recognize") {
+        return {
+          transcript: "hello world",
+          segments: [],
+          rawResponse: {
+            results: [
+              {
+                alternatives: [
+                  {
+                    transcript: "hello world",
+                    words: [
+                      { word: "hello", startOffset: "0s", endOffset: "0.5s" },
+                      { word: "world", startOffset: "0.5s", endOffset: "1.25s" },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      }
+      if (command === "save_text_file") {
+        savedFiles.set(args.path, args.content);
+        return null;
+      }
+      if (command === "save_transcript_document") {
+        savedDocPath = args.path;
+        return null;
+      }
+      if (command === "commit_staged_output_files") {
+        for (const f of args.files as Array<{ tempPath: string; finalPath: string }>) {
+          const content = savedFiles.get(f.tempPath);
+          if (content !== undefined) {
+            savedFiles.delete(f.tempPath);
+            savedFiles.set(f.finalPath, content);
+          }
+          if (f.finalPath.endsWith(".asrc.json")) {
+            savedDocPath = f.finalPath;
+          }
+        }
+        return null;
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:\\audio\\meeting.wav");
+
+    // Ensure outputPath is empty and ALL 6 formats are checked
+    const outputInput = document.getElementById("outputPathInput") as HTMLInputElement;
+    outputInput.value = "";
+    document.querySelectorAll<HTMLInputElement>(".output-format-checkbox").forEach((cb) => {
+      cb.checked = true;
+    });
+
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    engineSelect.value = "google_stt";
+
+    const startBtn = document.getElementById("startBtn") as HTMLButtonElement;
+    startBtn.click();
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(resolvedArg).toBe("");
+    expect(savedDocPath).toBe("C:\\Users\\test\\Downloads\\meeting.asrc.json");
+    expect(savedFiles.get("C:\\Users\\test\\Downloads\\meeting.txt")).toBe("hello\nworld");
+    expect(JSON.parse(savedFiles.get("C:\\Users\\test\\Downloads\\meeting.json")!)).toMatchObject({
+      mediaFileName: "meeting.wav",
+      sourceEngine: "cloud:google_stt",
+    });
+    expect(savedFiles.get("C:\\Users\\test\\Downloads\\meeting.md")).toContain(
+      "- **[00:00:00.000 - 00:00:00.500]** hello",
+    );
+    expect(savedFiles.get("C:\\Users\\test\\Downloads\\meeting.srt")).toContain(
+      "1\n00:00:00,000 --> 00:00:00,500\nhello",
+    );
+    expect(savedFiles.get("C:\\Users\\test\\Downloads\\meeting.csv")).toContain(
+      'start,end,text\n00:00:00.000,00:00:00.500,"hello"',
+    );
+    expect(savedFiles.get("C:\\Users\\test\\Downloads\\meeting.vtt")).toContain(
+      "WEBVTT\n\n1\n00:00:00.000 --> 00:00:00.500\nhello",
+    );
+    const savedInfo = document.getElementById("savedFilesInfo") as HTMLElement;
+    expect(savedInfo.style.display).toBe("");
+    expect(savedInfo.textContent).toContain("C:\\Users\\test\\Downloads");
+  });
+
+  it("handles timing-less Google STT results: saves txt/json/md/csv without fake timestamps, reports skipped srt/vtt, and fails if only srt/vtt selected", async () => {
+    const savedFiles = new Map<string, string>();
+    const dialogSpy = vi.spyOn(statusModule, "showAppDialog").mockResolvedValue(undefined as any);
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "C:/out",
+          correction_enabled: false,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 2,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-123",
+          projectVerified: true,
+        };
+      }
+      if (command === "resolve_output_directory") return "C:/out";
+      if (command === "google_stt_recognize") {
+        return {
+          transcript: "時刻なし文字起こし",
+          segments: [],
+          rawResponse: {
+            results: [{ alternatives: [{ transcript: "時刻なし文字起こし" }] }],
+          },
+        };
+      }
+      if (command === "save_text_file") {
+        savedFiles.set(args.path, args.content);
+        return null;
+      }
+      if (command === "save_transcript_document") return null;
+      if (command === "commit_staged_output_files") {
+        for (const f of args.files as Array<{ tempPath: string; finalPath: string }>) {
+          const content = savedFiles.get(f.tempPath);
+          if (content !== undefined) {
+            savedFiles.delete(f.tempPath);
+            savedFiles.set(f.finalPath, content);
+          }
+        }
+        return null;
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:/audio/notime.wav");
+    document.querySelectorAll<HTMLInputElement>(".output-format-checkbox").forEach((cb) => {
+      cb.checked = true;
+    });
+    (document.getElementById("engineSelect") as HTMLSelectElement).value = "google_stt";
+
+    (document.getElementById("startBtn") as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(savedFiles.get("C:/out/notime.txt")).toBe("時刻なし文字起こし");
+    expect(savedFiles.has("C:/out/notime.json")).toBe(true);
+    expect(savedFiles.get("C:/out/notime.md")).toContain("時刻なし文字起こし");
+    expect(savedFiles.get("C:/out/notime.csv")).toBe('start,end,text\n,,"時刻なし文字起こし"\n');
+    expect(savedFiles.has("C:/out/notime.srt")).toBe(false);
+    expect(savedFiles.has("C:/out/notime.vtt")).toBe(false);
+    const savedInfo = document.getElementById("savedFilesInfo") as HTMLElement;
+    expect(savedInfo.textContent).toContain("未出力（タイムスタンプ情報なし）: SRT, VTT");
+
+    // Now select ONLY srt -> must fail explicitly without saving
+    savedFiles.clear();
+    dialogSpy.mockClear();
+    document.querySelectorAll<HTMLInputElement>(".output-format-checkbox").forEach((cb) => {
+      cb.checked = cb.value === "srt";
+    });
+    (document.getElementById("startBtn") as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(savedFiles.size).toBe(0);
+    expect(dialogSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "文字起こしエラー",
+        message: expect.stringContaining("タイムスタンプ情報が含まれていないため"),
+      }),
+    );
+  });
+
+  it("aborts without saving, displaying, or auto-correcting when user cancels during in-flight Google STT recognition", async () => {
+    const invokedCommands: string[] = [];
+    let resolveRecognize!: (value: any) => void;
+
+    setTauriInvokeForTest((async (command: string) => {
+      invokedCommands.push(command);
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "C:/out",
+          correction_enabled: true,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 2,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-123",
+          projectVerified: true,
+        };
+      }
+      if (command === "resolve_output_directory") return "C:/out";
+      if (command === "google_stt_recognize") {
+        return await new Promise((resolve) => {
+          resolveRecognize = resolve;
+        });
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:/audio/cancel.wav");
+    (document.getElementById("engineSelect") as HTMLSelectElement).value = "google_stt";
+
+    const startBtn = document.getElementById("startBtn") as HTMLButtonElement;
+    const cancelBtn = document.getElementById("cancelBtn") as HTMLButtonElement;
+    startBtn.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // User clicks cancel while google_stt_recognize is still in flight
+    cancelBtn.click();
+    resolveRecognize({
+      transcript: "cancelled transcript",
+      segments: [],
+      rawResponse: {
+        results: [{ alternatives: [{ transcript: "cancelled transcript" }] }],
+      },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(invokedCommands).toContain("google_stt_recognize");
+    expect(invokedCommands).not.toContain("save_text_file");
+    expect(invokedCommands).not.toContain("save_transcript_document");
+    expect(invokedCommands).not.toContain("call_ollama_chat");
+    const resultText = document.getElementById("resultText") as HTMLTextAreaElement;
+    expect(resultText.value).toBe("");
+  });
+
+  it("preserves existing files, cleans up only staged temp files, and aborts when user cancels while saving multiple output formats", async () => {
+    const fsMap = new Map<string, string>([
+      ["C:/out/midsave.txt", "EXISTING TXT CONTENT"],
+      ["C:/out/midsave.json", '{"existing":true}'],
+    ]);
+    const writtenTempPaths: string[] = [];
+    const removedPaths: string[] = [];
+    const invokedCommands: string[] = [];
+    let resolveSecondSave!: () => void;
+    let saveCallCount = 0;
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      invokedCommands.push(command);
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "C:/out",
+          correction_enabled: true,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 2,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-123",
+          projectVerified: true,
+        };
+      }
+      if (command === "resolve_output_directory") return "C:/out";
+      if (command === "google_stt_recognize") {
+        return {
+          transcript: "hello",
+          segments: [],
+          rawResponse: {
+            results: [{ alternatives: [{ transcript: "hello" }] }],
+          },
+        };
+      }
+      if (command === "save_text_file") {
+        saveCallCount += 1;
+        writtenTempPaths.push(args.path);
+        fsMap.set(args.path, args.content);
+        if (saveCallCount === 2) {
+          return await new Promise<null>((resolve) => {
+            resolveSecondSave = () => resolve(null);
+          });
+        }
+        return null;
+      }
+      if (command === "remove_output_file") {
+        removedPaths.push(args.path);
+        fsMap.delete(args.path);
+        return null;
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:/audio/midsave.wav");
+    document.querySelectorAll<HTMLInputElement>(".output-format-checkbox").forEach((cb) => {
+      cb.checked = cb.value === "txt" || cb.value === "json";
+    });
+    (document.getElementById("engineSelect") as HTMLSelectElement).value = "google_stt";
+
+    const startBtn = document.getElementById("startBtn") as HTMLButtonElement;
+    const cancelBtn = document.getElementById("cancelBtn") as HTMLButtonElement;
+    startBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Only temp paths are written; existing files are untouched
+    expect(writtenTempPaths.length).toBe(2);
+    expect(writtenTempPaths[0]).toMatch(/^C:\/out\/midsave\.txt\.tmp-/);
+    expect(writtenTempPaths[1]).toMatch(/^C:\/out\/midsave\.json\.tmp-/);
+    cancelBtn.click();
+    resolveSecondSave();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Only staged temp paths are removed; pre-existing files remain intact; commit never runs
+    expect(removedPaths).toEqual(writtenTempPaths);
+    expect(fsMap.get("C:/out/midsave.txt")).toBe("EXISTING TXT CONTENT");
+    expect(fsMap.get("C:/out/midsave.json")).toBe('{"existing":true}');
+    expect(invokedCommands).not.toContain("commit_staged_output_files");
+    expect(invokedCommands).not.toContain("save_transcript_document");
+    expect(invokedCommands).not.toContain("call_ollama_chat");
+    const resultText = document.getElementById("resultText") as HTMLTextAreaElement;
+    expect(resultText.value).toBe("");
+  });
+
+  it("preserves existing files and cleans up staged temp files when write fails during saving", async () => {
+    const fsMap = new Map<string, string>([
+      ["C:/out/fail.txt", "ORIGINAL TXT"],
+      ["C:/out/fail.json", '{"original":true}'],
+    ]);
+    const removedPaths: string[] = [];
+    const invokedCommands: string[] = [];
+    const dialogSpy = vi.spyOn(statusModule, "showAppDialog").mockResolvedValue(undefined as any);
+    let saveCallCount = 0;
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      invokedCommands.push(command);
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "C:/out",
+          correction_enabled: true,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 2,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-123",
+          projectVerified: true,
+        };
+      }
+      if (command === "resolve_output_directory") return "C:/out";
+      if (command === "google_stt_recognize") {
+        return {
+          transcript: "new text",
+          segments: [],
+          rawResponse: {
+            results: [{ alternatives: [{ transcript: "new text" }] }],
+          },
+        };
+      }
+      if (command === "save_text_file") {
+        saveCallCount += 1;
+        if (saveCallCount === 2) {
+          throw new Error("disk full");
+        }
+        fsMap.set(args.path, args.content);
+        return null;
+      }
+      if (command === "remove_output_file") {
+        removedPaths.push(args.path);
+        fsMap.delete(args.path);
+        return null;
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:/audio/fail.wav");
+    document.querySelectorAll<HTMLInputElement>(".output-format-checkbox").forEach((cb) => {
+      cb.checked = cb.value === "txt" || cb.value === "json";
+    });
+    (document.getElementById("engineSelect") as HTMLSelectElement).value = "google_stt";
+
+    (document.getElementById("startBtn") as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(invokedCommands).not.toContain("commit_staged_output_files");
+    expect(removedPaths.every((p) => /\.tmp-/.test(p))).toBe(true);
+    expect(fsMap.get("C:/out/fail.txt")).toBe("ORIGINAL TXT");
+    expect(fsMap.get("C:/out/fail.json")).toBe('{"original":true}');
+    expect(dialogSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "文字起こしエラー",
+      }),
+    );
+  });
+
+  it("aborts right before commit when cancelled during .asrc.json staging without overwriting existing files", async () => {
+    const fsMap = new Map<string, string>([
+      ["C:/out/precommit.txt", "KEEP EXISTING TXT"],
+      ["C:/out/precommit.asrc.json", '{"keep":true}'],
+    ]);
+    const removedPaths: string[] = [];
+    const invokedCommands: string[] = [];
+    let resolveAsrcStage!: () => void;
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      invokedCommands.push(command);
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "C:/out",
+          correction_enabled: false,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 2,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-123",
+          projectVerified: true,
+        };
+      }
+      if (command === "resolve_output_directory") return "C:/out";
+      if (command === "google_stt_recognize") {
+        return {
+          transcript: "new",
+          segments: [],
+          rawResponse: { results: [{ alternatives: [{ transcript: "new" }] }] },
+        };
+      }
+      if (command === "save_text_file") {
+        fsMap.set(args.path, args.content);
+        return null;
+      }
+      if (command === "save_transcript_document") {
+        fsMap.set(args.path, JSON.stringify(args.document));
+        return await new Promise<null>((resolve) => {
+          resolveAsrcStage = () => resolve(null);
+        });
+      }
+      if (command === "remove_output_file") {
+        removedPaths.push(args.path);
+        fsMap.delete(args.path);
+        return null;
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:/audio/precommit.wav");
+    (document.getElementById("engineSelect") as HTMLSelectElement).value = "google_stt";
+
+    (document.getElementById("startBtn") as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Cancel right before commit starts (while .asrc.json temp staging is finishing)
+    (document.getElementById("cancelBtn") as HTMLButtonElement).click();
+    resolveAsrcStage();
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(invokedCommands).not.toContain("commit_staged_output_files");
+    expect(removedPaths.length).toBe(2);
+    expect(removedPaths.every((p) => /\.tmp-/.test(p))).toBe(true);
+    expect(fsMap.get("C:/out/precommit.txt")).toBe("KEEP EXISTING TXT");
+    expect(fsMap.get("C:/out/precommit.asrc.json")).toBe('{"keep":true}');
+  });
+
+  it("disables and ignores cancel during commit_staged_output_files, shows committing state, and completes normally", async () => {
+    const fsMap = new Map<string, string>();
+    const invokedCommands: string[] = [];
+    let resolveCommit!: () => void;
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      invokedCommands.push(command);
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "C:/out",
+          correction_enabled: false,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 2,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-123",
+          projectVerified: true,
+        };
+      }
+      if (command === "resolve_output_directory") return "C:/out";
+      if (command === "google_stt_recognize") {
+        return {
+          transcript: "committed text",
+          segments: [],
+          rawResponse: { results: [{ alternatives: [{ transcript: "committed text" }] }] },
+        };
+      }
+      if (command === "save_text_file") {
+        fsMap.set(args.path, args.content);
+        return null;
+      }
+      if (command === "save_transcript_document") {
+        fsMap.set(args.path, JSON.stringify(args.document));
+        return null;
+      }
+      if (command === "commit_staged_output_files") {
+        return await new Promise<null>((resolve) => {
+          resolveCommit = () => {
+            for (const f of args.files as Array<{ tempPath: string; finalPath: string }>) {
+              const c = fsMap.get(f.tempPath);
+              if (c !== undefined) {
+                fsMap.delete(f.tempPath);
+                fsMap.set(f.finalPath, c);
+              }
+            }
+            resolve(null);
+          };
+        });
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:/audio/commitlock.wav");
+    (document.getElementById("engineSelect") as HTMLSelectElement).value = "google_stt";
+
+    (document.getElementById("startBtn") as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const cancelBtn = document.getElementById("cancelBtn") as HTMLButtonElement;
+    const progressStage = document.getElementById("progressStage") as HTMLElement;
+    expect(cancelBtn.disabled).toBe(true);
+    expect(cancelBtn.textContent).toContain("確定中...");
+    expect(progressStage.textContent).toBe("出力ファイルを確定中...");
+
+    // Attempting to click cancel during commit is ignored
+    cancelBtn.click();
+    expect(invokedCommands).not.toContain("cancel_transcription");
+
+    resolveCommit();
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(fsMap.get("C:/out/commitlock.txt")).toBe("committed text");
+    expect((document.getElementById("resultText") as HTMLTextAreaElement).value).toBe("committed text");
+  });
+
+  it("shows explicit error dialog when commit_staged_output_files fails partially across formats", async () => {
+    const dialogSpy = vi.spyOn(statusModule, "showAppDialog").mockResolvedValue(undefined as any);
+
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") {
+        return {
+          ...defaultMockSettings,
+          providers: {
+            ...defaultMockSettings.providers,
+            google_stt: {
+              default_model: "chirp_2",
+              options: { location: "us-central1", recognizer_id: "_" },
+            },
+          },
+          asr_mode: "cloud",
+          asr_engine: "google_stt",
+          asr_execution_mode: "single",
+          output_path: "C:/out",
+          correction_enabled: false,
+        };
+      }
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 2,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "u@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-123",
+          projectVerified: true,
+        };
+      }
+      if (command === "resolve_output_directory") return "C:/out";
+      if (command === "google_stt_recognize") {
+        return {
+          transcript: "partial",
+          segments: [],
+          rawResponse: { results: [{ alternatives: [{ transcript: "partial" }] }] },
+        };
+      }
+      if (command === "save_text_file" || command === "save_transcript_document") return null;
+      if (command === "commit_staged_output_files") {
+        throw new Error(
+          "一部の出力ファイルの確定に失敗しました（確定済み: partial.txt / 失敗: partial.json / 未確定: partial.asrc.json）",
+        );
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("transcribe");
+    setSelectedAudioFileForTest("C:/audio/partial.wav");
+    document.querySelectorAll<HTMLInputElement>(".output-format-checkbox").forEach((cb) => {
+      cb.checked = cb.value === "txt" || cb.value === "json";
+    });
+    (document.getElementById("engineSelect") as HTMLSelectElement).value = "google_stt";
+
+    (document.getElementById("startBtn") as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(dialogSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "文字起こしエラー",
+        message: expect.stringContaining("確定済み: partial.txt / 失敗: partial.json"),
+      }),
+    );
+    expect((document.getElementById("resultText") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("§25: handles Speech API disabled with matching consumer via explicit user consent, then re-runs builtin test to success", async () => {
+    const invokedCommands: string[] = [];
+    let recognizeCalls = 0;
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      invokedCommands.push(command);
+      if (command === "load_api_settings") return defaultMockSettings;
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 2,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "user@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "amed-512123",
+          projectVerified: false,
+        };
+      }
+      if (command === "google_stt_list_projects") {
+        return {
+          projects: [{ projectId: "amed-512123", name: "AMED" }],
+          authGeneration: 2,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_stt_run_builtin_test") {
+        recognizeCalls += 1;
+        if (recognizeCalls === 1) {
+          throw {
+            kind: "speech_api_disabled",
+            message: "Cloud Speech-to-Text API is disabled",
+            targetService: "speech.googleapis.com",
+            consumerProject: "amed-512123",
+            authGeneration: 2,
+            sub: "sub-1",
+            oauthClientIdFingerprint: "fp-test",
+          };
+        }
+        return {
+          transcript: "こんにちは",
+          segments: [],
+          authGeneration: 2,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_stt_enable_speech_api") {
+        expect(args).toEqual({ projectId: "amed-512123", confirmed: true });
+        return {
+          projectId: "amed-512123",
+          serviceName: "speech.googleapis.com",
+          status: "enabled",
+          authGeneration: 2,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("settings");
+    await new Promise((r) => setTimeout(r, 30));
+
+    const item = document.querySelector<HTMLElement>('.accordion-item[data-provider-id="google_stt"]')!;
+    const cardText = item.textContent || "";
+    // General user guidance must never ask for PowerShell, gcloud, ADC, env vars, or OAuth JSON edits
+    expect(cardText).not.toMatch(/PowerShell|gcloud|ADC|環境変数|oauth-client/i);
+
+    const builtinBtn = item.querySelector<HTMLButtonElement>(".btn-google-stt-builtin-test")!;
+    builtinBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Must NOT auto-enable without user consent; shows confirmation panel with target project & service
+    expect(invokedCommands).not.toContain("google_stt_enable_speech_api");
+    const confirmPanel = item.querySelector<HTMLElement>('[data-field="api-enable-confirm-panel"]')!;
+    expect(confirmPanel.hidden).toBe(false);
+    expect(confirmPanel.textContent).toContain("amed-512123");
+    expect(confirmPanel.textContent).toContain("speech.googleapis.com");
+
+    // User explicitly clicks confirm -> enables API -> re-runs builtin test -> succeeds
+    const confirmEnableBtn = item.querySelector<HTMLButtonElement>(".btn-google-stt-confirm-enable-api")!;
+    confirmEnableBtn.click();
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(invokedCommands).toContain("google_stt_enable_speech_api");
+    expect(recognizeCalls).toBe(2);
+    expect(confirmPanel.hidden).toBe(true);
+    const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]')!;
+    expect(resultEl.textContent).toContain("こんにちは");
+  });
+
+  it("§25: does not prompt auto-enable on consumer mismatch, and preserves login + shows Console fallback on enable permission denied or failed state recheck", async () => {
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") return defaultMockSettings;
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          authGeneration: 5,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "user@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-selected",
+          projectVerified: false,
+        };
+      }
+      if (command === "google_stt_list_projects") {
+        throw { kind: "project_list_permission_denied", message: "list denied" };
+      }
+      if (command === "google_stt_run_builtin_test") {
+        throw {
+          kind: "speech_api_disabled",
+          message: "disabled",
+          targetService: "speech.googleapis.com",
+          consumerProject: "different-project",
+          authGeneration: 5,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_stt_check_speech_api_state") {
+        throw {
+          kind: "service_usage_permission_denied",
+          message: "権限（serviceusage.services.enable）が不足しています。",
+          authGeneration: 5,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("settings");
+    await new Promise((r) => setTimeout(r, 30));
+
+    const item = document.querySelector<HTMLElement>('.accordion-item[data-provider-id="google_stt"]')!;
+    item.querySelector<HTMLButtonElement>('[data-field="advanced-toggle"]')!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    // Project list failed -> fell back to manual input while staying logged in
+    expect(item.dataset.googleAuthState).toBe("connected");
+    expect(item.querySelector<HTMLInputElement>('[data-field="project-id-input"]')!.hidden).toBe(false);
+
+    // Click builtin test -> consumer mismatch -> must NOT show auto-enable confirm panel; shows fallback panel
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-builtin-test")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(item.querySelector<HTMLElement>('[data-field="api-enable-confirm-panel"]')!.hidden).toBe(true);
+    const fallbackPanel = item.querySelector<HTMLElement>('[data-field="api-fallback-panel"]')!;
+    expect(fallbackPanel.hidden).toBe(false);
+    expect(fallbackPanel.textContent).toContain("proj-selected");
+
+    // Click re-check -> service_usage_permission_denied -> keeps login, does NOT claim API is disabled
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-recheck-api")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(item.dataset.googleAuthState).toBe("connected");
+    expect(fallbackPanel.hidden).toBe(false);
+    expect(fallbackPanel.textContent).toContain("serviceusage.services.get");
+    expect(fallbackPanel.textContent).toContain("準備して接続テスト");
+
+    // Also verify oauth_scope_not_granted during recheck shows fallback panel with Console + recheck buttons
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "google_stt_check_speech_api_state") {
+        throw {
+          kind: "oauth_scope_not_granted",
+          message: "Googleアカウントの認証スコープが不足しています。",
+          authGeneration: 5,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      return null;
+    }) as any);
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-recheck-api")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(fallbackPanel.hidden).toBe(false);
+    expect(fallbackPanel.textContent).toContain("OAuth認証スコープが不足しています");
+    expect(fallbackPanel.querySelector(".btn-google-stt-open-console")).not.toBeNull();
+    expect(fallbackPanel.querySelector(".btn-google-stt-recheck-api")).not.toBeNull();
+  });
+
+  it("closes and invalidates Speech API enable confirm panel when Project or auth changes (P1)", async () => {
+    const enableCalls: any[] = [];
+    let activeProject = "proj-a";
+    let generation = 10;
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      if (command === "load_api_settings") return defaultMockSettings;
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          email: "user@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: activeProject,
+          projectVerified: false,
+          authGeneration: 10,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+        };
+      }
+      if (command === "google_stt_list_projects") {
+        return {
+          projects: [
+            { projectId: "proj-a", name: "Project A" },
+            { projectId: "proj-b", name: "Project B" },
+          ],
+          authGeneration: 10,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_auth_confirm_project") {
+        activeProject = args?.projectId;
+        expect(args.authGeneration).toBe(generation);
+        expect(args.sub).toBe("sub-1");
+        expect(args.oauthClientIdFingerprint).toBe("fp-test");
+        generation++;
+        return {
+          state: "connected",
+          email: "user@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: activeProject,
+          projectVerified: false,
+          authGeneration: generation,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+        };
+      }
+      if (command === "google_stt_run_builtin_test") {
+        throw {
+          kind: "speech_api_disabled",
+          message: "disabled",
+          targetService: "speech.googleapis.com",
+          consumerProject: "proj-a",
+          authGeneration: 10,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_stt_enable_speech_api") {
+        enableCalls.push(args);
+        return {
+          projectId: args?.projectId,
+          alreadyEnabled: false,
+          authGeneration: 10,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("settings");
+    await new Promise((r) => setTimeout(r, 30));
+
+    const item = document.querySelector<HTMLElement>('.accordion-item[data-provider-id="google_stt"]')!;
+    item.querySelector<HTMLButtonElement>('[data-field="advanced-toggle"]')!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    const confirmPanel = item.querySelector<HTMLElement>('[data-field="api-enable-confirm-panel"]')!;
+
+    // Trigger Speech API disabled for proj-a -> confirm panel opens with proj-a
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-builtin-test")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(confirmPanel.hidden).toBe(false);
+    expect(confirmPanel.dataset.confirmProjectId).toBe("proj-a");
+
+    // Switch to proj-b via select -> confirm panel closes and clears captured context
+    const selectEl = item.querySelector<HTMLSelectElement>('[data-field="project-id-select"]')!;
+    selectEl.value = "proj-b";
+    selectEl.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(confirmPanel.hidden).toBe(true);
+    expect(confirmPanel.dataset.confirmProjectId).toBeUndefined();
+
+    // Even if the button is clicked while panel is stale/closed, no enable request is sent
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-confirm-enable-api")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(enableCalls).toHaveLength(0);
+
+    // Also test stale DOM tamper / mismatched dataset vs currentGoogleAuthStatus
+    confirmPanel.hidden = false;
+    confirmPanel.dataset.confirmProjectId = "proj-a";
+    confirmPanel.dataset.confirmAuthGeneration = "10";
+    confirmPanel.dataset.confirmSub = "sub-1";
+    confirmPanel.dataset.confirmOauthClientIdFingerprint = "fp-test";
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-confirm-enable-api")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(enableCalls).toHaveLength(0);
+    expect(confirmPanel.hidden).toBe(true);
+    expect(item.querySelector<HTMLElement>('[data-field="recognize-result"]')!.textContent).toContain("proj-b");
+  });
+
+  it("ignores stale google_stt_enable_speech_api error when Project switches during in-flight enablement (P1)", async () => {
+    let rejectEnable!: (err: unknown) => void;
+    let activeProject = "proj-a";
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      if (command === "load_api_settings") return defaultMockSettings;
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          email: "user@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: activeProject,
+          projectVerified: false,
+          authGeneration: 11,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+        };
+      }
+      if (command === "google_stt_list_projects") {
+        return {
+          projects: [
+            { projectId: "proj-a", name: "Project A" },
+            { projectId: "proj-b", name: "Project B" },
+          ],
+          authGeneration: 11,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_auth_confirm_project") {
+        activeProject = args?.projectId;
+        return {
+          state: "connected",
+          email: "user@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: activeProject,
+          projectVerified: false,
+          authGeneration: 12,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+        };
+      }
+      if (command === "google_stt_run_builtin_test") {
+        throw {
+          kind: "speech_api_disabled",
+          message: "disabled",
+          targetService: "speech.googleapis.com",
+          consumerProject: "proj-a",
+          authGeneration: 11,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_stt_enable_speech_api") {
+        return new Promise((_resolve, reject) => {
+          rejectEnable = reject;
+        });
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("settings");
+    await new Promise((r) => setTimeout(r, 30));
+
+    const item = document.querySelector<HTMLElement>('.accordion-item[data-provider-id="google_stt"]')!;
+    item.querySelector<HTMLButtonElement>('[data-field="advanced-toggle"]')!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-builtin-test")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Start enablement for proj-a
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-confirm-enable-api")!.click();
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Switch Project to proj-b before enablement resolves/rejects
+    const selectEl = item.querySelector<HTMLSelectElement>('[data-field="project-id-select"]')!;
+    selectEl.value = "proj-b";
+    selectEl.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Reject the stale enablement for proj-a
+    rejectEnable({
+      kind: "service_usage_permission_denied",
+      message: "denied for proj-a",
+      authGeneration: 11,
+      sub: "sub-1",
+      oauthClientIdFingerprint: "fp-test",
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Fallback panel must NOT appear for stale proj-a error
+    expect(item.querySelector<HTMLElement>('[data-field="api-fallback-panel"]')!.hidden).toBe(true);
+    expect(item.querySelector<HTMLElement>('[data-field="api-enable-confirm-panel"]')!.hidden).toBe(true);
+  });
+
+  it("handles STATE_UNSPECIFIED and unknown API states as unknown fallback instead of DISABLED (P2)", async () => {
+    let checkState = "STATE_UNSPECIFIED";
+    let enableCalls = 0;
+    let builtinCalls = 0;
+
+    setTauriInvokeForTest((async (command: string) => {
+      if (command === "load_api_settings") return defaultMockSettings;
+      if (command === "google_auth_get_status") {
+        return {
+          state: "connected",
+          email: "user@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectId: "proj-a",
+          projectVerified: false,
+          authGeneration: 12,
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+        };
+      }
+      if (command === "google_stt_list_projects") {
+        return {
+          projects: [{ projectId: "proj-a", name: "Project A" }],
+          authGeneration: 12,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_stt_run_builtin_test") {
+        builtinCalls += 1;
+        if (checkState === "ENABLED") {
+          return {
+            transcript: "こんにちは",
+            segments: [],
+            authGeneration: 12,
+            sub: "sub-1",
+            oauthClientIdFingerprint: "fp-test",
+          };
+        }
+        throw {
+          kind: "service_usage_operation_timeout",
+          message: "timeout",
+          authGeneration: 12,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_stt_check_speech_api_state") {
+        return {
+          projectId: "proj-a",
+          state: checkState,
+          authGeneration: 12,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_stt_enable_speech_api") {
+        enableCalls += 1;
+        return {};
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("settings");
+    await new Promise((r) => setTimeout(r, 30));
+
+    const item = document.querySelector<HTMLElement>('.accordion-item[data-provider-id="google_stt"]')!;
+    item.querySelector<HTMLButtonElement>('[data-field="advanced-toggle"]')!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    const confirmPanel = item.querySelector<HTMLElement>('[data-field="api-enable-confirm-panel"]')!;
+    const fallbackPanel = item.querySelector<HTMLElement>('[data-field="api-fallback-panel"]')!;
+
+    // Trigger fallback panel first so .btn-google-stt-recheck-api is visible
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-builtin-test")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(fallbackPanel.hidden).toBe(false);
+
+    // 1) STATE_UNSPECIFIED -> fallback panel ("状態を確認できませんでした"), NOT confirm panel
+    checkState = "STATE_UNSPECIFIED";
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-recheck-api")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(confirmPanel.hidden).toBe(true);
+    expect(fallbackPanel.hidden).toBe(false);
+    expect(fallbackPanel.textContent).toContain("状態を確認できませんでした");
+    expect(enableCalls).toBe(0);
+
+    // 2) Unknown string -> fallback panel, NOT confirm panel
+    checkState = "PENDING_VERIFICATION";
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-recheck-api")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(confirmPanel.hidden).toBe(true);
+    expect(fallbackPanel.hidden).toBe(false);
+    expect(fallbackPanel.textContent).toContain("PENDING_VERIFICATION");
+    expect(enableCalls).toBe(0);
+
+    // 3) DISABLED -> confirm panel opens
+    checkState = "DISABLED";
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-recheck-api")!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(confirmPanel.hidden).toBe(false);
+    expect(confirmPanel.dataset.confirmProjectId).toBe("proj-a");
+
+    // 4) ENABLED -> hides panels and proceeds to builtin test
+    checkState = "ENABLED";
+    const beforeBuiltin = builtinCalls;
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-recheck-api")!.click();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(confirmPanel.hidden).toBe(true);
+    expect(fallbackPanel.hidden).toBe(true);
+    expect(builtinCalls).toBe(beforeBuiltin + 1);
+  });
+
+  it("§26: completes 1-click Google login onboarding without Project list or extra clicks, deduplicates by authSessionId, and syncs Transcribe screen", async () => {
+    const invokedCommands: string[] = [];
+    let currentStatus: any = {
+      state: "disconnected",
+      authGeneration: 1,
+      authSessionId: "",
+      oauthClientIdFingerprint: "fp-test",
+      oauthClientConfigured: true,
+      canonicalScopes: [],
+      projectVerified: false,
+      defaultProjectId: "amed-512123",
+    };
+
+    setTauriInvokeForTest((async (command: string) => {
+      invokedCommands.push(command);
+      if (command === "load_api_settings") return defaultMockSettings;
+      if (command === "google_auth_get_status") return currentStatus;
+      if (command === "google_auth_login") {
+        currentStatus = {
+          state: "connected",
+          authGeneration: 2,
+          authSessionId: "sess-onb-1",
+          oauthClientIdFingerprint: "fp-test",
+          oauthClientConfigured: true,
+          email: "user@example.com",
+          sub: "sub-1",
+          canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+          projectVerified: false,
+          defaultProjectId: "amed-512123",
+        };
+        return currentStatus;
+      }
+      if (command === "google_auth_complete_onboarding") {
+        currentStatus = {
+          ...currentStatus,
+          authGeneration: 3,
+          projectId: "amed-512123",
+          projectVerified: true,
+          projectSource: "default",
+        };
+        return {
+          outcome: "ready",
+          message: "ok",
+          projectId: "amed-512123",
+          email: "user@example.com",
+          authGeneration: 3,
+          authSessionId: "sess-onb-1",
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+          status: currentStatus,
+          diagnosticTranscriptPreview: "こんにちは",
+        };
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      if (command === "local_asr_get_statuses") return [];
+      return null;
+    }) as any);
+
+    await navigateTo("settings");
+    await new Promise((r) => setTimeout(r, 30));
+
+    const item = document.querySelector<HTMLElement>('.accordion-item[data-provider-id="google_stt"]')!;
+    const advancedContent = item.querySelector<HTMLElement>('[data-field="advanced-content"]')!;
+    expect(advancedContent.hidden).toBe(true);
+
+    // 1-click login -> automatically runs onboarding -> transitions to 利用可能
+    item.querySelector<HTMLButtonElement>(".btn-google-auth-login")!.click();
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(invokedCommands).not.toContain("google_stt_list_projects");
+    expect(invokedCommands.filter((c) => c === "google_auth_complete_onboarding")).toHaveLength(1);
+    expect(item.querySelector<HTMLElement>('[data-field="auth-state"]')!.textContent).toContain("利用可能");
+    expect(item.dataset.googleProjectId).toBe("amed-512123");
+    expect(item.dataset.googleProjectVerified).toBe("true");
+    expect(advancedContent.hidden).toBe(true);
+
+    // Revisiting settings must NOT re-run onboarding for already verified session
+    await navigateTo("transcribe");
+    await new Promise((r) => setTimeout(r, 20));
+    await navigateTo("settings");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(invokedCommands.filter((c) => c === "google_auth_complete_onboarding")).toHaveLength(1);
+
+    // Transcribe screen cloud mode includes google_stt
+    await navigateTo("transcribe");
+    await new Promise((r) => setTimeout(r, 20));
+    const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement;
+    modeSelect.value = "cloud";
+    modeSelect.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 30));
+    const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement;
+    expect([...engineSelect.options].some((o) => o.value === "google_stt")).toBe(true);
+  });
+
+  it("§26: handles needs_api_enable_consent during onboarding, preserves user_selected upgrade project, and invalidates stale onboarding on manual project change", async () => {
+    let onboardingCalls = 0;
+    let resolveDelayedOnboarding!: (val: any) => void;
+    let currentStatus: any = {
+      state: "connected",
+      authGeneration: 5,
+      authSessionId: "sess-consent",
+      oauthClientIdFingerprint: "fp-test",
+      oauthClientConfigured: true,
+      email: "user@example.com",
+      sub: "sub-1",
+      canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+      projectVerified: false,
+      defaultProjectId: "amed-512123",
+    };
+
+    setTauriInvokeForTest((async (command: string, args?: any) => {
+      if (command === "load_api_settings") return defaultMockSettings;
+      if (command === "google_auth_get_status") return currentStatus;
+      if (command === "google_stt_list_projects") {
+        return {
+          projects: [{ projectId: "manual-proj-999", name: "Manual" }],
+          authGeneration: currentStatus.authGeneration,
+          sub: "sub-1",
+          oauthClientIdFingerprint: "fp-test",
+        };
+      }
+      if (command === "google_auth_confirm_project") {
+        currentStatus = {
+          ...currentStatus,
+          authGeneration: currentStatus.authGeneration + 1,
+          projectId: args?.projectId,
+          projectVerified: false,
+          projectSource: "user_selected",
+        };
+        return currentStatus;
+      }
+      if (command === "google_auth_complete_onboarding") {
+        onboardingCalls += 1;
+        if (onboardingCalls === 1) {
+          return {
+            outcome: "needs_api_enable_consent",
+            message: "disabled",
+            projectId: "amed-512123",
+            email: "user@example.com",
+            targetService: "speech.googleapis.com",
+            consumerProject: "amed-512123",
+            authGeneration: 5,
+            authSessionId: "sess-consent",
+            sub: "sub-1",
+            oauthClientIdFingerprint: "fp-test",
+            status: currentStatus,
+          };
+        }
+        if (args?.input?.enableSpeechApiIfNeeded) {
+          expect(args.input.expectedAuthSessionId).toBe("sess-consent");
+          currentStatus = {
+            ...currentStatus,
+            authGeneration: 6,
+            projectId: "amed-512123",
+            projectVerified: true,
+            projectSource: "default",
+          };
+          return {
+            outcome: "ready",
+            message: "ok",
+            projectId: "amed-512123",
+            email: "user@example.com",
+            authGeneration: 6,
+            authSessionId: "sess-consent",
+            sub: "sub-1",
+            oauthClientIdFingerprint: "fp-test",
+            status: currentStatus,
+          };
+        }
+        return new Promise((resolve) => {
+          resolveDelayedOnboarding = resolve;
+        });
+      }
+      if (command === "hf_token_get_status") return { configured: false, maskedValue: null };
+      return null;
+    }) as any);
+
+    await navigateTo("settings");
+    await new Promise((r) => setTimeout(r, 40));
+
+    const item = document.querySelector<HTMLElement>('.accordion-item[data-provider-id="google_stt"]')!;
+    const confirmPanel = item.querySelector<HTMLElement>('[data-field="api-enable-confirm-panel"]')!;
+    expect(confirmPanel.hidden).toBe(false);
+    expect(confirmPanel.dataset.confirmMode).toBe("onboarding");
+
+    // User consents -> enables API & completes onboarding without extra test button
+    item.querySelector<HTMLButtonElement>(".btn-google-stt-confirm-enable-api")!.click();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(confirmPanel.hidden).toBe(true);
+    expect(item.dataset.googleProjectVerified).toBe("true");
+    expect(item.dataset.googleProjectId).toBe("amed-512123");
+
+    // Now test manual override invalidating an in-flight onboarding on a fresh login
+    resetMountedPagesForTest();
+    resetMultiAsrMainStateForTest();
+    document.body.innerHTML = '<div id="app"></div>';
+    currentStatus = {
+      state: "connected",
+      authGeneration: 20,
+      authSessionId: "sess-race",
+      oauthClientIdFingerprint: "fp-test",
+      oauthClientConfigured: true,
+      email: "user@example.com",
+      sub: "sub-1",
+      canonicalScopes: ["identity:openid", "identity:email", "google_cloud_api"],
+      projectVerified: false,
+      defaultProjectId: "amed-512123",
+    };
+
+    await navigateTo("settings");
+    await new Promise((r) => setTimeout(r, 30));
+    const item2 = document.querySelector<HTMLElement>('.accordion-item[data-provider-id="google_stt"]')!;
+    item2.querySelector<HTMLButtonElement>('[data-field="advanced-toggle"]')!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    const sel2 = item2.querySelector<HTMLSelectElement>('[data-field="project-id-select"]')!;
+    sel2.value = "manual-proj-999";
+    sel2.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(item2.dataset.googleProjectId).toBe("manual-proj-999");
+
+    // Stale onboarding resolves after manual selection -> must NOT overwrite manual-proj-999
+    resolveDelayedOnboarding({
+      outcome: "ready",
+      message: "stale",
+      projectId: "amed-512123",
+      authGeneration: 21,
+      authSessionId: "sess-race",
+      sub: "sub-1",
+      oauthClientIdFingerprint: "fp-test",
+      status: {
+        ...currentStatus,
+        authGeneration: 21,
+        projectId: "amed-512123",
+        projectVerified: true,
+        projectSource: "default",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(item2.dataset.googleProjectId).toBe("manual-proj-999");
   });
 });
 

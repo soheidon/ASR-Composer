@@ -17,3 +17,4 @@ __pycache__/
 /stitch-screens/
 /icon/
 /.plan/
+/oauth-client.dev.json

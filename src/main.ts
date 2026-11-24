@@ -8,7 +8,6 @@ import {
   prepareProviderForModelFetch,
   getGoogleSttProjectId,
   buildGoogleSttProjectOptions,
-  shouldAutoSaveProject,
   setGoogleSttAdvancedOpen,
   ensureSelectValue,
   setGoogleSttStatus,
@@ -17,6 +16,21 @@ import {
   setButtonLoading,
   restoreButtonLoading,
 } from "./provider-config-save";
+import {
+  applyGoogleAuthStatusToSection,
+  buildGoogleCloudSpeechConsoleUrl,
+  canPromptSpeechApiEnable,
+  isGoogleAuthResponseCurrent,
+  isGoogleSttAvailableForTranscribe,
+  parseGoogleApiError,
+  shouldAutoRunDefaultOnboarding,
+  type EnableSpeechApiResult,
+  type GoogleAuthRevokeResult,
+  type GoogleAuthStatus,
+  type GoogleCloudListProjectsResult,
+  type GoogleOnboardingResult,
+  type SpeechApiEnableStateResult,
+} from "./google-auth";
 import {
   renderDockerStatusContent,
   renderHuggingFaceTokenSection,
@@ -39,7 +53,12 @@ import {
   setEditorDocumentWithProposals,
   setEditorInvoke,
   isEditorDirty,
+  formatTimestamp,
 } from "./editor";
+import {
+  convertGoogleRawResponseToTranscriptDocument,
+  type GoogleSttRawResponse,
+} from "./google-stt";
 import type { TranscriptDocument } from "./transcript";
 import {
   type SavedAppSettings,
@@ -179,31 +198,58 @@ function buildStandardDetail(p: ProviderDefinition): string {
 
 function buildGoogleSttDetail(_p: ProviderDefinition): string {
   return `
-          <div class="google-stt-adc-section">
+          <div class="google-stt-oauth-section">
             <div class="google-stt-adc-status-row">
-              <span class="google-stt-adc-status" data-field="adc-status">未確認</span>
-              <span class="google-stt-adc-quota" data-field="adc-quota"></span>
+              <span class="google-stt-adc-status" data-field="auth-state">Googleに未接続</span>
+              <span class="google-stt-adc-quota" data-field="auth-account" hidden></span>
             </div>
-            <button class="btn-google-stt-check-adc" type="button">
-              <span class="material-symbols-outlined">key</span>
-              ADC認証チェック
-            </button>
-          </div>
-
-          <div class="api-field-group">
-            <label class="api-field-label">Google Cloud プロジェクト <span class="api-field-required">*</span></label>
-            <div class="google-stt-project-row">
-              <select class="google-stt-project-select" data-field="project-id-select">
-                <option value="">読み込み中...</option>
-              </select>
-              <input type="text" class="google-stt-project-input" data-field="project-id-input"
-                     placeholder="Project IDを入力" hidden />
-              <button class="btn-google-stt-refresh-projects" type="button">
+            <p class="google-stt-project-error" data-field="auth-error" style="display:none;"></p>
+            <div class="google-stt-oauth-actions">
+              <button class="btn-google-auth-login" type="button">
+                <span class="material-symbols-outlined">login</span>
+                Googleにログイン
+              </button>
+              <button class="btn-google-auth-retry-consent" type="button" hidden>
                 <span class="material-symbols-outlined">refresh</span>
-                再取得
+                同意を再取得してログイン
+              </button>
+              <button class="btn-google-auth-switch" type="button" hidden>
+                <span class="material-symbols-outlined">switch_account</span>
+                アカウントを切り替える
+              </button>
+              <button class="btn-google-auth-logout" type="button" hidden>
+                <span class="material-symbols-outlined">logout</span>
+                ログアウト
+              </button>
+              <button class="btn-google-auth-revoke" type="button" hidden>
+                <span class="material-symbols-outlined">link_off</span>
+                Google側のアクセス権も取り消す
               </button>
             </div>
-            <p class="google-stt-project-error" data-field="project-error" style="display:none;"></p>
+            <p class="google-stt-login-notice" data-field="login-notice">※ ログイン後、短い同梱音声（ja-JP）で接続確認を自動で行います（追加クリック不要）。</p>
+            <p class="google-stt-revoke-note">※ アクセス権の取り消しは同じGoogle Cloud OAuthプロジェクトの他クライアントやトークンにも影響する可能性があります。</p>
+            <div class="google-stt-onboarding-status" data-field="onboarding-status-panel" hidden>
+              <span class="material-symbols-outlined spin">sync</span>
+              <span data-field="onboarding-status-text">Google Cloudを準備しています…</span>
+            </div>
+            <div class="google-stt-api-panel" data-field="onboarding-action-panel" hidden>
+              <p class="google-stt-api-panel-title" data-field="onboarding-action-title"></p>
+              <p class="google-stt-api-panel-body" data-field="onboarding-action-reason"></p>
+              <p class="google-stt-api-panel-meta" data-field="onboarding-action-meta" hidden></p>
+              <div class="google-stt-api-panel-actions">
+                <button class="btn-google-onboarding-retry" type="button" hidden>再試行</button>
+                <button class="btn-google-onboarding-switch" type="button" hidden>アカウントを切り替える</button>
+              </div>
+            </div>
+            <div class="google-stt-diagnostics">
+              <span data-field="diag-project-list">Project一覧: 未取得</span>
+              <span data-field="diag-project-state">選択Project ID: 未接続</span>
+            </div>
+            <p class="google-stt-setup-guidance" data-field="setup-guidance"></p>
+            <div class="google-stt-legacy-banner" data-field="legacy-project-banner" hidden>
+              <span>以前の設定値（<code data-field="legacy-project-value"></code>）があります。現在のGoogleアカウントでは未確認です。</span>
+              <button class="btn-google-stt-confirm-legacy-project" type="button">このProject IDを確定</button>
+            </div>
           </div>
 
           <div class="api-field-group">
@@ -233,10 +279,28 @@ function buildGoogleSttDetail(_p: ProviderDefinition): string {
           <div class="google-stt-advanced-toggle">
             <button type="button" class="btn-google-stt-advanced" data-field="advanced-toggle" aria-expanded="false">
               <span class="material-symbols-outlined accordion-chevron">chevron_right</span>
-              詳細設定
+              別のProjectを使う・詳細設定
             </button>
           </div>
           <div class="google-stt-advanced-content" data-field="advanced-content" hidden>
+            <div class="api-field-group">
+              <label class="api-field-label">Google Cloud プロジェクト <span class="api-field-required">*</span></label>
+              <div class="google-stt-project-row">
+                <select class="google-stt-project-select" data-field="project-id-select" disabled>
+                  <option value="">詳細設定を開くと取得します</option>
+                </select>
+                <input type="text" class="google-stt-project-input" data-field="project-id-input"
+                       placeholder="Project IDを入力" hidden disabled />
+                <button class="btn-google-stt-confirm-project" type="button" hidden disabled>
+                  このProjectを使う
+                </button>
+                <button class="btn-google-stt-refresh-projects" type="button" disabled>
+                  <span class="material-symbols-outlined">refresh</span>
+                  再取得
+                </button>
+              </div>
+              <p class="google-stt-project-error" data-field="project-error" style="display:none;"></p>
+            </div>
             <div class="api-field-group">
               <label class="api-field-label">Recognizer ID</label>
               <input type="text" class="google-stt-recognizer-id" data-field="recognizer-id"
@@ -244,6 +308,11 @@ function buildGoogleSttDetail(_p: ProviderDefinition): string {
             </div>
             <div class="api-field-group">
               <label class="api-field-label">詳細な確認</label>
+              <p class="google-stt-test-description">同梱された短い日本語音声（ja-JP）で手動接続テストを行います</p>
+              <button class="btn-google-stt-builtin-test" type="button">
+                <span class="material-symbols-outlined">mic</span>
+                準備して接続テスト
+              </button>
               <button class="btn-google-stt-select-file" type="button">
                 <span class="material-symbols-outlined">folder_open</span>
                 別の音声ファイルで試す
@@ -253,11 +322,29 @@ function buildGoogleSttDetail(_p: ProviderDefinition): string {
           </div>
 
           <div class="google-stt-recognize-section">
-            <p class="google-stt-test-description">同梱された短い日本語音声（ja-JP）で確認します</p>
-            <button class="btn-google-stt-builtin-test" type="button">
-              <span class="material-symbols-outlined">mic</span>
-              接続・認識テスト
-            </button>
+            <div class="google-stt-api-panel" data-field="api-enable-confirm-panel" hidden>
+              <p class="google-stt-api-panel-title">Speech-to-Text API がまだ有効化されていません</p>
+              <p class="google-stt-api-panel-body">
+                対象Project（<code data-field="enable-target-project"></code>）で
+                <code data-field="enable-target-service">speech.googleapis.com</code> を有効化してから接続テストを再実行しますか？
+              </p>
+              <div class="google-stt-api-panel-actions">
+                <button class="btn-google-stt-confirm-enable-api" type="button">有効化してテストを続行</button>
+                <button class="btn-google-stt-cancel-enable-api" type="button">キャンセル</button>
+              </div>
+            </div>
+            <div class="google-stt-api-panel google-stt-api-fallback" data-field="api-fallback-panel" hidden>
+              <p class="google-stt-api-panel-title" data-field="fallback-title">API準備を続行できませんでした</p>
+              <p class="google-stt-api-panel-body" data-field="fallback-reason"></p>
+              <p class="google-stt-api-panel-meta">
+                対象Project: <code data-field="fallback-project"></code>
+                <span data-field="fallback-permission-wrap" hidden> / 必要な権限: <code data-field="fallback-permission"></code></span>
+              </p>
+              <div class="google-stt-api-panel-actions">
+                <button class="btn-google-stt-open-console" type="button">Google Cloud Console で開く</button>
+                <button class="btn-google-stt-recheck-api" type="button">状態を再確認</button>
+              </div>
+            </div>
             <div class="google-stt-result" data-field="recognize-result" style="display:none;"></div>
           </div>`;
 }
@@ -1104,21 +1191,36 @@ type AvailableAsrProvider = {
 function isAsrProviderConfigured(
   provider: ProviderDefinition,
   saved: SavedProviderSettings | undefined,
+  googleAuthStatus: GoogleAuthStatus | null = currentGoogleAuthStatus,
 ): boolean {
   if (provider.id === "google_stt") {
-    // Google STT: options 内の project_id + location で判定
-    const projectId = saved?.options?.project_id?.trim() ?? "";
-    const location = saved?.options?.location?.trim() ?? "";
-    return Boolean(projectId && location);
+    return isGoogleSttAvailableForTranscribe(googleAuthStatus, saved?.options?.location);
   }
   return Boolean(saved?.env_name);
 }
 
+let cloudEnginesPopulateGeneration = 0;
+
+function updateCurrentGoogleAuthStatusIfNewer(status: GoogleAuthStatus): GoogleAuthStatus {
+  if (
+    !currentGoogleAuthStatus ||
+    status.oauthClientIdFingerprint !== currentGoogleAuthStatus.oauthClientIdFingerprint ||
+    status.state === "revoking" ||
+    status.authGeneration >= currentGoogleAuthStatus.authGeneration
+  ) {
+    currentGoogleAuthStatus = status;
+  }
+  return currentGoogleAuthStatus;
+}
+
 async function loadConfiguredAsrProviders(): Promise<AvailableAsrProvider[]> {
   const settings = await invokeTauri<SavedAppSettings>("load_api_settings");
+  const googleAuthStatus = await invokeTauri<GoogleAuthStatus>("google_auth_get_status")
+    .then((status) => updateCurrentGoogleAuthStatusIfNewer(status))
+    .catch(() => currentGoogleAuthStatus);
   return asrProviders
     .filter((provider) =>
-      isAsrProviderConfigured(provider, settings.providers[provider.id]),
+      isAsrProviderConfigured(provider, settings.providers[provider.id], googleAuthStatus),
     )
     .map((provider) => ({
       id: provider.id,
@@ -1127,7 +1229,11 @@ async function loadConfiguredAsrProviders(): Promise<AvailableAsrProvider[]> {
 }
 
 async function populateCloudEngines(select: HTMLSelectElement): Promise<void> {
+  const gen = ++cloudEnginesPopulateGeneration;
   const providers = await loadConfiguredAsrProviders();
+  if (gen !== cloudEnginesPopulateGeneration || !select.isConnected) {
+    return;
+  }
   if (providers.length === 0) {
     select.innerHTML = `
       <option value="" selected disabled>
@@ -2131,12 +2237,11 @@ export async function navigateTo(page: PageName): Promise<NavigationResult> {
   if (page === "settings-docker") {
     invalidateLocalAsrStatusCache();
     void loadDockerPageStatuses();
-  } else if (
-    page === "transcribe" &&
-    wasWorkspaceAlreadyMounted &&
-    shouldRefreshTranscribeLocalEngines()
-  ) {
-    await refreshTranscribeLocalEnginesIfActive(navId);
+  } else if (page === "transcribe" && wasWorkspaceAlreadyMounted) {
+    if (shouldRefreshTranscribeLocalEngines()) {
+      await refreshTranscribeLocalEnginesIfActive(navId);
+    }
+    await refreshTranscribeGoogleSttSelectors();
   }
 
   updateHeaderActiveNav(page);
@@ -2414,6 +2519,7 @@ type TranscriptionResult = {
   engine: string;
   language: string;
   savedFiles: SavedOutputFile[];
+  skippedFormats?: string[];
   document?: TranscriptDocument | null;
 };
 
@@ -2427,6 +2533,7 @@ type TranscriptionProgress = {
 let selectedFilePath: string | null = null;
 let activeJobId: string | null = null;
 let cancelRequested = false;
+let isCommittingOutputs = false;
 let unlistenTranscriptionProgress: (() => void) | null = null;
 let unlistenFileDragDrop: (() => void) | null = null;
 
@@ -2588,6 +2695,322 @@ function setTranscriptionRunning(running: boolean): void {
   if (cancelLabel) cancelLabel.textContent = "中止";
 }
 
+function escapeCsvCell(value: string): string {
+  const escaped = value.replace(/"/g, '""');
+  return `"${escaped}"`;
+}
+
+export function buildGoogleSttFormattedOutputs(
+  doc: TranscriptDocument,
+  txtContent: string,
+  outputFormats: string[],
+): {
+  files: Array<{ format: string; ext: string; content: string }>;
+  vttContent: string | null;
+  skippedFormats: string[];
+} {
+  const vttContent =
+    doc.segments.length > 0
+      ? [
+          "WEBVTT",
+          ...doc.segments.map(
+            (s, idx) =>
+              `${idx + 1}\n${formatTimestamp(s.start)} --> ${formatTimestamp(s.end)}\n${s.text}`,
+          ),
+        ].join("\n\n")
+      : null;
+
+  const files: Array<{ format: string; ext: string; content: string }> = [];
+  const skippedFormats: string[] = [];
+
+  for (const fmt of outputFormats) {
+    switch (fmt) {
+      case "txt":
+        files.push({ format: "txt", ext: "txt", content: txtContent });
+        break;
+      case "json":
+        files.push({ format: "json", ext: "json", content: JSON.stringify(doc, null, 2) });
+        break;
+      case "md": {
+        const header = [
+          `# ${doc.mediaFileName}`,
+          "",
+          `- Engine: ${doc.sourceEngine || "cloud:google_stt"}`,
+          `- Language: ${doc.language || ""}`,
+          "",
+        ].join("\n");
+        const body =
+          doc.segments.length > 0
+            ? doc.segments
+                .map((s) => `- **[${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}]** ${s.text}`)
+                .join("\n")
+            : txtContent;
+        files.push({ format: "md", ext: "md", content: `${header}${body}\n` });
+        break;
+      }
+      case "csv": {
+        const rows =
+          doc.segments.length > 0
+            ? doc.segments.map(
+                (s) =>
+                  `${formatTimestamp(s.start)},${formatTimestamp(s.end)},${escapeCsvCell(s.text)}`,
+              )
+            : [`, ,${escapeCsvCell(txtContent)}`.replace(", ,", ",,")];
+        files.push({
+          format: "csv",
+          ext: "csv",
+          content: ["start,end,text", ...rows].join("\n") + "\n",
+        });
+        break;
+      }
+      case "srt": {
+        if (doc.segments.length === 0) {
+          skippedFormats.push("srt");
+        } else {
+          const srtContent = doc.segments
+            .map(
+              (s, idx) =>
+                `${idx + 1}\n${formatTimestamp(s.start).replace(".", ",")} --> ${formatTimestamp(s.end).replace(".", ",")}\n${s.text}`,
+            )
+            .join("\n\n");
+          files.push({ format: "srt", ext: "srt", content: srtContent });
+        }
+        break;
+      }
+      case "vtt": {
+        if (vttContent === null) {
+          skippedFormats.push("vtt");
+        } else {
+          files.push({ format: "vtt", ext: "vtt", content: vttContent });
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  return { files, vttContent, skippedFormats };
+}
+
+async function runSingleGoogleSttTranscription(params: {
+  jobId: string;
+  audioPath: string;
+  language: string;
+  outputPath: string;
+  outputFormats: string[];
+  isCancelled?: () => boolean;
+}): Promise<TranscriptionResult> {
+  const { jobId, audioPath, language, outputPath, outputFormats, isCancelled } = params;
+  const assertNotCancelled = () => {
+    if (isCancelled?.()) {
+      throw new Error("Transcription cancelled");
+    }
+  };
+
+  assertNotCancelled();
+  const authStatus = await invokeTauri<GoogleAuthStatus>("google_auth_get_status");
+  assertNotCancelled();
+  if (authStatus.state !== "connected") {
+    throw new Error("Googleアカウントにログインしてください");
+  }
+  const projectId = authStatus.projectId?.trim() ?? "";
+  if (!projectId) {
+    throw new Error("Google Cloud プロジェクトIDを設定してください");
+  }
+  const capturedMeta = {
+    authGeneration: authStatus.authGeneration,
+    sub: authStatus.sub,
+    oauthClientIdFingerprint: authStatus.oauthClientIdFingerprint,
+  };
+
+  const resolvedOutputDir = await invokeTauri<string>("resolve_output_directory", {
+    outputPath,
+  });
+  assertNotCancelled();
+
+  const settings = await invokeTauri<SavedAppSettings>("load_api_settings");
+  assertNotCancelled();
+  const googleProvider = settings?.providers?.google_stt;
+  const options = googleProvider?.options ?? {};
+  const location = options.location?.trim() || "us-central1";
+  const recognizerId = options.recognizer_id?.trim() || "_";
+  const model = googleProvider?.default_model?.trim() || "chirp_2";
+  const langCode = language.toLowerCase().startsWith("en")
+    ? "en-US"
+    : language.toLowerCase().startsWith("zh")
+      ? "cmn-Hans-CN"
+      : "ja-JP";
+
+  showProgressSection("Google Speech-to-Text で認識中...");
+  const result = await invokeTauri<{
+    transcript?: string;
+    rawResponse?: GoogleSttRawResponse;
+    raw_response?: GoogleSttRawResponse;
+    authGeneration?: number;
+    sub?: string;
+    oauthClientIdFingerprint?: string;
+  }>("google_stt_recognize", {
+    input: {
+      projectId,
+      location,
+      recognizerId,
+      languageCode: langCode,
+      model,
+      audioPath,
+    },
+  });
+  assertNotCancelled();
+
+  // Verify auth generation/sub/fingerprint did not change while recognition was in flight (fail closed on status error)
+  const latestAuthStatus = await invokeTauri<GoogleAuthStatus>("google_auth_get_status")
+    .then((s) => updateCurrentGoogleAuthStatusIfNewer(s));
+  assertNotCancelled();
+  if (
+    !isGoogleAuthResponseCurrent(latestAuthStatus, {
+      authGeneration: result.authGeneration ?? capturedMeta.authGeneration,
+      sub: result.sub ?? capturedMeta.sub,
+      oauthClientIdFingerprint:
+        result.oauthClientIdFingerprint ?? capturedMeta.oauthClientIdFingerprint,
+    })
+  ) {
+    throw new Error("認証状態が変更されたため、古いGoogle STT認識結果を破棄しました。");
+  }
+
+  const mediaFileName = audioPath.split(/[\\/]/).pop() || audioPath;
+  const transcript = result.transcript ?? "";
+  const rawResponse = result.rawResponse ?? result.raw_response;
+  let doc: TranscriptDocument;
+
+  if (rawResponse !== undefined) {
+    const converted = convertGoogleRawResponseToTranscriptDocument({
+      rawResponse,
+      mediaPath: audioPath,
+      mediaFileName,
+      language,
+      sourceRunId: jobId,
+      expectedDurationSec: getSelectedAudioDurationSec() ?? undefined,
+      transcriptFallback: transcript,
+    });
+    if (converted.ok) {
+      doc = converted.document;
+    } else if (
+      transcript.trim() ||
+      converted.documentWithoutTiming.transcriptTextWithoutTiming?.trim()
+    ) {
+      doc = converted.documentWithoutTiming;
+    } else {
+      throw new Error(
+        converted.reason || "Google Speech-to-Text から有効な文字起こし結果が返されませんでした",
+      );
+    }
+  } else if (transcript.trim()) {
+    const nowIso = new Date().toISOString();
+    doc = {
+      schemaVersion: 1,
+      mediaPath: audioPath,
+      mediaFileName,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      language,
+      sourceEngine: "cloud:google_stt",
+      sourceRunId: jobId,
+      segments: [],
+      transcriptTextWithoutTiming: transcript,
+    };
+  } else {
+    throw new Error("Google Speech-to-Text から有効な文字起こし結果が返されませんでした");
+  }
+
+  const txtContent =
+    doc.segments.length > 0
+      ? doc.segments.map((s) => s.text).join("\n")
+      : doc.transcriptTextWithoutTiming || transcript;
+
+  const formatted = buildGoogleSttFormattedOutputs(doc, txtContent, outputFormats);
+  if (formatted.files.length === 0 && formatted.skippedFormats.length > 0) {
+    throw new Error(
+      `タイムスタンプ情報が含まれていないため、選択された形式（${formatted.skippedFormats
+        .map((f) => f.toUpperCase())
+        .join(" / ")}）を出力できませんでした。テキストやJSON等の形式を選択してください。`,
+    );
+  }
+
+  const savedFiles: SavedOutputFile[] = [];
+  const stagedFiles: Array<{
+    tempPath: string;
+    finalPath: string;
+    format: string;
+    fileName: string;
+  }> = [];
+  const sep = resolvedOutputDir.includes("\\") ? "\\" : "/";
+  const baseDir = resolvedOutputDir.replace(/[\\/]+$/, "");
+  const baseName = mediaFileName.replace(/\.[^.]+$/, "") || "transcript";
+
+  const cleanupStagedFiles = async () => {
+    for (const s of stagedFiles) {
+      try {
+        await invokeTauri("remove_output_file", { path: s.tempPath });
+      } catch (cleanupErr) {
+        console.warn("remove_output_file cleanup error:", cleanupErr);
+      }
+    }
+  };
+
+  try {
+    for (const out of formatted.files) {
+      assertNotCancelled();
+      const fileName = `${baseName}.${out.ext}`;
+      const fullPath = `${baseDir}${sep}${fileName}`;
+      const tempPath = `${fullPath}.tmp-${jobId}`;
+      stagedFiles.push({ tempPath, finalPath: fullPath, format: out.format, fileName });
+      await invokeTauri("save_text_file", { path: tempPath, content: out.content });
+      assertNotCancelled();
+    }
+
+    assertNotCancelled();
+    const asrcFileName = `${baseName}.asrc.json`;
+    const asrcPath = `${baseDir}${sep}${asrcFileName}`;
+    const tempAsrcPath = `${asrcPath}.tmp-${jobId}`;
+    stagedFiles.push({ tempPath: tempAsrcPath, finalPath: asrcPath, format: "asrc", fileName: asrcFileName });
+    await invokeTauri("save_transcript_document", { path: tempAsrcPath, document: doc });
+    assertNotCancelled();
+
+    // Commit phase: lock out cancellation, indicate committing in UI, and complete atomically
+    isCommittingOutputs = true;
+    showProgressSection("出力ファイルを確定中...");
+    const cancelBtnEl = document.getElementById("cancelBtn") as HTMLButtonElement | null;
+    if (cancelBtnEl) {
+      cancelBtnEl.disabled = true;
+      const cancelLabel = cancelBtnEl.querySelector("span:last-child");
+      if (cancelLabel) cancelLabel.textContent = "確定中...";
+    }
+    try {
+      await invokeTauri("commit_staged_output_files", {
+        files: stagedFiles.map(({ tempPath, finalPath }) => ({ tempPath, finalPath })),
+      });
+    } finally {
+      isCommittingOutputs = false;
+    }
+    for (const s of stagedFiles) {
+      savedFiles.push({ format: s.format, fileName: s.fileName, path: s.finalPath });
+    }
+  } catch (err) {
+    await cleanupStagedFiles();
+    throw err;
+  }
+
+  return {
+    txtContent,
+    vttContent: formatted.vttContent,
+    engine: "google_stt",
+    language,
+    savedFiles,
+    skippedFormats: formatted.skippedFormats,
+    document: doc,
+  };
+}
+
 function bindStartButton(): void {
   const startBtn = document.getElementById("startBtn");
   const cancelBtn = document.getElementById("cancelBtn") as HTMLButtonElement | null;
@@ -2665,6 +3088,7 @@ function bindStartButton(): void {
 
     activeJobId = jobId;
     asrGeneration++;
+    const generationAtStart = asrGeneration;
     activeAutoCorrectionRunId = null;
     activeAutoCorrectionGeneration = asrGeneration;
     cancelRequested = false;
@@ -2672,13 +3096,30 @@ function bindStartButton(): void {
     showProgressSection("準備中...");
     hideResultSection();
 
+    const selectedMode =
+      (document.getElementById("asrModeSelect") as HTMLSelectElement | null)?.value || "local";
+    const selectedEngine =
+      (document.getElementById("engineSelect") as HTMLSelectElement | null)?.value || "";
+    const selectedLanguage =
+      (document.getElementById("langSelect") as HTMLSelectElement | null)?.value || "ja";
+
     try {
-      const result = await invokeTauri<TranscriptionResult>("local_asr_transcribe", {
-        jobId,
-        audioPath: selectedFilePath,
-        outputPath,
-        outputFormats,
-      });
+      const result =
+        selectedMode === "cloud" && selectedEngine === "google_stt"
+          ? await runSingleGoogleSttTranscription({
+              jobId,
+              audioPath: selectedFilePath,
+              language: selectedLanguage,
+              outputPath,
+              outputFormats,
+              isCancelled: () => cancelRequested || generationAtStart !== asrGeneration,
+            })
+          : await invokeTauri<TranscriptionResult>("local_asr_transcribe", {
+              jobId,
+              audioPath: selectedFilePath,
+              outputPath,
+              outputFormats,
+            });
       if (!cancelRequested) {
         displayTranscriptionResult(result);
         if (result.document) {
@@ -2701,9 +3142,14 @@ function bindStartButton(): void {
     } catch (error) {
       if (!cancelRequested) {
         const { showAppDialog } = await import("./status");
-        showAppDialog({ title: "文字起こしエラー", message: String(error), type: "error" });
+        showAppDialog({
+          title: "文字起こしエラー",
+          message: formatGoogleSttErrorMessage(error),
+          type: "error",
+        });
       }
     } finally {
+      isCommittingOutputs = false;
       releaseExecutionLock(jobId);
       setTranscriptionRunning(false);
       hideProgressSection();
@@ -2719,7 +3165,7 @@ function bindStartButton(): void {
   });
 
   cancelBtn?.addEventListener("click", async () => {
-    if (!activeJobId) return;
+    if (!activeJobId || isCommittingOutputs) return;
     cancelRequested = true;
     cancelBtn.disabled = true;
     const cancelLabel = cancelBtn.querySelector("span:last-child");
@@ -2746,11 +3192,22 @@ export function getActiveMultiAsrJobIdForTest(): string | null {
 
 let dualAsrOptionsGeneration = 0;
 
+export function setSelectedAudioFileForTest(path: string | null): void {
+  selectedFilePath = path;
+}
+
 export function resetMultiAsrMainStateForTest(): void {
   activeMultiAsrJobId = null;
   activeMultiAsrRunId = null;
   multiAsrCancelRequested = false;
+  isCommittingOutputs = false;
   dualAsrOptionsGeneration = 0;
+  cloudEnginesPopulateGeneration = 0;
+  currentGoogleAuthStatus = null;
+  clearPendingSpeechApiEnableContext();
+  attemptedOnboardingSessionIds.clear();
+  activeOnboardingRunSeq = 0;
+  selectedFilePath = null;
 }
 
 async function populateDualAsrEngineOptions(
@@ -3303,7 +3760,11 @@ function displayTranscriptionResult(result: TranscriptionResult): void {
   if (savedFilesEl && result.savedFiles.length > 0) {
     const dir = result.savedFiles[0].path.replace(/[\\/][^\\/]+$/, "");
     const list = result.savedFiles.map((f) => `・${f.fileName}`).join("\n");
-    savedFilesEl.textContent = `保存済み:\n${list}\n保存先: ${dir}`;
+    const skippedNotice =
+      result.skippedFormats && result.skippedFormats.length > 0
+        ? `\n未出力（タイムスタンプ情報なし）: ${result.skippedFormats.map((f) => f.toUpperCase()).join(", ")}`
+        : "";
+    savedFilesEl.textContent = `保存済み:\n${list}\n保存先: ${dir}${skippedNotice}`;
     savedFilesEl.style.display = "";
   } else if (savedFilesEl) {
     savedFilesEl.style.display = "none";
@@ -3467,28 +3928,19 @@ async function loadSavedSettings(navGeneration?: number, container: ParentNode =
         }
       }
 
-      // Google STT options の復元
+      // Google STT options の復元（Project IDはOAuth metadataが唯一の正本のため読まない）
       if (saved?.options) {
         const locationSelect = item.querySelector<HTMLSelectElement>('[data-field="location"]');
         const recognizerInput = item.querySelector<HTMLInputElement>('[data-field="recognizer-id"]');
         const langSelect = item.querySelector<HTMLSelectElement>('[data-field="language-code"]');
-        // project-id は data属性経由で loadGoogleSttProjects に渡す
-        if (saved.options.project_id) item.dataset.googleSttSavedProjectId = saved.options.project_id;
         if (locationSelect && saved.options.location) locationSelect.value = saved.options.location;
         if (recognizerInput && saved.options.recognizer_id) recognizerInput.value = saved.options.recognizer_id;
         if (langSelect && saved.options.language_code) ensureSelectValue(langSelect, saved.options.language_code);
       }
 
-      // Google STT プロジェクト読み込み起動
+      // Google STT OAuth状態取得＆接続済みならプロジェクト一覧読み込み
       if (providerId === "google_stt") {
-        loadGoogleSttProjects(item).finally(() => {
-          delete item.dataset.googleSttSavedProjectId;
-          // プロジェクト一覧読込完了後、設定状態を再評価
-          if (item.dataset.providerId === "google_stt" && item.querySelector("[data-status-badge]")) {
-            const configuredState = getGoogleSttConfiguredState(item);
-            setGoogleSttStatus(item, configuredState, (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
-          }
-        });
+        refreshGoogleAuthAndProjects(item);
       }
     });
     return true;
@@ -3679,40 +4131,29 @@ function bindProviderConfigAutoSave(container: ParentNode = document) {
       });
     }
 
-    // Google STT options: select/input→dirty, blur/change→save
-    // project-id-select: change→dirty+save
+    // Google STT options: project_idはOAuth metadataで明示確定、それ以外はprovider settingsへ保存
     item.querySelectorAll<HTMLSelectElement>('[data-field="project-id-select"]').forEach((optSelect) => {
       optSelect.addEventListener("change", () => {
         if (optSelect.value === "__manual__") {
-          switchToManualProjectInput(item, "", null);
+          switchToManualProjectInput(item, currentGoogleAuthStatus?.projectId ?? "", null);
           const input = item.querySelector<HTMLInputElement>('[data-field="project-id-input"]');
           if (input) input.focus();
           return;
         }
-        // 接続確認状態を無効化
-        invalidateGoogleSttVerification(item, (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
-        providerConfigState.markDirty(providerId);
-        saveDirtyProviderConfig({
-          providerId: providerId!,
-          section: item,
-          state: providerConfigState,
-          saveConfig: saveProviderConfigFromSection,
-        });
+        const selectedPid = optSelect.value.trim();
+        if (selectedPid) {
+          void confirmGoogleSttProject(item, selectedPid);
+        }
       });
     });
 
-    // project-id-input: input→dirty, blur→save
     item.querySelectorAll<HTMLInputElement>('[data-field="project-id-input"]').forEach((optInput) => {
-      optInput.addEventListener("input", () => providerConfigState.markDirty(providerId));
-      optInput.addEventListener("blur", () => {
-        // 接続確認状態を無効化
-        invalidateGoogleSttVerification(item, (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
-        saveDirtyProviderConfig({
-          providerId: providerId!,
-          section: item,
-          state: providerConfigState,
-          saveConfig: saveProviderConfigFromSection,
-        });
+      optInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          const pid = optInput.value.trim();
+          if (pid) void confirmGoogleSttProject(item, pid);
+        }
       });
     });
 
@@ -3771,6 +4212,14 @@ function bindProviderConfigAutoSave(container: ParentNode = document) {
         const open = content.hidden;
         setGoogleSttAdvancedOpen(toggleBtn, content, open);
         toggleBtn.classList.toggle("is-open", open);
+        if (open && item.dataset.providerId === "google_stt") {
+          ++activeOnboardingRunSeq;
+          setGoogleOnboardingBusy(item, false);
+          hideGoogleOnboardingPanels(item);
+          if (currentGoogleAuthStatus?.state === "connected") {
+            void loadGoogleSttProjects(item);
+          }
+        }
       });
     });
 
@@ -3897,69 +4346,273 @@ function bindFetchModelsButtons(container: ParentNode = document) {
 
 // ---- Google STT: loadGoogleSttProjects ----
 
+function formatGoogleSttErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message !== "[object Object]") {
+    return error.message;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  if (error && typeof error === "object") {
+    const record = error as Record<string, unknown>;
+    const message = typeof record.message === "string" ? record.message : "";
+    const kind = typeof record.kind === "string" ? record.kind : "";
+    if (message && kind) return `${message} (${kind})`;
+    if (message) return message;
+    try {
+      return JSON.stringify(error);
+    } catch {
+      // Fall through to a stable generic message for cyclic/unserializable objects.
+    }
+  }
+  return String(error);
+}
+
+let currentGoogleAuthStatus: GoogleAuthStatus | null = null;
+
+function getGoogleAuthSessionKey(status: GoogleAuthStatus): string {
+  // New backend versions always provide the random persisted session ID. Keep a
+  // deterministic fallback for older test fixtures / mixed-version UI payloads.
+  return status.authSessionId || `legacy:${status.oauthClientIdFingerprint}:${status.sub ?? ""}`;
+}
+
+async function refreshTranscribeGoogleSttSelectors(): Promise<void> {
+  const modeSelect = document.getElementById("asrModeSelect") as HTMLSelectElement | null;
+  const engineSelect = document.getElementById("engineSelect") as HTMLSelectElement | null;
+  if (modeSelect?.value === "cloud" && engineSelect) {
+    await populateCloudEngines(engineSelect);
+  }
+  const firstSource = document.getElementById("multiAsrFirstSourceModeSelect") as HTMLSelectElement | null;
+  const secondSource = document.getElementById("multiAsrSecondSourceModeSelect") as HTMLSelectElement | null;
+  if (firstSource?.value === "cloud" || secondSource?.value === "cloud") {
+    await populateDualAsrEngineOptions();
+  }
+}
+
+function applyAndSyncGoogleAuthStatus(
+  item: HTMLElement,
+  status: GoogleAuthStatus,
+  options: { restoreProjectControls?: boolean } = {},
+): void {
+  const effective = updateCurrentGoogleAuthStatusIfNewer(status);
+  if (!isPendingSpeechApiEnableContextCurrent(effective, pendingSpeechApiEnableContext)) {
+    hideSpeechApiPanels(item);
+  }
+  applyGoogleAuthStatusToSection(item, effective, options);
+  if (effective.state === "connected" && effective.projectId && effective.projectVerified) {
+    setGoogleSttStatus(item, "verified", (el, label) =>
+      setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"),
+    );
+  } else {
+    const configuredState = getGoogleSttConfiguredState(item);
+    setGoogleSttStatus(item, configuredState, (el, label) =>
+      setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"),
+    );
+  }
+  void refreshTranscribeGoogleSttSelectors();
+}
+
+async function refreshGoogleAuthAndProjects(item: HTMLElement): Promise<void> {
+  try {
+    const status = await invokeTauri<GoogleAuthStatus>("google_auth_get_status");
+    applyAndSyncGoogleAuthStatus(item, status);
+    const advancedContent = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+    if (status.state === "connected" && advancedContent && !advancedContent.hidden) {
+      await loadGoogleSttProjects(item);
+    } else if (status.state !== "connected") {
+      const diagList = item.querySelector<HTMLElement>('[data-field="diag-project-list"]');
+      if (diagList) diagList.textContent = "Project一覧: 未取得";
+    }
+    if (shouldAutoRunDefaultOnboarding(currentGoogleAuthStatus, attemptedOnboardingSessionIds)) {
+      await runGoogleDefaultOnboarding(item);
+    }
+  } catch (e) {
+    console.error("google_auth_get_status error:", e);
+  }
+}
+
+let confirmGoogleSttProjectQueue: Promise<void> = Promise.resolve();
+
+async function confirmGoogleSttProject(item: HTMLElement, projectId: string): Promise<void> {
+  const errorEl = item.querySelector<HTMLElement>('[data-field="project-error"]');
+  if (errorEl) errorEl.style.display = "none";
+  ++activeOnboardingRunSeq;
+  hideGoogleOnboardingPanels(item);
+  hideSpeechApiPanels(item);
+  const requestedProjectId = projectId.trim();
+  const projectInput = item.querySelector<HTMLInputElement>('[data-field="project-id-input"]');
+  const projectSelect = item.querySelector<HTMLSelectElement>('[data-field="project-id-select"]');
+  const requestedControlValue = projectInput && !projectInput.hidden
+    ? projectInput.value
+    : projectSelect?.value ?? "";
+  const requestedBy = currentGoogleAuthStatus;
+  if (!requestedBy || requestedBy.state !== "connected" || !requestedBy.sub) return;
+  const requestedIdentity = {
+    sub: requestedBy.sub,
+    oauthClientIdFingerprint: requestedBy.oauthClientIdFingerprint,
+    authSessionId: getGoogleAuthSessionKey(requestedBy),
+  };
+  const operation = confirmGoogleSttProjectQueue.then(async () => {
+    const snapshot = currentGoogleAuthStatus;
+    if (
+      !snapshot || snapshot.state !== "connected" || !snapshot.sub ||
+      snapshot.sub !== requestedIdentity.sub ||
+      snapshot.oauthClientIdFingerprint !== requestedIdentity.oauthClientIdFingerprint ||
+      getGoogleAuthSessionKey(snapshot) !== requestedIdentity.authSessionId
+    ) return;
+    const capturedMeta = {
+      authGeneration: snapshot.authGeneration,
+      sub: snapshot.sub,
+      oauthClientIdFingerprint: snapshot.oauthClientIdFingerprint,
+      authSessionId: getGoogleAuthSessionKey(snapshot),
+    };
+    try {
+      const status = await invokeTauri<GoogleAuthStatus>("google_auth_confirm_project", {
+        projectId: requestedProjectId,
+        ...capturedMeta,
+      });
+      if (
+        !isGoogleAuthResponseCurrent(currentGoogleAuthStatus, capturedMeta) ||
+        status.authGeneration !== capturedMeta.authGeneration + 1 ||
+        status.state !== "connected" || status.projectId?.trim() !== requestedProjectId ||
+        (status.sub ?? "") !== capturedMeta.sub ||
+        status.oauthClientIdFingerprint !== capturedMeta.oauthClientIdFingerprint ||
+        getGoogleAuthSessionKey(status) !== capturedMeta.authSessionId ||
+        getGoogleAuthSessionKey(currentGoogleAuthStatus!) !== capturedMeta.authSessionId
+      ) return;
+      // The CAS response can become stale immediately after the backend releases its lock
+      // (for example, another app instance switches accounts). Only render a fresh status.
+      const latest = await invokeTauri<GoogleAuthStatus>("google_auth_get_status").catch(() => null);
+      if (!latest) {
+        if (errorEl) {
+          errorEl.textContent = "Projectは確定しましたが、最新のGoogle認証状態を再取得できませんでした。状態を再確認してください。";
+          errorEl.style.display = "";
+        }
+        return;
+      }
+      applyAndSyncGoogleAuthStatus(item, latest);
+      if (
+        latest.state !== "connected" ||
+        getGoogleAuthSessionKey(latest) !== capturedMeta.authSessionId ||
+        latest.projectId?.trim() !== requestedProjectId
+      ) {
+        if (errorEl) {
+          errorEl.textContent = "確定後にGoogle認証状態またはProjectが変更されました。現在の状態を確認してください。";
+          errorEl.style.display = "";
+        }
+      }
+    } catch (e) {
+      // A CAS rejection may mean another window/process changed auth or Project state.
+      // Refresh and apply the authoritative status before reporting the failed selection.
+      const latest = await invokeTauri<GoogleAuthStatus>("google_auth_get_status").catch(() => null);
+      const controlsUnchanged = projectInput && !projectInput.hidden
+        ? projectInput.value === requestedControlValue
+        : (projectSelect?.value ?? "") === requestedControlValue;
+      const isCasConflict = parseGoogleApiError(e).message.includes("認証状態が変更されたためProjectの確定を中止しました");
+      if (latest) {
+        applyAndSyncGoogleAuthStatus(item, latest, {
+          restoreProjectControls: isCasConflict && controlsUnchanged,
+        });
+      }
+      const active = currentGoogleAuthStatus;
+      if (!active) return;
+      const sameSession = getGoogleAuthSessionKey(active) === capturedMeta.authSessionId;
+      const msg = sameSession
+        ? formatGoogleSttErrorMessage(e)
+        : "Google認証状態が変更されたため、Projectの確定を中止しました。現在の認証状態を確認してください。";
+      if (errorEl) { errorEl.textContent = msg; errorEl.style.display = ""; }
+    }
+  });
+  confirmGoogleSttProjectQueue = operation.catch(() => undefined);
+  await operation;
+}
+
 async function loadGoogleSttProjects(section: Element): Promise<void> {
   const select = section.querySelector<HTMLSelectElement>(
     '[data-field="project-id-select"]',
   );
+  const input = section.querySelector<HTMLInputElement>(
+    '[data-field="project-id-input"]',
+  );
+  const confirmBtn = section.querySelector<HTMLButtonElement>(
+    ".btn-google-stt-confirm-project",
+  );
   const errorEl = section.querySelector<HTMLElement>(
     '[data-field="project-error"]',
   );
+  const diagListEl = section.querySelector<HTMLElement>(
+    '[data-field="diag-project-list"]',
+  );
   if (!select) return;
 
+  const snapshot = currentGoogleAuthStatus;
+  if (!snapshot || snapshot.state !== "connected") {
+    return;
+  }
+  const capturedMeta = {
+    authGeneration: snapshot.authGeneration,
+    sub: snapshot.sub,
+    oauthClientIdFingerprint: snapshot.oauthClientIdFingerprint,
+  };
+
   if (errorEl) errorEl.style.display = "none";
+  select.hidden = false;
+  if (input) input.hidden = true;
+  if (confirmBtn) confirmBtn.hidden = true;
   select.innerHTML = '<option value="">読み込み中...</option>';
 
-  // 保存済みproject_idをdata属性から取得（loadSavedSettingsで設定済み）
-  // selectの現在値は使わない（再取得時は「読み込み中...」で上書き済みのため）
-  const savedProjectId =
-    (section as HTMLElement).dataset.googleSttSavedProjectId || null;
-
   try {
-    const result = await invokeTauri<{
-      projects: Array<{ projectId: string; name: string }>;
-      currentProject: string | null;
-    }>("google_stt_list_projects");
+    const result = await invokeTauri<GoogleCloudListProjectsResult>("google_stt_list_projects");
 
-    if (result.projects.length === 0) {
-      if (result.currentProject) {
-        switchToManualProjectInput(section, result.currentProject, errorEl);
-        return;
-      }
-      switchToManualProjectInput(section, "", errorEl);
+    // Stale check: discard if generation/sub/fingerprint changed or revoking
+    if (!isGoogleAuthResponseCurrent(currentGoogleAuthStatus, result)) {
       return;
     }
 
+    if (diagListEl) {
+      diagListEl.textContent = `Project一覧: 取得済み（${result.projects.length}件）`;
+    }
+
+    if (result.projects.length === 0) {
+      switchToManualProjectInput(section, currentGoogleAuthStatus?.projectId ?? "", errorEl);
+      return;
+    }
+
+    const savedProjectId = currentGoogleAuthStatus?.projectId ?? null;
     const optionsResult = buildGoogleSttProjectOptions({
       projects: result.projects,
-      currentProject: result.currentProject,
+      currentProject: null,
       savedProjectId,
     });
 
-    // DOM構築: innerHTMLを使わずnew Option()で安全に
     select.replaceChildren();
+    if (!savedProjectId) {
+      select.add(new Option("プロジェクトを選択してください...", ""));
+    }
     for (const opt of optionsResult.options) {
       select.add(new Option(opt.label, opt.value));
     }
     if (optionsResult.selectedValue) {
       select.value = optionsResult.selectedValue;
-    }
-
-    // 自動保存: 保存値なし + current_project自動選択時のみ
-    if (shouldAutoSaveProject({
-      selectedBy: optionsResult.selectedBy,
-      savedProjectId,
-    })) {
-      providerConfigState.markDirty("google_stt");
-      await saveDirtyProviderConfig({
-        providerId: "google_stt",
-        section: section as HTMLElement,
-        state: providerConfigState,
-        saveConfig: saveProviderConfigFromSection,
-      });
+    } else {
+      select.value = "";
     }
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    switchToManualProjectInput(section, "", errorEl, msg);
+    const parsed = parseGoogleApiError(e);
+    const metaToCheck = {
+      authGeneration: parsed.authGeneration ?? capturedMeta.authGeneration,
+      sub: parsed.sub ?? capturedMeta.sub,
+      oauthClientIdFingerprint:
+        parsed.oauthClientIdFingerprint ?? capturedMeta.oauthClientIdFingerprint,
+    };
+    if (!isGoogleAuthResponseCurrent(currentGoogleAuthStatus, metaToCheck)) {
+      return;
+    }
+    if (diagListEl) {
+      diagListEl.textContent = "Project一覧: 取得失敗（手入力可能）";
+    }
+    const msg = formatGoogleSttErrorMessage(e);
+    switchToManualProjectInput(section, currentGoogleAuthStatus?.projectId ?? "", errorEl, msg);
   }
 }
 
@@ -3975,10 +4628,16 @@ function switchToManualProjectInput(
   const input = section.querySelector<HTMLInputElement>(
     '[data-field="project-id-input"]',
   );
+  const confirmBtn = section.querySelector<HTMLButtonElement>(
+    ".btn-google-stt-confirm-project",
+  );
   if (select) select.hidden = true;
   if (input) {
     input.hidden = false;
-    if (fallbackValue) input.value = fallbackValue;
+    input.value = fallbackValue;
+  }
+  if (confirmBtn) {
+    confirmBtn.hidden = false;
   }
   if (errorEl) {
     if (errorMsg) {
@@ -4073,12 +4732,137 @@ function bindTestSendButtons(container: ParentNode = document) {
 }
 
 function bindGoogleSttHandlers(container: ParentNode = document) {
-  // ADC認証チェック
-  container.querySelectorAll<HTMLElement>(".btn-google-stt-check-adc").forEach((btn) => {
+  // Googleにログイン
+  container.querySelectorAll<HTMLButtonElement>(".btn-google-auth-login").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const item = btn.closest<HTMLElement>(".accordion-item");
       if (!item) return;
-      await runAdcCheck(item, btn);
+      await runGoogleOAuthLogin(item, btn, "google_auth_login", false);
+    });
+  });
+
+  // 同意を再取得してログイン（refresh token未返却時の明示的再試行）
+  container.querySelectorAll<HTMLButtonElement>(".btn-google-auth-retry-consent").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      const command =
+        currentGoogleAuthStatus?.state === "connected"
+          ? "google_auth_switch_account"
+          : "google_auth_login";
+      await runGoogleOAuthLogin(item, btn, command, true);
+    });
+  });
+
+  // アカウントを切り替える
+  container.querySelectorAll<HTMLButtonElement>(".btn-google-auth-switch").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      await runGoogleOAuthLogin(item, btn, "google_auth_switch_account", false);
+    });
+  });
+
+  // 通常ログアウト
+  container.querySelectorAll<HTMLButtonElement>(".btn-google-auth-logout").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      btn.disabled = true;
+      try {
+        const status = await invokeTauri<GoogleAuthStatus>("google_auth_logout");
+        applyAndSyncGoogleAuthStatus(item, status);
+        const diagList = item.querySelector<HTMLElement>('[data-field="diag-project-list"]');
+        if (diagList) diagList.textContent = "Project一覧: 未取得";
+      } catch (e) {
+        const errorEl = item.querySelector<HTMLElement>('[data-field="auth-error"]');
+        if (errorEl) {
+          errorEl.textContent = formatGoogleSttErrorMessage(e);
+          errorEl.style.display = "";
+        }
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
+
+  // Google側のアクセス権も取り消す
+  container.querySelectorAll<HTMLButtonElement>(".btn-google-auth-revoke").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      const confirmed = await showAppConfirm({
+        title: "Googleアクセス権の取り消し",
+        message:
+          "このPCからログアウトし、Google側のアクセス権も取り消します。同じGoogle Cloud OAuthプロジェクトの他クライアントやトークンにも影響する可能性があります。続行しますか？",
+      });
+      if (!confirmed) return;
+
+      if (currentGoogleAuthStatus) {
+        applyAndSyncGoogleAuthStatus(item, {
+          ...currentGoogleAuthStatus,
+          state: "revoking",
+        });
+      }
+
+      try {
+        const res = await invokeTauri<GoogleAuthRevokeResult>("google_auth_revoke");
+        applyAndSyncGoogleAuthStatus(item, res.status);
+        const diagList = item.querySelector<HTMLElement>('[data-field="diag-project-list"]');
+        if (diagList) diagList.textContent = "Project一覧: 未取得";
+        const authErrorEl = item.querySelector<HTMLElement>('[data-field="auth-error"]');
+        if (authErrorEl && !res.revokedOnGoogle) {
+          authErrorEl.textContent = res.message;
+          authErrorEl.style.display = "";
+        }
+      } catch (e) {
+        await refreshGoogleAuthAndProjects(item);
+        const authErrorEl = item.querySelector<HTMLElement>('[data-field="auth-error"]');
+        if (authErrorEl) {
+          authErrorEl.textContent = formatGoogleSttErrorMessage(e);
+          authErrorEl.style.display = "";
+        }
+      }
+    });
+  });
+
+  // オンボーディング再試行 / アカウント切替（例外時パネル）
+  container.querySelectorAll<HTMLButtonElement>(".btn-google-onboarding-retry").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      await runGoogleDefaultOnboarding(item, { allowRetrySameSession: true });
+    });
+  });
+
+  container.querySelectorAll<HTMLButtonElement>(".btn-google-onboarding-switch").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      await runGoogleOAuthLogin(item, btn, "google_auth_switch_account", false);
+    });
+  });
+
+  // 手入力 Project ID 確定
+  container.querySelectorAll<HTMLButtonElement>(".btn-google-stt-confirm-project").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      const input = item.querySelector<HTMLInputElement>('[data-field="project-id-input"]');
+      const pid = input?.value.trim() ?? "";
+      await confirmGoogleSttProject(item, pid);
+    });
+  });
+
+  // 旧 provider settings の Project ID 候補を明示確定
+  container.querySelectorAll<HTMLButtonElement>(".btn-google-stt-confirm-legacy-project").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      const candidate = item.querySelector<HTMLElement>('[data-field="legacy-project-value"]')?.textContent?.trim() ?? "";
+      if (!candidate) return;
+      await confirmGoogleSttProject(item, candidate);
+      await loadGoogleSttProjects(item);
     });
   });
 
@@ -4109,22 +4893,50 @@ function bindGoogleSttHandlers(container: ParentNode = document) {
         btn.innerHTML = '<span class="material-symbols-outlined spin">mic</span> 認識中...';
         (btn as HTMLButtonElement).disabled = true;
 
+        const snapshot = currentGoogleAuthStatus;
+        if (!snapshot || snapshot.state !== "connected" || !snapshot.projectId) {
+          throw new Error("Googleアカウントにログインし、Project IDを確定してください。");
+        }
+        const capturedMeta = {
+          authGeneration: snapshot.authGeneration,
+          sub: snapshot.sub,
+          oauthClientIdFingerprint: snapshot.oauthClientIdFingerprint,
+        };
         try {
-          const projectId = getGoogleSttProjectId(item);
+          const projectId = snapshot.projectId;
           const location = item.querySelector<HTMLSelectElement>('[data-field="location"]')?.value || "us-central1";
           const recognizerId = item.querySelector<HTMLInputElement>('[data-field="recognizer-id"]')?.value?.trim() || "_";
           const langSel = item.querySelector<HTMLSelectElement>('[data-field="language-code"]');
           const languageCode = langSel?.value?.trim() || "ja-JP";
 
-          const result = await invokeTauri<GoogleSttRecognizeResult>("google_stt_recognize", {
+          const result = await invokeTauri<GoogleSttRecognizeResult & {
+            authGeneration?: number;
+            sub?: string;
+            oauthClientIdFingerprint?: string;
+          }>("google_stt_recognize", {
             input: { projectId, location, recognizerId, languageCode, model: "chirp_2", audioPath: selected },
           });
+          if (!isGoogleAuthResponseCurrent(currentGoogleAuthStatus, {
+            authGeneration: result.authGeneration ?? capturedMeta.authGeneration,
+            sub: result.sub ?? capturedMeta.sub,
+            oauthClientIdFingerprint: result.oauthClientIdFingerprint ?? capturedMeta.oauthClientIdFingerprint,
+          })) {
+            return;
+          }
           renderGoogleSttRecognitionSuccess(resultEl!, result, {
             sourceLabel: `使用ファイル: ${fileName}`,
             languageCode,
             model: "chirp_2",
           });
         } catch (e) {
+          const parsed = parseGoogleApiError(e);
+          if (!isGoogleAuthResponseCurrent(currentGoogleAuthStatus, {
+            authGeneration: parsed.authGeneration ?? capturedMeta.authGeneration,
+            sub: parsed.sub ?? capturedMeta.sub,
+            oauthClientIdFingerprint: parsed.oauthClientIdFingerprint ?? capturedMeta.oauthClientIdFingerprint,
+          })) {
+            return;
+          }
           renderGoogleSttRecognitionError(resultEl!, e, `使用ファイル: ${fileName}`);
         } finally {
           btn.innerHTML = origHtml;
@@ -4142,6 +4954,44 @@ function bindGoogleSttHandlers(container: ParentNode = document) {
       const item = btn.closest<HTMLElement>(".accordion-item");
       if (!item) return;
       await runBuiltinTest(item, btn);
+    });
+  });
+
+  container.querySelectorAll<HTMLElement>('.accordion-item[data-provider-id="google_stt"] .btn-google-stt-confirm-enable-api').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      await runSpeechApiEnablementAndRetest(item, btn as HTMLButtonElement);
+    });
+  });
+
+  container.querySelectorAll<HTMLElement>('.accordion-item[data-provider-id="google_stt"] .btn-google-stt-cancel-enable-api').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      hideSpeechApiPanels(item);
+    });
+  });
+
+  container.querySelectorAll<HTMLElement>('.accordion-item[data-provider-id="google_stt"] .btn-google-stt-open-console').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      const projectId = currentGoogleAuthStatus?.projectId?.trim() || "";
+      if (!item || !projectId) return;
+      try {
+        const { openUrl } = await import("@tauri-apps/plugin-opener");
+        await openUrl(buildGoogleCloudSpeechConsoleUrl(projectId));
+      } catch (e) {
+        console.error("openUrl error:", e);
+      }
+    });
+  });
+
+  container.querySelectorAll<HTMLElement>('.accordion-item[data-provider-id="google_stt"] .btn-google-stt-recheck-api').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const item = btn.closest<HTMLElement>(".accordion-item");
+      if (!item) return;
+      await recheckSpeechApiStateAndContinue(item, btn as HTMLButtonElement);
     });
   });
 }
@@ -4303,64 +5153,48 @@ function bindXiaomiMimoAsrHandlers(container: ParentNode = document) {
   });
 }
 
-async function runAdcCheck(item: HTMLElement, btn: HTMLElement): Promise<void> {
+async function runGoogleOAuthLogin(
+  item: HTMLElement,
+  btn: HTMLButtonElement,
+  command: "google_auth_login" | "google_auth_switch_account",
+  forceConsent: boolean = false,
+): Promise<void> {
   const originalHtml = btn.innerHTML;
-  btn.innerHTML = '<span class="material-symbols-outlined spin">key</span> 確認中...';
-  (btn as HTMLButtonElement).disabled = true;
+  btn.innerHTML = '<span class="material-symbols-outlined spin">login</span> ブラウザーで認証中...';
+  btn.disabled = true;
+  const authErrorEl = item.querySelector<HTMLElement>('[data-field="auth-error"]');
+  if (authErrorEl) authErrorEl.style.display = "none";
+
   try {
-    const status = await invokeTauri<{ available: boolean; quota_project?: string; current_project?: string; error?: string }>("google_stt_check_adc");
-    const statusEl = item.querySelector<HTMLElement>('[data-field="adc-status"]');
-    const quotaEl = item.querySelector<HTMLElement>('[data-field="adc-quota"]');
-    if (status.available) {
-      if (statusEl) { statusEl.textContent = "ADC利用可能"; statusEl.dataset.adcState = "available"; }
-      const parts: string[] = [];
-      if (status.quota_project) parts.push(`クォータ: ${status.quota_project}`);
-      if (status.current_project) parts.push(`プロジェクト: ${status.current_project}`);
-      if (quotaEl) quotaEl.textContent = parts.join(" / ") || "プロジェクト情報なし";
-
-      // ADC成功 → ステータスバッジ更新
-      setGoogleSttStatus(item, "verified", (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
-
-      // Project IDが空欄の場合のみcurrent_projectを自動入力
-      const currentProjectId = getGoogleSttProjectId(item);
-      if (!currentProjectId && status.current_project) {
-        const select = item.querySelector<HTMLSelectElement>('[data-field="project-id-select"]');
-        const input = item.querySelector<HTMLInputElement>('[data-field="project-id-input"]');
-        if (select && !select.hidden) {
-          const match = Array.from(select.options).find(o => o.value === status.current_project);
-          if (match) {
-            select.value = status.current_project;
-          } else {
-            select.hidden = true;
-            if (input) { input.hidden = false; input.value = status.current_project; }
-          }
-        } else if (input) {
-          input.value = status.current_project;
-        }
-        providerConfigState.markDirty("google_stt");
-        saveDirtyProviderConfig({
-          providerId: "google_stt",
-          section: item,
-          state: providerConfigState,
-          saveConfig: saveProviderConfigFromSection,
-        });
-      }
-    } else {
-      if (statusEl) { statusEl.textContent = "ADC利用不可"; statusEl.dataset.adcState = "unavailable"; }
-      if (quotaEl) quotaEl.textContent = status.error || "";
-      // ADC失敗: 必須設定あればエラー
-      const configuredState = getGoogleSttConfiguredState(item);
-      setGoogleSttStatus(item, configuredState === "configured" ? "error" : "unconfigured", (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
+    const status = await invokeTauri<GoogleAuthStatus>(command, { forceConsent });
+    applyAndSyncGoogleAuthStatus(item, status);
+    const advancedContent = item.querySelector<HTMLElement>('[data-field="advanced-content"]');
+    if (status.state === "connected" && advancedContent && !advancedContent.hidden) {
+      await loadGoogleSttProjects(item);
+    }
+    if (shouldAutoRunDefaultOnboarding(currentGoogleAuthStatus, attemptedOnboardingSessionIds)) {
+      await runGoogleDefaultOnboarding(item);
     }
   } catch (e) {
-    const statusEl = item.querySelector<HTMLElement>('[data-field="adc-status"]');
-    if (statusEl) { statusEl.textContent = "エラー"; statusEl.dataset.adcState = "error"; }
-    const configuredState = getGoogleSttConfiguredState(item);
-    setGoogleSttStatus(item, configuredState === "configured" ? "error" : "unconfigured", (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
-    console.error("google_stt_check_adc error:", e);
+    const parsed = parseGoogleApiError(e);
+    if (authErrorEl) {
+      authErrorEl.textContent = parsed.isUserCancel
+        ? "ログインがキャンセルされました。"
+        : formatGoogleSttErrorMessage(e);
+      authErrorEl.style.display = "";
+    }
+    const retryConsentBtn = item.querySelector<HTMLButtonElement>(".btn-google-auth-retry-consent");
+    if (retryConsentBtn) {
+      retryConsentBtn.hidden = parsed.kind !== "oauth_refresh_token_missing";
+    }
+    // Keep existing active account (if any) intact on pre-commit failure!
+    const latest = await invokeTauri<GoogleAuthStatus>("google_auth_get_status").catch(() => null);
+    if (latest) {
+      applyAndSyncGoogleAuthStatus(item, latest);
+    }
   } finally {
     btn.innerHTML = originalHtml;
-    (btn as HTMLButtonElement).disabled = false;
+    btn.disabled = false;
   }
 }
 
@@ -4398,52 +5232,763 @@ function renderGoogleSttRecognitionSuccess(
   resultEl.style.display = "block";
 }
 
+const attemptedOnboardingSessionIds = new Set<string>();
+let activeOnboardingRunSeq = 0;
+
+function hideGoogleOnboardingPanels(item: HTMLElement): void {
+  const statusPanel = item.querySelector<HTMLElement>('[data-field="onboarding-status-panel"]');
+  const actionPanel = item.querySelector<HTMLElement>('[data-field="onboarding-action-panel"]');
+  if (statusPanel) statusPanel.hidden = true;
+  if (actionPanel) actionPanel.hidden = true;
+}
+
+function setGoogleOnboardingBusy(item: HTMLElement, busy: boolean, statusText?: string): void {
+  const statusPanel = item.querySelector<HTMLElement>('[data-field="onboarding-status-panel"]');
+  const statusTextEl = item.querySelector<HTMLElement>('[data-field="onboarding-status-text"]');
+  if (statusPanel) {
+    statusPanel.hidden = !busy;
+  }
+  if (statusTextEl && statusText) {
+    statusTextEl.textContent = statusText;
+  }
+  const controls = item.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>(
+    ".btn-google-auth-login, .btn-google-auth-switch, .btn-google-stt-builtin-test",
+  );
+  controls.forEach((el) => {
+    if (busy) {
+      el.dataset.onboardingPrevDisabled = String(el.disabled);
+      el.disabled = true;
+    } else if (el.dataset.onboardingPrevDisabled !== undefined) {
+      el.disabled = el.dataset.onboardingPrevDisabled === "true";
+      delete el.dataset.onboardingPrevDisabled;
+    }
+  });
+}
+
+function showGoogleOnboardingActionPanel(
+  item: HTMLElement,
+  opts: {
+    title: string;
+    reason: string;
+    email?: string;
+    projectId?: string;
+    requiredPermission?: string;
+    showRetry?: boolean;
+    showSwitchAccount?: boolean;
+  },
+): void {
+  const panel = item.querySelector<HTMLElement>('[data-field="onboarding-action-panel"]');
+  if (!panel) return;
+  const titleEl = panel.querySelector<HTMLElement>('[data-field="onboarding-action-title"]');
+  const reasonEl = panel.querySelector<HTMLElement>('[data-field="onboarding-action-reason"]');
+  const metaEl = panel.querySelector<HTMLElement>('[data-field="onboarding-action-meta"]');
+  const retryBtn = panel.querySelector<HTMLButtonElement>(".btn-google-onboarding-retry");
+  const switchBtn = panel.querySelector<HTMLButtonElement>(".btn-google-onboarding-switch");
+  if (titleEl) titleEl.textContent = opts.title;
+  if (reasonEl) reasonEl.textContent = opts.reason;
+  const metaParts: string[] = [];
+  if (opts.email) metaParts.push(`アカウント: ${opts.email}`);
+  if (opts.projectId) metaParts.push(`対象Project: ${opts.projectId}`);
+  if (opts.requiredPermission) metaParts.push(`必要な権限: ${opts.requiredPermission}`);
+  if (metaEl) {
+    metaEl.textContent = metaParts.join(" / ");
+    metaEl.hidden = metaParts.length === 0;
+  }
+  if (retryBtn) retryBtn.hidden = !opts.showRetry;
+  if (switchBtn) switchBtn.hidden = !opts.showSwitchAccount;
+  panel.hidden = false;
+}
+
+async function runGoogleDefaultOnboarding(
+  item: HTMLElement,
+  opts: {
+    enableSpeechApiIfNeeded?: boolean;
+    allowRetrySameSession?: boolean;
+    confirmContext?: PendingSpeechApiEnableContext;
+  } = {},
+): Promise<void> {
+  const snapshot = currentGoogleAuthStatus;
+  if (!snapshot || snapshot.state !== "connected") return;
+  const authSessionId = snapshot.authSessionId ?? "";
+  if (!opts.allowRetrySameSession && authSessionId && attemptedOnboardingSessionIds.has(authSessionId)) {
+    return;
+  }
+  const targetProject = opts.confirmContext?.projectId || snapshot.defaultProjectId?.trim() || "";
+  if (!targetProject) return;
+
+  if (authSessionId) {
+    attemptedOnboardingSessionIds.add(authSessionId);
+  }
+  const runSeq = ++activeOnboardingRunSeq;
+  const capturedIdentity = {
+    authGeneration: snapshot.authGeneration,
+    authSessionId,
+    sub: snapshot.sub,
+    oauthClientIdFingerprint: snapshot.oauthClientIdFingerprint,
+  };
+
+  hideGoogleOnboardingPanels(item);
+  hideSpeechApiPanels(item);
+  setGoogleOnboardingBusy(
+    item,
+    true,
+    opts.enableSpeechApiIfNeeded
+      ? `Google Cloudを準備しています（${snapshot.email || ""} / ${targetProject}: API有効化と接続確認中…）`
+      : `Google Cloudを準備しています（${snapshot.email || ""} / ${targetProject}: 接続確認中…）`,
+  );
+
+  try {
+    const res = await invokeTauri<GoogleOnboardingResult>("google_auth_complete_onboarding", {
+      input: opts.enableSpeechApiIfNeeded && opts.confirmContext
+        ? {
+            enableSpeechApiIfNeeded: true,
+            expectedAuthSessionId: opts.confirmContext.authSessionId ?? capturedIdentity.authSessionId,
+            expectedAuthGeneration: opts.confirmContext.authGeneration,
+            expectedSub: opts.confirmContext.sub,
+            expectedOauthClientIdFingerprint: opts.confirmContext.oauthClientIdFingerprint,
+            expectedProjectId: opts.confirmContext.projectId,
+          }
+        : { enableSpeechApiIfNeeded: false },
+    });
+
+    const latest = currentGoogleAuthStatus;
+    if (
+      runSeq !== activeOnboardingRunSeq ||
+      !latest ||
+      latest.state !== "connected" ||
+      (latest.authSessionId ?? "") !== capturedIdentity.authSessionId ||
+      (latest.sub ?? "") !== (capturedIdentity.sub ?? "") ||
+      latest.oauthClientIdFingerprint !== capturedIdentity.oauthClientIdFingerprint ||
+      latest.projectSource === "user_selected"
+    ) {
+      return;
+    }
+
+    setGoogleOnboardingBusy(item, false);
+    applyAndSyncGoogleAuthStatus(item, res.status);
+
+    const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
+    switch (res.outcome) {
+      case "ready":
+      case "already_ready_user_project": {
+        hideGoogleOnboardingPanels(item);
+        if (resultEl) {
+          resultEl.textContent = `✓ 利用可能: ${res.email || res.status.email || ""} / Project: ${res.projectId || res.status.projectId || ""}`;
+          resultEl.style.display = "block";
+        }
+        break;
+      }
+      case "needs_api_enable_consent": {
+        const pid = res.consumerProject || res.projectId || targetProject;
+        showSpeechApiEnableConfirmPanel(item, pid, {
+          authGeneration: res.authGeneration,
+          sub: res.sub,
+          oauthClientIdFingerprint: res.oauthClientIdFingerprint,
+          authSessionId: res.authSessionId,
+          mode: "onboarding",
+        });
+        break;
+      }
+      case "project_access_denied":
+        showGoogleOnboardingActionPanel(item, {
+          title: "既定の Google Cloud プロジェクトにアクセスできません（利用者対応が必要）",
+          reason: res.message,
+          email: res.email || res.status.email,
+          projectId: res.projectId || targetProject,
+          requiredPermission: res.requiredPermission,
+          showRetry: true,
+          showSwitchAccount: true,
+        });
+        break;
+      case "workspace_denied":
+        showGoogleOnboardingActionPanel(item, {
+          title: "Google Workspace 管理ポリシーにより利用できません（利用者対応が必要）",
+          reason: res.message,
+          email: res.email || res.status.email,
+          projectId: res.projectId || targetProject,
+          showSwitchAccount: true,
+        });
+        break;
+      case "billing_or_quota_error":
+        showGoogleOnboardingActionPanel(item, {
+          title: "課金設定または利用上限を確認してください（利用者対応が必要）",
+          reason: res.message,
+          email: res.email || res.status.email,
+          projectId: res.projectId || targetProject,
+          showRetry: true,
+          showSwitchAccount: true,
+        });
+        break;
+      case "network_or_timeout":
+        showGoogleOnboardingActionPanel(item, {
+          title: "接続確認がタイムアウトまたは通信エラーになりました",
+          reason: res.message,
+          email: res.email || res.status.email,
+          projectId: res.projectId || targetProject,
+          showRetry: true,
+          showSwitchAccount: false,
+        });
+        break;
+      case "reauth_required":
+        showGoogleOnboardingActionPanel(item, {
+          title: "Googleアカウントの再認証が必要です",
+          reason: res.message,
+          email: res.email || res.status.email,
+          projectId: res.projectId || targetProject,
+          showRetry: false,
+          showSwitchAccount: true,
+        });
+        break;
+      case "configuration_error":
+        showGoogleOnboardingActionPanel(item, {
+          title: "アプリの Google Cloud 設定が不完全です",
+          reason: res.message,
+          showRetry: false,
+          showSwitchAccount: false,
+        });
+        break;
+      case "cancelled_or_stale":
+        hideGoogleOnboardingPanels(item);
+        break;
+      default:
+        showGoogleOnboardingActionPanel(item, {
+          title: "Google Cloud の準備を完了できませんでした",
+          reason: res.message,
+          email: res.email || res.status.email,
+          projectId: res.projectId || targetProject,
+          showRetry: true,
+          showSwitchAccount: true,
+        });
+        break;
+    }
+  } catch (e) {
+    setGoogleOnboardingBusy(item, false);
+    const latest = currentGoogleAuthStatus;
+    if (
+      runSeq !== activeOnboardingRunSeq ||
+      !latest ||
+      latest.state !== "connected" ||
+      (latest.authSessionId ?? "") !== capturedIdentity.authSessionId
+    ) {
+      return;
+    }
+    showGoogleOnboardingActionPanel(item, {
+      title: "Google Cloud の準備に失敗しました",
+      reason: formatGoogleSttErrorMessage(e),
+      email: latest.email,
+      projectId: targetProject,
+      showRetry: true,
+      showSwitchAccount: true,
+    });
+  } finally {
+    if (runSeq === activeOnboardingRunSeq) {
+      setGoogleOnboardingBusy(item, false);
+    }
+  }
+}
+
+interface PendingSpeechApiEnableContext {
+  projectId: string;
+  authGeneration: number;
+  sub?: string;
+  oauthClientIdFingerprint: string;
+  authSessionId?: string;
+  mode: "manual" | "onboarding";
+}
+
+let pendingSpeechApiEnableContext: PendingSpeechApiEnableContext | null = null;
+
+function clearPendingSpeechApiEnableContext(): void {
+  pendingSpeechApiEnableContext = null;
+}
+
+function isPendingSpeechApiEnableContextCurrent(
+  status: GoogleAuthStatus | null,
+  ctx: PendingSpeechApiEnableContext | null,
+): boolean {
+  if (!ctx || !status || status.state !== "connected") return false;
+  if (ctx.mode === "onboarding") {
+    const defaultPid = status.defaultProjectId?.trim() || "";
+    return (
+      defaultPid !== "" &&
+      defaultPid === ctx.projectId &&
+      !status.projectVerified &&
+      status.projectSource !== "user_selected" &&
+      (status.authSessionId ?? "") === (ctx.authSessionId ?? "") &&
+      status.authGeneration === ctx.authGeneration &&
+      (status.sub ?? "") === (ctx.sub ?? "") &&
+      status.oauthClientIdFingerprint === ctx.oauthClientIdFingerprint
+    );
+  }
+  const currentProjectId = status.projectId?.trim() || "";
+  return (
+    currentProjectId !== "" &&
+    currentProjectId === ctx.projectId &&
+    status.authGeneration === ctx.authGeneration &&
+    (status.sub ?? "") === (ctx.sub ?? "") &&
+    status.oauthClientIdFingerprint === ctx.oauthClientIdFingerprint
+  );
+}
+
+function hideSpeechApiPanels(item: HTMLElement): void {
+  clearPendingSpeechApiEnableContext();
+  const confirmPanel = item.querySelector<HTMLElement>('[data-field="api-enable-confirm-panel"]');
+  const fallbackPanel = item.querySelector<HTMLElement>('[data-field="api-fallback-panel"]');
+  if (confirmPanel) {
+    confirmPanel.hidden = true;
+    delete confirmPanel.dataset.confirmProjectId;
+    delete confirmPanel.dataset.confirmAuthGeneration;
+    delete confirmPanel.dataset.confirmSub;
+    delete confirmPanel.dataset.confirmOauthClientIdFingerprint;
+    delete confirmPanel.dataset.confirmMode;
+    delete confirmPanel.dataset.confirmAuthSessionId;
+  }
+  if (fallbackPanel) fallbackPanel.hidden = true;
+}
+
+function showSpeechApiEnableConfirmPanel(
+  item: HTMLElement,
+  projectId: string,
+  meta?: {
+    authGeneration: number;
+    sub?: string;
+    oauthClientIdFingerprint: string;
+    authSessionId?: string;
+    mode?: "manual" | "onboarding";
+  },
+): void {
+  hideSpeechApiPanels(item);
+  const snapshot = currentGoogleAuthStatus;
+  const mode = meta?.mode ?? "manual";
+  const resolvedMeta =
+    meta ??
+    (snapshot && snapshot.state === "connected"
+      ? {
+          authGeneration: snapshot.authGeneration,
+          sub: snapshot.sub,
+          oauthClientIdFingerprint: snapshot.oauthClientIdFingerprint,
+          authSessionId: snapshot.authSessionId,
+          mode: "manual" as const,
+        }
+      : null);
+  const normalizedProjectId = projectId.trim();
+  const expectedSnapshotProject =
+    mode === "onboarding"
+      ? snapshot?.defaultProjectId?.trim()
+      : snapshot?.projectId?.trim();
+  if (
+    !resolvedMeta ||
+    !normalizedProjectId ||
+    !snapshot ||
+    snapshot.state !== "connected" ||
+    expectedSnapshotProject !== normalizedProjectId ||
+    snapshot.authGeneration !== resolvedMeta.authGeneration ||
+    (snapshot.sub ?? "") !== (resolvedMeta.sub ?? "") ||
+    snapshot.oauthClientIdFingerprint !== resolvedMeta.oauthClientIdFingerprint ||
+    (mode === "onboarding" &&
+      (snapshot.authSessionId ?? "") !== (resolvedMeta.authSessionId ?? ""))
+  ) {
+    return;
+  }
+  pendingSpeechApiEnableContext = {
+    projectId: normalizedProjectId,
+    authGeneration: resolvedMeta.authGeneration,
+    sub: resolvedMeta.sub,
+    oauthClientIdFingerprint: resolvedMeta.oauthClientIdFingerprint,
+    authSessionId: resolvedMeta.authSessionId ?? snapshot.authSessionId,
+    mode,
+  };
+  const confirmPanel = item.querySelector<HTMLElement>('[data-field="api-enable-confirm-panel"]');
+  const projectEl = confirmPanel?.querySelector<HTMLElement>('[data-field="enable-target-project"]');
+  const serviceEl = confirmPanel?.querySelector<HTMLElement>('[data-field="enable-target-service"]');
+  if (projectEl) projectEl.textContent = normalizedProjectId;
+  if (serviceEl) serviceEl.textContent = "speech.googleapis.com";
+  if (confirmPanel) {
+    confirmPanel.dataset.confirmProjectId = normalizedProjectId;
+    confirmPanel.dataset.confirmAuthGeneration = String(resolvedMeta.authGeneration);
+    confirmPanel.dataset.confirmSub = resolvedMeta.sub ?? "";
+    confirmPanel.dataset.confirmOauthClientIdFingerprint = resolvedMeta.oauthClientIdFingerprint;
+    confirmPanel.dataset.confirmMode = mode;
+    confirmPanel.dataset.confirmAuthSessionId = resolvedMeta.authSessionId ?? snapshot.authSessionId ?? "";
+    confirmPanel.hidden = false;
+  }
+}
+
+function showSpeechApiFallbackPanel(
+  item: HTMLElement,
+  opts: {
+    title: string;
+    reason: string;
+    projectId: string;
+    requiredPermission?: string;
+  },
+): void {
+  hideSpeechApiPanels(item);
+  const panel = item.querySelector<HTMLElement>('[data-field="api-fallback-panel"]');
+  if (!panel) return;
+  const titleEl = panel.querySelector<HTMLElement>('[data-field="fallback-title"]');
+  const reasonEl = panel.querySelector<HTMLElement>('[data-field="fallback-reason"]');
+  const projectEl = panel.querySelector<HTMLElement>('[data-field="fallback-project"]');
+  const permWrap = panel.querySelector<HTMLElement>('[data-field="fallback-permission-wrap"]');
+  const permEl = panel.querySelector<HTMLElement>('[data-field="fallback-permission"]');
+  if (titleEl) titleEl.textContent = opts.title;
+  if (reasonEl) reasonEl.textContent = opts.reason;
+  if (projectEl) projectEl.textContent = opts.projectId;
+  if (permWrap && permEl) {
+    if (opts.requiredPermission) {
+      permEl.textContent = opts.requiredPermission;
+      permWrap.hidden = false;
+    } else {
+      permEl.textContent = "";
+      permWrap.hidden = true;
+    }
+  }
+  panel.hidden = false;
+}
+
 function renderGoogleSttRecognitionError(
   resultEl: HTMLElement,
   error: unknown,
   sourceLabel: string,
 ): void {
-  const msg = error instanceof Error ? error.message : String(error);
+  const msg = formatGoogleSttErrorMessage(error);
   const safeMsg = msg.length > 500 ? msg.substring(0, 500) + "..." : msg;
-  resultEl.textContent = `✗ 認識に失敗しました\n\n音声: ${sourceLabel}\nエラー: ${safeMsg}`;
+  resultEl.textContent =
+    `✗ 認識に失敗しました\n\n音声: ${sourceLabel}\nエラー: ${safeMsg}\n\n次の手段: 対象Projectやリージョンを確認して再テストするか、Google Cloud Console で API・権限の状態を確認してください。`;
   resultEl.style.display = "block";
+}
+
+function handleGoogleSpeechPreparationError(
+  item: HTMLElement,
+  projectId: string,
+  error: unknown,
+  resultEl: HTMLElement | null,
+  sourceLabel: string,
+  meta?: {
+    authGeneration: number;
+    sub?: string;
+    oauthClientIdFingerprint: string;
+  },
+): void {
+  const parsed = parseGoogleApiError(error);
+  if (canPromptSpeechApiEnable(parsed, projectId)) {
+    showSpeechApiEnableConfirmPanel(item, projectId, meta);
+    return;
+  }
+
+  switch (parsed.kind) {
+    case "speech_api_disabled":
+      showSpeechApiFallbackPanel(item, {
+        title: "Speech-to-Text API の有効化先を自動特定できませんでした",
+        reason:
+          "Googleの応答から有効化対象Projectの一致を確認できなかったため、自動有効化を行いませんでした。Consoleで確認するか「状態を再確認」を実行してください。",
+        projectId,
+      });
+      return;
+    case "service_usage_permission_denied":
+      showSpeechApiFallbackPanel(item, {
+        title: "APIを有効化する権限が不足しています",
+        reason: parsed.message,
+        projectId,
+        requiredPermission: "serviceusage.services.enable",
+      });
+      return;
+    case "service_usage_api_disabled":
+      showSpeechApiFallbackPanel(item, {
+        title: "Service Usage API が無効です",
+        reason: parsed.message,
+        projectId,
+      });
+      return;
+    case "oauth_admin_policy_enforced":
+      showSpeechApiFallbackPanel(item, {
+        title: "Workspace管理ポリシーにより制限されています",
+        reason: parsed.message,
+        projectId,
+      });
+      return;
+    case "oauth_scope_not_granted":
+      showSpeechApiFallbackPanel(item, {
+        title: "OAuth認証スコープが不足しています",
+        reason: parsed.message,
+        projectId,
+      });
+      return;
+    case "service_usage_operation_timeout":
+      showSpeechApiFallbackPanel(item, {
+        title: "API有効化の結果を確認中です（タイムアウト）",
+        reason: parsed.message,
+        projectId,
+      });
+      return;
+    case "service_usage_operation_failed":
+      showSpeechApiFallbackPanel(item, {
+        title: "API有効化に失敗しました",
+        reason: parsed.message,
+        projectId,
+      });
+      return;
+    default:
+      if (resultEl) renderGoogleSttRecognitionError(resultEl, error, sourceLabel);
+  }
+}
+
+async function runSpeechApiEnablementAndRetest(
+  item: HTMLElement,
+  btn: HTMLButtonElement,
+): Promise<void> {
+  const snapshot = currentGoogleAuthStatus;
+  const confirmPanel = item.querySelector<HTMLElement>('[data-field="api-enable-confirm-panel"]');
+  const panelProjectId = confirmPanel?.dataset.confirmProjectId?.trim() || "";
+  const panelGenRaw = confirmPanel?.dataset.confirmAuthGeneration;
+  const panelSub = confirmPanel?.dataset.confirmSub ?? "";
+  const panelFingerprint = confirmPanel?.dataset.confirmOauthClientIdFingerprint ?? "";
+  const ctx = pendingSpeechApiEnableContext;
+  const matchesDom =
+    !!confirmPanel &&
+    !confirmPanel.hidden &&
+    !!ctx &&
+    panelProjectId === ctx.projectId &&
+    panelGenRaw === String(ctx.authGeneration) &&
+    panelSub === (ctx.sub ?? "") &&
+    panelFingerprint === ctx.oauthClientIdFingerprint;
+
+  const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
+
+  if (!matchesDom || !isPendingSpeechApiEnableContextCurrent(snapshot, ctx)) {
+    hideSpeechApiPanels(item);
+    const currentProjectId = snapshot?.projectId?.trim() || "";
+    if (resultEl) {
+      resultEl.textContent = currentProjectId
+        ? `Projectまたは認証状態が変更されたため、確認パネルを閉じました。現在のProject（${currentProjectId}）で再度「準備して接続テスト」を実行してください。`
+        : "Projectまたは認証状態が変更されたため、確認パネルを閉じました。Projectを選択して再度「準備して接続テスト」を実行してください。";
+      resultEl.style.display = "block";
+    }
+    return;
+  }
+
+  if (ctx?.mode === "onboarding" && matchesDom && isPendingSpeechApiEnableContextCurrent(snapshot, ctx)) {
+    const onboardingCtx = { ...ctx };
+    await runGoogleDefaultOnboarding(item, {
+      enableSpeechApiIfNeeded: true,
+      allowRetrySameSession: true,
+      confirmContext: onboardingCtx,
+    });
+    return;
+  }
+
+  const projectId = ctx.projectId;
+  const capturedMeta = {
+    authGeneration: ctx.authGeneration,
+    sub: ctx.sub,
+    oauthClientIdFingerprint: ctx.oauthClientIdFingerprint,
+  };
+
+  const originalText = btn.textContent || "有効化してテストを続行";
+  btn.disabled = true;
+  btn.textContent = "有効化中…";
+  if (resultEl) {
+    resultEl.textContent = `Project ${projectId} で speech.googleapis.com を有効化しています…`;
+    resultEl.style.display = "block";
+  }
+
+  try {
+    const res = await invokeTauri<EnableSpeechApiResult>("google_stt_enable_speech_api", {
+      projectId,
+      confirmed: true,
+    });
+    if (
+      !isGoogleAuthResponseCurrent(currentGoogleAuthStatus, {
+        authGeneration: res.authGeneration ?? capturedMeta.authGeneration,
+        sub: res.sub ?? capturedMeta.sub,
+        oauthClientIdFingerprint:
+          res.oauthClientIdFingerprint ?? capturedMeta.oauthClientIdFingerprint,
+      }) ||
+      currentGoogleAuthStatus?.projectId?.trim() !== projectId
+    ) {
+      return;
+    }
+
+    hideSpeechApiPanels(item);
+    const builtinBtn = item.querySelector<HTMLElement>(".btn-google-stt-builtin-test");
+    if (builtinBtn) {
+      await runBuiltinTest(item, builtinBtn);
+    }
+  } catch (e) {
+    const parsed = parseGoogleApiError(e);
+    if (
+      !isGoogleAuthResponseCurrent(currentGoogleAuthStatus, {
+        authGeneration: parsed.authGeneration ?? capturedMeta.authGeneration,
+        sub: parsed.sub ?? capturedMeta.sub,
+        oauthClientIdFingerprint:
+          parsed.oauthClientIdFingerprint ?? capturedMeta.oauthClientIdFingerprint,
+      }) ||
+      currentGoogleAuthStatus?.projectId?.trim() !== projectId
+    ) {
+      return;
+    }
+    if (resultEl) {
+      resultEl.style.display = "none";
+      resultEl.textContent = "";
+    }
+    handleGoogleSpeechPreparationError(item, projectId, e, resultEl, "同梱テスト音声", capturedMeta);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+}
+
+async function recheckSpeechApiStateAndContinue(
+  item: HTMLElement,
+  btn: HTMLButtonElement,
+): Promise<void> {
+  const snapshot = currentGoogleAuthStatus;
+  const projectId = snapshot?.projectId?.trim() || "";
+  if (!snapshot || snapshot.state !== "connected" || !projectId) {
+    return;
+  }
+  const capturedMeta = {
+    authGeneration: snapshot.authGeneration,
+    sub: snapshot.sub,
+    oauthClientIdFingerprint: snapshot.oauthClientIdFingerprint,
+  };
+
+  const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
+  const originalText = btn.textContent || "状態を再確認";
+  btn.disabled = true;
+  btn.textContent = "確認中…";
+
+  try {
+    const res = await invokeTauri<SpeechApiEnableStateResult>(
+      "google_stt_check_speech_api_state",
+      { projectId },
+    );
+    if (
+      !isGoogleAuthResponseCurrent(currentGoogleAuthStatus, {
+        authGeneration: res.authGeneration ?? capturedMeta.authGeneration,
+        sub: res.sub ?? capturedMeta.sub,
+        oauthClientIdFingerprint:
+          res.oauthClientIdFingerprint ?? capturedMeta.oauthClientIdFingerprint,
+      }) ||
+      currentGoogleAuthStatus?.projectId?.trim() !== projectId
+    ) {
+      return;
+    }
+
+    if (res.state === "ENABLED") {
+      hideSpeechApiPanels(item);
+      const builtinBtn = item.querySelector<HTMLElement>(".btn-google-stt-builtin-test");
+      if (builtinBtn) {
+        await runBuiltinTest(item, builtinBtn);
+      }
+    } else if (res.state === "DISABLED") {
+      showSpeechApiEnableConfirmPanel(item, projectId, capturedMeta);
+    } else {
+      showSpeechApiFallbackPanel(item, {
+        title: "Speech-to-Text API の状態を確認できませんでした",
+        reason: `Googleから返されたAPI状態が不明（${res.state || "空"}）のため、自動有効化を行いませんでした。「準備して接続テスト」を直接試すか、Google Cloud Consoleで確認してください。`,
+        projectId,
+      });
+    }
+  } catch (e) {
+    const parsed = parseGoogleApiError(e);
+    if (
+      !isGoogleAuthResponseCurrent(currentGoogleAuthStatus, {
+        authGeneration: parsed.authGeneration ?? capturedMeta.authGeneration,
+        sub: parsed.sub ?? capturedMeta.sub,
+        oauthClientIdFingerprint:
+          parsed.oauthClientIdFingerprint ?? capturedMeta.oauthClientIdFingerprint,
+      }) ||
+      currentGoogleAuthStatus?.projectId?.trim() !== projectId
+    ) {
+      return;
+    }
+    // State lookup failure must NOT claim the API is disabled: show permission/fallback info and allow direct test.
+    if (
+      parsed.kind === "service_usage_permission_denied" ||
+      parsed.kind === "service_usage_api_disabled" ||
+      parsed.kind === "oauth_admin_policy_enforced" ||
+      parsed.kind === "oauth_scope_not_granted"
+    ) {
+      showSpeechApiFallbackPanel(item, {
+        title:
+          parsed.kind === "oauth_scope_not_granted"
+            ? "OAuth認証スコープが不足しています（「準備して接続テスト」も試せます）"
+            : "API状態を確認できませんでした（「準備して接続テスト」を直接試せます）",
+        reason: parsed.message,
+        projectId,
+        requiredPermission:
+          parsed.kind === "service_usage_permission_denied"
+            ? "serviceusage.services.get"
+            : undefined,
+      });
+    } else if (resultEl) {
+      renderGoogleSttRecognitionError(resultEl, e, "同梱テスト音声");
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
 }
 
 // ---- Google STT: builtin test ----
 
-function markGoogleSttAdcVerifiedByRecognition(item: HTMLElement): void {
-  const statusEl = item.querySelector<HTMLElement>('[data-field="adc-status"]');
-  const detailEl = item.querySelector<HTMLElement>('[data-field="adc-quota"]');
-  if (statusEl) {
-    statusEl.textContent = "ADC利用可能";
-    statusEl.dataset.adcState = "available";
-  }
-  if (detailEl) {
-    detailEl.textContent = "認識テストで認証を確認しました";
-  }
-}
-
 async function runBuiltinTest(item: HTMLElement, btn: HTMLElement): Promise<void> {
-  const projectId = getGoogleSttProjectId(item);
+  const snapshot = currentGoogleAuthStatus;
+  if (!snapshot || snapshot.state !== "connected") {
+    await showAppDialog({ title: "Google未接続", message: "Googleアカウントにログインしてください。", type: "error" });
+    return;
+  }
+  const projectId = snapshot.projectId?.trim() || "";
   if (!projectId) {
-    await showAppDialog({ title: "プロジェクト未選択", message: "Google Cloud プロジェクトを選択または入力してください。", type: "error" });
+    await showAppDialog({ title: "プロジェクト未確定", message: "Google Cloud プロジェクトを選択または入力して「このProjectを使う」を押してください。", type: "error" });
     return;
   }
 
+  const capturedMeta = {
+    authGeneration: snapshot.authGeneration,
+    sub: snapshot.sub,
+    oauthClientIdFingerprint: snapshot.oauthClientIdFingerprint,
+  };
   const location = item.querySelector<HTMLSelectElement>('[data-field="location"]')?.value || "us-central1";
 
+  hideSpeechApiPanels(item);
   const originalHtml = btn.innerHTML;
-  btn.innerHTML = '<span class="material-symbols-outlined spin">mic</span> 認識しています…';
+  btn.innerHTML = '<span class="material-symbols-outlined spin">mic</span> 準備・認識テスト中…';
   (btn as HTMLButtonElement).disabled = true;
 
   const resultEl = item.querySelector<HTMLElement>('[data-field="recognize-result"]');
   if (resultEl) { resultEl.style.display = "none"; resultEl.textContent = ""; }
 
   try {
-    const result = await invokeTauri<GoogleSttRecognizeResult>(
+    const result = await invokeTauri<GoogleSttRecognizeResult & {
+      authGeneration?: number;
+      sub?: string;
+      oauthClientIdFingerprint?: string;
+    }>(
       "google_stt_run_builtin_test",
       { input: { projectId, location } },
     );
+    if (
+      !isGoogleAuthResponseCurrent(currentGoogleAuthStatus, {
+        authGeneration: result.authGeneration ?? capturedMeta.authGeneration,
+        sub: result.sub ?? capturedMeta.sub,
+        oauthClientIdFingerprint: result.oauthClientIdFingerprint ?? capturedMeta.oauthClientIdFingerprint,
+      }) ||
+      currentGoogleAuthStatus?.projectId?.trim() !== projectId
+    ) {
+      return;
+    }
+    const latest = await invokeTauri<GoogleAuthStatus>("google_auth_get_status").catch(() => null);
+    if (
+      !latest ||
+      !isGoogleAuthResponseCurrent(latest, capturedMeta) ||
+      latest.projectId?.trim() !== projectId ||
+      !isGoogleAuthResponseCurrent(currentGoogleAuthStatus, capturedMeta) ||
+      currentGoogleAuthStatus?.projectId?.trim() !== projectId
+    ) {
+      return;
+    }
     if (resultEl) {
       renderGoogleSttRecognitionSuccess(resultEl, result, {
         sourceLabel: "同梱テスト音声",
@@ -4451,13 +5996,21 @@ async function runBuiltinTest(item: HTMLElement, btn: HTMLElement): Promise<void
         model: "chirp_2",
       });
     }
-    // 成功時ステータス更新
-    setGoogleSttStatus(item, "verified", (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
-    markGoogleSttAdcVerifiedByRecognition(item);
+    applyAndSyncGoogleAuthStatus(item, latest);
   } catch (e) {
     console.error("google_stt_run_builtin_test error:", e);
-    if (resultEl) renderGoogleSttRecognitionError(resultEl, e, "同梱テスト音声");
-    // 失敗時: 必須設定があればエラー
+    const parsed = parseGoogleApiError(e);
+    if (
+      !isGoogleAuthResponseCurrent(currentGoogleAuthStatus, {
+        authGeneration: parsed.authGeneration ?? capturedMeta.authGeneration,
+        sub: parsed.sub ?? capturedMeta.sub,
+        oauthClientIdFingerprint: parsed.oauthClientIdFingerprint ?? capturedMeta.oauthClientIdFingerprint,
+      }) ||
+      currentGoogleAuthStatus?.projectId?.trim() !== projectId
+    ) {
+      return;
+    }
+    handleGoogleSpeechPreparationError(item, projectId, e, resultEl, "同梱テスト音声", capturedMeta);
     const configuredState = getGoogleSttConfiguredState(item);
     setGoogleSttStatus(item, configuredState === "configured" ? "error" : "unconfigured", (el, label) => setStatusBadge(el, label as "未設定" | "設定済み" | "接続確認済み" | "接続エラー"));
   } finally {

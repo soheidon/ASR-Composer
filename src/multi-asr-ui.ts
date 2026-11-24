@@ -945,9 +945,16 @@ export function createMultiAsrEnginesByOrder(
           const mediaFileName = mediaPath.split(/[\\/]/).pop() || mediaPath;
           if (engineId === "google_stt") {
             const options = provider?.options ?? {};
-            const projectId = options.project_id?.trim() ?? "";
-            const location = options.location?.trim() ?? "";
-            if (!projectId || !location) throw new Error("Google Speech-to-TextのプロジェクトIDとロケーションを設定してください");
+            const authStatus = await invokeFn<{
+              state: string;
+              projectId?: string;
+            }>("google_auth_get_status");
+            if (authStatus.state !== "connected") {
+              throw new Error("Googleアカウントにログインしてください");
+            }
+            const projectId = authStatus.projectId?.trim() ?? "";
+            const location = options.location?.trim() || "us-central1";
+            if (!projectId) throw new Error("Google Speech-to-TextのプロジェクトIDを設定してください");
             const langCode = language.toLowerCase().startsWith("en") ? "en-US" : language.toLowerCase().startsWith("zh") ? "cmn-Hans-CN" : "ja-JP";
             const result = await invokeFn<{
               transcript?: string;

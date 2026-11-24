@@ -189,13 +189,21 @@ export type GoogleSttConnectionState =
 export function getGoogleSttConfiguredState(
   section: Element,
 ): "unconfigured" | "configured" {
-  const projectId = getGoogleSttProjectId(section);
   const location =
     section
       .querySelector<HTMLSelectElement>('[data-field="location"]')
       ?.value
       .trim() ?? "";
 
+  if (section instanceof HTMLElement && section.dataset.googleAuthState !== undefined) {
+    if (section.dataset.googleAuthState !== "connected") {
+      return "unconfigured";
+    }
+    const confirmedProjectId = section.dataset.googleProjectId?.trim() ?? "";
+    return confirmedProjectId && location ? "configured" : "unconfigured";
+  }
+
+  const projectId = getGoogleSttProjectId(section);
   return projectId && location ? "configured" : "unconfigured";
 }
 
@@ -270,14 +278,12 @@ export function readProviderConfigFromSection(
       ? (modelManualInput?.value.trim() ?? "")
       : selectedModel;
 
-  // Google STT options
+  // Google STT options (account-independent settings only; Project ID lives in OAuth auth metadata)
   const options: Record<string, string> = {};
-  const projectId = getGoogleSttProjectId(section);
   const locationInput = section.querySelector<HTMLSelectElement>('[data-field="location"]');
   const recognizerIdInput = section.querySelector<HTMLInputElement>('[data-field="recognizer-id"]');
   const languageCodeSelect = section.querySelector<HTMLSelectElement>('[data-field="language-code"]');
 
-  if (projectId) options.project_id = projectId;
   if (locationInput) {
     const v = locationInput.value.trim();
     if (v) options.location = v;

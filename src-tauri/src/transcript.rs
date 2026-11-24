@@ -194,7 +194,7 @@ pub fn save_transcript_document_atomic(path: &Path, doc: &TranscriptDocument) ->
 }
 
 /// OSネイティブなアトミックファイル置換
-fn replace_file_atomic(src: &Path, dest: &Path) -> Result<(), String> {
+pub fn replace_file_atomic(src: &Path, dest: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;

@@ -120,6 +120,24 @@ npm run tauri dev
 npm run tauri build
 ```
 
+### Google OAuth 設定（開発・リリース共通）
+
+Google Cloud Speech-to-Text の GUI ログインを利用するビルドでは、リポジトリ直下に Git 管理対象外の `oauth-client.dev.json` を 1 つ作成してください（[oauth-client.dev.example.json](oauth-client.dev.example.json) をコピーして値を設定）。開発ビルド（debug）とリリースビルド（release）の両方がこの単一ファイルを入力として使用します。
+
+```json
+{
+  "client_id": "YOUR_DESKTOP_CLIENT_ID.apps.googleusercontent.com",
+  "client_secret": "YOUR_DESKTOP_CLIENT_SECRET",
+  "secret_mode": "required",
+  "default_project_id": "amed-512123"
+}
+```
+
+- `secret_mode` には `"required"`（Client Secret を送信する Desktop クライアント）または `"none"`（Secret を送信しない設定）を指定します。
+- `default_project_id` にはログイン後に自動接続確認する既定の Google Cloud Project ID（`amed-512123`）を指定します。
+- `oauth-client.dev.json` が未作成でも開発ビルド（debug）では他機能が動作します（Google ログイン時のみ設定不足が表示されます）。リリースビルド時は `oauth-client.dev.json` が必須ですが、生成されたインストーラーには設定 JSON ファイル自体は同梱されません。
+- 開発ビルド（`dev`）とリリースビルド（`release`）では Credential Manager および認証メタデータの保存領域が分離されており、ログイン状態・token・Project 確認状態は相互に共有されません。
+
 ### テスト
 
 ```bash

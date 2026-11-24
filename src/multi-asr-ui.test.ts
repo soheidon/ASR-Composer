@@ -83,10 +83,13 @@ describe("multi-asr-ui", () => {
       if (command === "load_api_settings") {
         return {
           providers: {
-            google_stt: { options: { project_id: "project", location: "us-central1" } },
+            google_stt: { options: { location: "us-central1" } },
             xiaomi_mimo_asr: { env_name: "XIAOMI_API_KEY", base_url: "https://api.xiaomimimo.com/v1" },
           },
         } as T;
+      }
+      if (command === "google_auth_get_status") {
+        return { state: "connected", projectId: "project" } as T;
       }
       if (command === "google_stt_recognize") return { transcript: "Google result" } as T;
       if (command === "xiaomi_mimo_asr_recognize") return { transcript: "Xiaomi result" } as T;

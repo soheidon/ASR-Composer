@@ -1,3 +1,7 @@
+pub mod google_cloud;
+pub mod google_oauth;
+#[cfg(test)]
+mod google_oauth_tests;
 pub mod transcript;
 
 use serde::{Deserialize, Serialize};
@@ -227,6 +231,44 @@ fn load_api_settings(app: tauri::AppHandle) -> AppSettings {
     load_settings(&app)
 }
 
+fn strip_google_stt_auth_and_project_options(options: &mut HashMap<String, String>) -> bool {
+    let mut changed = false;
+    for key in ["project_id", "sub", "email", "scope", "canonical_scopes"] {
+        if options.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn cleanup_legacy_google_stt_options_in_settings(app: &tauri::AppHandle) {
+    let path = settings_path(app);
+    if !path.exists() {
+        return;
+    }
+    let mut settings = load_settings(app);
+    if let Some(google) = settings.providers.get_mut("google_stt") {
+        if let Some(ref mut opts) = google.options {
+            if strip_google_stt_auth_and_project_options(opts) {
+                if let Ok(json) = serde_json::to_string_pretty(&settings) {
+                    let _ = fs::write(&path, json);
+                }
+            }
+        }
+    }
+}
+
+fn read_legacy_google_stt_project_candidate(app: &tauri::AppHandle) -> Option<String> {
+    let settings = load_settings(app);
+    settings
+        .providers
+        .get("google_stt")
+        .and_then(|p| p.options.as_ref())
+        .and_then(|o| o.get("project_id"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[tauri::command]
 fn save_provider_config(
     app: tauri::AppHandle,
@@ -234,13 +276,18 @@ fn save_provider_config(
 ) -> Result<(), String> {
     let path = settings_path(&app);
     let mut settings = load_settings(&app);
-    let options = match input.options {
+    let mut options = match input.options {
         Some(new_opts) => Some(new_opts),
         None => settings
             .providers
             .get(&input.provider_id)
             .and_then(|p| p.options.clone()),
     };
+    if input.provider_id == "google_stt" {
+        if let Some(ref mut opts) = options {
+            strip_google_stt_auth_and_project_options(opts);
+        }
+    }
     settings.providers.insert(
         input.provider_id,
         ProviderSettings {
@@ -1840,6 +1887,11 @@ fn resolve_output_dir(output_path: &str) -> Result<std::path::PathBuf, String> {
     }
 }
 
+#[tauri::command]
+fn resolve_output_directory(output_path: String) -> Result<String, String> {
+    resolve_output_dir(output_path.trim()).map(|p| p.to_string_lossy().to_string())
+}
+
 /// エンジンのLocalAsrEngineStatusから文字起こし実行可能性を判定する純粋関数（テスト可能）。
 fn validate_engine_status_for_transcribe(status: &LocalAsrEngineStatus) -> Result<(), String> {
     if !status.docker_available {
@@ -2419,6 +2471,67 @@ async fn cancel_transcription(
 #[tauri::command]
 fn save_text_file(path: String, content: String) -> Result<(), String> {
     fs::write(&path, content).map_err(|e| format!("ファイル保存エラー: {e}"))
+}
+
+#[tauri::command]
+fn remove_output_file(path: String) -> Result<(), String> {
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("出力ファイル削除エラー: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedOutputFileInput {
+    temp_path: String,
+    final_path: String,
+}
+
+#[tauri::command]
+fn commit_staged_output_files(files: Vec<StagedOutputFileInput>) -> Result<(), String> {
+    let file_name = |p: &str| -> String {
+        std::path::Path::new(p)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(p)
+            .to_string()
+    };
+    for (idx, item) in files.iter().enumerate() {
+        let src = std::path::Path::new(&item.temp_path);
+        let dest = std::path::Path::new(&item.final_path);
+        if let Err(e) = transcript::replace_file_atomic(src, dest) {
+            for rem in &files[idx..] {
+                let _ = fs::remove_file(&rem.temp_path);
+            }
+            let failed_name = file_name(&item.final_path);
+            if idx == 0 {
+                return Err(format!(
+                    "出力ファイルの確定に失敗しました（既存ファイルは変更されていません）: {failed_name} ({e})"
+                ));
+            }
+            let committed_list = files[..idx]
+                .iter()
+                .map(|f| file_name(&f.final_path))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let remaining_list = files[idx + 1..]
+                .iter()
+                .map(|f| file_name(&f.final_path))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let remaining_part = if remaining_list.is_empty() {
+                String::new()
+            } else {
+                format!(" / 未確定: {remaining_list}")
+            };
+            return Err(format!(
+                "一部の出力ファイルの確定に失敗しました（確定済み: {committed_list} / 失敗: {failed_name}{remaining_part}）: {e}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3261,33 +3374,15 @@ const GOOGLE_STT_ALLOWED_LOCATIONS: &[&str] = &[
 
 const GOOGLE_STT_MAX_FILE_SIZE: u64 = 7 * 1024 * 1024; // 7MB (base64膨張を考慮)
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum GoogleSttErrorKind {
-    GcloudNotFound,
-    AdcUnavailable,
-    InvalidConfig,
-    AudioFileError,
-    AuthenticationError,
-    PermissionError,
-    BillingOrApiDisabled,
-    HttpError,
-    InvalidResponse,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GoogleSttAdcStatus {
-    pub available: bool,
-    pub quota_project: Option<String>,
-    pub current_project: Option<String>,
-    pub error: Option<String>,
-    pub error_kind: Option<GoogleSttErrorKind>,
+pub struct GoogleAuthState {
+    pub manager: std::sync::Arc<google_oauth::GoogleAuthManager<google_oauth::ReqwestGoogleHttpTransport>>,
+    pub transport: std::sync::Arc<google_oauth::ReqwestGoogleHttpTransport>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoogleSttRecognizeInput {
+    #[serde(default)]
     pub project_id: String,
     pub location: String,
     pub recognizer_id: String,
@@ -3296,50 +3391,10 @@ pub struct GoogleSttRecognizeInput {
     pub audio_path: String,
 }
 
-#[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct GoogleSttRecognizeSegment {
-    pub transcript: String,
-    pub start_offset: Option<String>,
-    pub end_offset: Option<String>,
-    pub words: Vec<GoogleSttWordInfo>,
-    pub confidence: Option<f64>,
-    pub language_code: Option<String>,
-}
-
-#[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct GoogleSttWordInfo {
-    pub word: String,
-    pub start_offset: Option<String>,
-    pub end_offset: Option<String>,
-}
-
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct GoogleSttRecognizeResult {
-    pub transcript: String,
-    pub segments: Vec<GoogleSttRecognizeSegment>,
-    pub raw_response: serde_json::Value,
-}
-
-#[derive(Serialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct GoogleSttProject {
-    pub project_id: String,
-    pub name: String,
-}
-
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct GoogleSttListProjectsResult {
-    pub projects: Vec<GoogleSttProject>,
-    pub current_project: Option<String>,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoogleSttBuiltinTestInput {
+    #[serde(default)]
     pub project_id: String,
     pub location: String,
 }
@@ -3358,215 +3413,190 @@ fn google_stt_builtin_recognition_config() -> GoogleSttBuiltinRecognitionConfig 
     }
 }
 
-fn find_gcloud_executable() -> Option<std::path::PathBuf> {
-    // 1. PATH上の gcloud.cmd / gcloud を where で検索
-    for name in &["gcloud.cmd", "gcloud"] {
-        if let Ok(output) = std::process::Command::new("cmd.exe")
-            .args(["/C", "where", name])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-        {
-            if output.status.success() {
-                let path_str = String::from_utf8_lossy(&output.stdout);
-                let first_line = path_str.lines().next().unwrap_or("").trim();
-                if !first_line.is_empty() {
-                    return Some(std::path::PathBuf::from(first_line));
-                }
-            }
-        }
-    }
-    // 2. 候補ディレクトリを順に探索
-    let candidates: Vec<String> = [
-        "LOCALAPPDATA",
-        "PROGRAMFILES",
-        "PROGRAMFILES(X86)",
-    ]
-    .iter()
-    .filter_map(|var| std::env::var(var).ok())
-    .collect();
-
-    for base in &candidates {
-        let candidate = std::path::PathBuf::from(base)
-            .join("Google")
-            .join("Cloud SDK")
-            .join("google-cloud-sdk")
-            .join("bin")
-            .join("gcloud.cmd");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn get_adc_quota_project() -> Option<String> {
-    let app_data = std::env::var("APPDATA").ok()?;
-    let adc_path = std::path::PathBuf::from(app_data)
-        .join("gcloud")
-        .join("application_default_credentials.json");
-    let content = fs::read_to_string(adc_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json.get("quota_project_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-fn get_adc_current_project(gcloud: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new("cmd.exe")
-        .args(["/C", &gcloud.to_string_lossy(), "config", "get-value", "project"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let project = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if project.is_empty() || project == "(unset)" {
-        None
-    } else {
-        Some(project)
-    }
-}
-
-fn parse_google_stt_projects(json_str: &str) -> Result<Vec<GoogleSttProject>, FetchModelsError> {
-    let json: serde_json::Value = serde_json::from_str(json_str).map_err(|e| FetchModelsError {
-        kind: FetchErrorKind::ConnectionError,
-        message: format!("プロジェクト一覧のJSON解析に失敗しました: {}", e),
-    })?;
-
-    let arr = match json.as_array() {
-        Some(a) => a,
-        None => return Ok(Vec::new()),
-    };
-
-    let mut seen = std::collections::HashSet::new();
-    let mut projects: Vec<GoogleSttProject> = Vec::new();
-
-    for item in arr {
-        let project_id = match item.get("projectId").and_then(|v| v.as_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
-        if !seen.insert(project_id.clone()) {
-            continue;
-        }
-        let name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&project_id)
-            .to_string();
-        projects.push(GoogleSttProject { project_id, name });
-    }
-
-    projects.sort_by(|a, b| a.project_id.cmp(&b.project_id));
-    Ok(projects)
+#[tauri::command]
+async fn google_auth_get_status(
+    state: tauri::State<'_, GoogleAuthState>,
+) -> Result<google_oauth::GoogleAuthStatus, google_oauth::GoogleApiError> {
+    Ok(state.manager.get_status().await)
 }
 
 #[tauri::command]
-async fn google_stt_check_adc() -> GoogleSttAdcStatus {
-    let gcloud = match find_gcloud_executable() {
-        Some(path) => path,
-        None => {
-            return GoogleSttAdcStatus {
-                available: false,
-                quota_project: None,
-                current_project: None,
-                error: Some("Google Cloud CLIが見つかりません。gcloud CLIをインストールしてください。".to_string()),
-                error_kind: Some(GoogleSttErrorKind::GcloudNotFound),
-            };
-        }
-    };
-
-    let output = std::process::Command::new("cmd.exe")
-        .args(["/C", &gcloud.to_string_lossy(), "auth", "application-default", "print-access-token"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => GoogleSttAdcStatus {
-            available: true,
-            quota_project: get_adc_quota_project(),
-            current_project: get_adc_current_project(&gcloud),
-            error: None,
-            error_kind: None,
-        },
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let (kind, msg) = if stderr.contains("Could not find") || stderr.contains("no credentials") {
-                (
-                    GoogleSttErrorKind::AdcUnavailable,
-                    "ADCが未作成です。`gcloud auth application-default login` を実行してください。".to_string(),
-                )
-            } else {
-                (
-                    GoogleSttErrorKind::AdcUnavailable,
-                    format!("ADCトークン取得に失敗しました: {}", stderr.trim()),
-                )
-            };
-            GoogleSttAdcStatus {
-                available: false,
-                quota_project: get_adc_quota_project(),
-                current_project: None,
-                error: Some(msg),
-                error_kind: Some(kind),
-            }
-        }
-        Err(e) => GoogleSttAdcStatus {
-            available: false,
-            quota_project: None,
-            current_project: None,
-            error: Some(format!("gcloud実行に失敗しました: {}", e)),
-            error_kind: Some(GoogleSttErrorKind::GcloudNotFound),
-        },
-    }
+async fn google_auth_login(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, GoogleAuthState>,
+    force_consent: Option<bool>,
+) -> Result<google_oauth::GoogleAuthStatus, google_oauth::GoogleApiError> {
+    let app_handle = app.clone();
+    state
+        .manager
+        .start_login_flow_with_options(force_consent.unwrap_or(false), move |url| {
+            app_handle
+                .opener()
+                .open_url(url, None::<&str>)
+                .map_err(|e| e.to_string())
+        })
+        .await
 }
 
 #[tauri::command]
-async fn google_stt_list_projects() -> Result<GoogleSttListProjectsResult, FetchModelsError> {
-    let gcloud = find_gcloud_executable().ok_or_else(|| FetchModelsError {
-        kind: FetchErrorKind::NotConfigured,
-        message: "Google Cloud CLIが見つかりません。gcloud CLIをインストールしてください。".to_string(),
-    })?;
-
-    let current_project = get_adc_current_project(&gcloud);
-
-    let output = std::process::Command::new("cmd.exe")
-        .args([
-            "/C",
-            &gcloud.to_string_lossy(),
-            "projects",
-            "list",
-            "--filter=lifecycleState:ACTIVE",
-            "--format=json(projectId,name)",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| FetchModelsError {
-            kind: FetchErrorKind::ConnectionError,
-            message: format!("gcloud projects list の実行に失敗しました: {}", e),
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(FetchModelsError {
-            kind: FetchErrorKind::ConnectionError,
-            message: format!("プロジェクト一覧の取得に失敗しました: {}", stderr.trim()),
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let projects = parse_google_stt_projects(&stdout)?;
-
-    Ok(GoogleSttListProjectsResult {
-        projects,
-        current_project,
-    })
+async fn google_auth_switch_account(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, GoogleAuthState>,
+    force_consent: Option<bool>,
+) -> Result<google_oauth::GoogleAuthStatus, google_oauth::GoogleApiError> {
+    let app_handle = app.clone();
+    state
+        .manager
+        .start_login_flow_with_options(force_consent.unwrap_or(false), move |url| {
+            app_handle
+                .opener()
+                .open_url(url, None::<&str>)
+                .map_err(|e| e.to_string())
+        })
+        .await
 }
 
+#[tauri::command]
+async fn google_auth_cancel_login(
+    state: tauri::State<'_, GoogleAuthState>,
+) -> Result<bool, google_oauth::GoogleApiError> {
+    Ok(state.manager.cancel_in_flight_login().await)
+}
+
+#[tauri::command]
+async fn google_auth_logout(
+    state: tauri::State<'_, GoogleAuthState>,
+) -> Result<google_oauth::GoogleAuthStatus, google_oauth::GoogleApiError> {
+    state.manager.logout().await
+}
+
+#[tauri::command]
+async fn google_auth_revoke(
+    state: tauri::State<'_, GoogleAuthState>,
+) -> Result<google_oauth::GoogleAuthRevokeResult, google_oauth::GoogleApiError> {
+    state.manager.revoke().await
+}
+
+#[tauri::command]
+async fn google_auth_confirm_project(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, GoogleAuthState>,
+    project_id: String,
+    auth_generation: u64,
+    sub: String,
+    oauth_client_id_fingerprint: String,
+    auth_session_id: String,
+) -> Result<google_oauth::GoogleAuthStatus, google_oauth::GoogleApiError> {
+    let status = state.manager.confirm_project_guarded(&project_id, auth_generation, &sub, &oauth_client_id_fingerprint, &auth_session_id).await?;
+    cleanup_legacy_google_stt_options_in_settings(&app);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn google_auth_complete_onboarding(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, GoogleAuthState>,
+    input: Option<google_cloud::CompleteOnboardingRequest>,
+) -> Result<google_cloud::GoogleOnboardingResult, google_oauth::GoogleApiError> {
+    let req = input.unwrap_or_default();
+    let audio_path = resolve_google_stt_builtin_audio(&app).map_err(|e| {
+        google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            e.message,
+        )
+    })?;
+    let metadata = std::fs::metadata(&audio_path).map_err(|e| {
+        google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            format!("同梱テスト音声の読み込みに失敗しました: {}", e),
+        )
+    })?;
+    if metadata.len() > GOOGLE_STT_MAX_FILE_SIZE {
+        return Err(google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            "同梱テスト音声サイズが上限を超えています。",
+        ));
+    }
+    let audio_bytes = std::fs::read(&audio_path).map_err(|e| {
+        google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            format!("同梱テスト音声の読み込みに失敗しました: {}", e),
+        )
+    })?;
+
+    use base64::Engine;
+    let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
+    let config = google_stt_builtin_recognition_config();
+    let location = "us-central1";
+    let base_url = build_google_stt_base_url(location).map_err(|e| {
+        google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            e.message,
+        )
+    })?;
+    let body = build_google_stt_request_body(&audio_base64, config.model, config.language_code);
+    let recognizer_id = config.recognizer_id;
+
+    let result = google_cloud::complete_onboarding_with_auth(
+        &state.manager,
+        state.transport.as_ref(),
+        req,
+        |project_id| {
+            build_google_stt_recognize_url(&base_url, project_id, location, recognizer_id)
+        },
+        &body,
+        parse_google_stt_response,
+        None,
+        std::time::Duration::from_secs(2),
+        15,
+    )
+    .await?;
+    if result.outcome == google_cloud::GoogleOnboardingOutcome::Ready {
+        cleanup_legacy_google_stt_options_in_settings(&app);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn google_stt_list_projects(
+    state: tauri::State<'_, GoogleAuthState>,
+) -> Result<google_cloud::GoogleCloudListProjectsResult, google_oauth::GoogleApiError> {
+    google_cloud::list_projects_with_auth(&state.manager, state.transport.as_ref(), None).await
+}
+
+#[tauri::command]
+async fn google_stt_check_speech_api_state(
+    state: tauri::State<'_, GoogleAuthState>,
+    project_id: Option<String>,
+) -> Result<google_cloud::SpeechApiEnableStateResult, google_oauth::GoogleApiError> {
+    google_cloud::check_speech_api_state_with_auth(
+        &state.manager,
+        state.transport.as_ref(),
+        project_id.as_deref(),
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn google_stt_enable_speech_api(
+    state: tauri::State<'_, GoogleAuthState>,
+    project_id: Option<String>,
+    confirmed: bool,
+) -> Result<google_cloud::EnableSpeechApiResult, google_oauth::GoogleApiError> {
+    google_cloud::enable_speech_api_with_auth(
+        &state.manager,
+        state.transport.as_ref(),
+        project_id.as_deref(),
+        confirmed,
+        None,
+        std::time::Duration::from_secs(2),
+        15,
+    )
+    .await
+}
+
+#[cfg(test)]
 fn validate_google_stt_input(input: &GoogleSttRecognizeInput) -> Result<(), FetchModelsError> {
     // project_id: 6-30文字, 小文字英数字ハイフン, 英字始まり, ハイフンで終わらない
     let pid = input.project_id.trim();
@@ -3684,10 +3714,10 @@ fn build_google_stt_request_body(
     })
 }
 
-fn parse_google_stt_response(json: &serde_json::Value) -> Result<GoogleSttRecognizeResult, FetchModelsError> {
-    let results = json
-        .get("results")
-        .and_then(|v| v.as_array());
+fn parse_google_stt_response(
+    json: &serde_json::Value,
+) -> Result<google_cloud::GoogleSpeechRecognizeResult, google_oauth::GoogleApiError> {
+    let results = json.get("results").and_then(|v| v.as_array());
 
     let mut segments = Vec::new();
     let mut full_transcript = String::new();
@@ -3714,14 +3744,14 @@ fn parse_google_stt_response(json: &serde_json::Value) -> Result<GoogleSttRecogn
                 .get("languageCode")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let words: Vec<GoogleSttWordInfo> = alt
+            let words: Vec<google_cloud::GoogleSpeechWordInfo> = alt
                 .get("words")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|word| {
                             let text = word.get("word").and_then(|v| v.as_str())?;
-                            Some(GoogleSttWordInfo {
+                            Some(google_cloud::GoogleSpeechWordInfo {
                                 word: text.to_string(),
                                 start_offset: word
                                     .get("startOffset")
@@ -3748,7 +3778,7 @@ fn parse_google_stt_response(json: &serde_json::Value) -> Result<GoogleSttRecogn
                 full_transcript.push_str(&transcript);
             }
 
-            segments.push(GoogleSttRecognizeSegment {
+            segments.push(google_cloud::GoogleSpeechSegment {
                 transcript,
                 start_offset,
                 end_offset,
@@ -3759,161 +3789,140 @@ fn parse_google_stt_response(json: &serde_json::Value) -> Result<GoogleSttRecogn
         }
     }
 
-    Ok(GoogleSttRecognizeResult {
+    Ok(google_cloud::GoogleSpeechRecognizeResult {
         transcript: full_transcript,
         segments,
         raw_response: json.clone(),
+        auth_generation: None,
+        sub: None,
+        oauth_client_id_fingerprint: None,
     })
-}
-
-fn get_adc_access_token() -> Result<String, FetchModelsError> {
-    let gcloud = find_gcloud_executable().ok_or_else(|| FetchModelsError {
-        kind: FetchErrorKind::NotConfigured,
-        message: "Google Cloud CLIが見つかりません。gcloud CLIをインストールしてください。".to_string(),
-    })?;
-
-    let output = std::process::Command::new("cmd.exe")
-        .args(["/C", &gcloud.to_string_lossy(), "auth", "application-default", "print-access-token"])
-        .output()
-        .map_err(|e| FetchModelsError {
-            kind: FetchErrorKind::ConnectionError,
-            message: format!("gcloud実行に失敗しました: {}", e),
-        })?;
-
-    if !output.status.success() {
-        let _stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(FetchModelsError {
-            kind: FetchErrorKind::AuthError,
-            message: "ADCトークン取得に失敗しました。`gcloud auth application-default login` を実行してください。".to_string(),
-        });
-    }
-
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() || !token.starts_with("ya29.") {
-        return Err(FetchModelsError {
-            kind: FetchErrorKind::AuthError,
-            message: "ADCから有効なトークンを取得できませんでした。".to_string(),
-        });
-    }
-
-    Ok(token)
 }
 
 #[tauri::command]
 async fn google_stt_recognize(
+    state: tauri::State<'_, GoogleAuthState>,
     input: GoogleSttRecognizeInput,
-) -> Result<GoogleSttRecognizeResult, FetchModelsError> {
-    validate_google_stt_input(&input)?;
-    recognize_google_stt_audio(
-        &input.project_id,
+) -> Result<google_cloud::GoogleSpeechRecognizeResult, google_oauth::GoogleApiError> {
+    if !GOOGLE_STT_ALLOWED_LOCATIONS.contains(&input.location.as_str()) {
+        return Err(google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            format!(
+                "サポートされていないリージョンです: {}。使用可能: {}",
+                input.location,
+                GOOGLE_STT_ALLOWED_LOCATIONS.join(", ")
+            ),
+        ));
+    }
+    if input.recognizer_id.trim().is_empty() {
+        return Err(google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            "Recognizer IDを入力してください",
+        ));
+    }
+    if input.model.trim().is_empty() {
+        return Err(google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            "モデル名を入力してください",
+        ));
+    }
+    if input.language_code.trim().is_empty() {
+        return Err(google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            "言語コードを入力してください",
+        ));
+    }
+
+    let expected_pid = if input.project_id.trim().is_empty() {
+        None
+    } else {
+        Some(input.project_id.trim())
+    };
+    recognize_google_stt_audio_with_auth(
+        &state.manager,
+        state.transport.as_ref(),
+        expected_pid,
         &input.location,
         &input.recognizer_id,
         &input.language_code,
         &input.model,
         std::path::Path::new(&input.audio_path),
+        None,
+        false,
     )
     .await
 }
 
-async fn recognize_google_stt_audio(
-    project_id: &str,
+async fn recognize_google_stt_audio_with_auth<T: google_oauth::GoogleHttpTransport>(
+    auth: &google_oauth::GoogleAuthManager<T>,
+    transport: &T,
+    expected_project_id: Option<&str>,
     location: &str,
     recognizer_id: &str,
     language_code: &str,
     model: &str,
     audio_path: &std::path::Path,
-) -> Result<GoogleSttRecognizeResult, FetchModelsError> {
-    // ファイル存在確認
+    base_url_override: Option<&str>,
+    mark_verified_on_success: bool,
+) -> Result<google_cloud::GoogleSpeechRecognizeResult, google_oauth::GoogleApiError> {
     if !audio_path.exists() {
-        return Err(FetchModelsError {
-            kind: FetchErrorKind::NotConfigured,
-            message: "音声ファイルが見つかりません".to_string(),
-        });
+        return Err(google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            "音声ファイルが見つかりません",
+        ));
     }
 
-    // ファイルサイズ確認
-    let metadata = fs::metadata(audio_path).map_err(|e| FetchModelsError {
-        kind: FetchErrorKind::ConnectionError,
-        message: format!("ファイル情報の取得に失敗しました: {}", e),
+    let metadata = fs::metadata(audio_path).map_err(|e| {
+        google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            format!("ファイル情報の取得に失敗しました: {}", e),
+        )
     })?;
     if metadata.len() > GOOGLE_STT_MAX_FILE_SIZE {
-        return Err(FetchModelsError {
-            kind: FetchErrorKind::NotConfigured,
-            message: format!(
+        return Err(google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            format!(
                 "ファイルサイズが大きすぎます（{}MB）。上限は7MBです。",
                 metadata.len() / 1024 / 1024
             ),
-        });
+        ));
     }
 
-    // 音声読み込み + base64
-    let audio_bytes = fs::read(audio_path).map_err(|e| FetchModelsError {
-        kind: FetchErrorKind::ConnectionError,
-        message: format!("音声ファイルの読み込みに失敗しました: {}", e),
+    let audio_bytes = fs::read(audio_path).map_err(|e| {
+        google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            format!("音声ファイルの読み込みに失敗しました: {}", e),
+        )
     })?;
     use base64::Engine;
     let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
 
-    // ADCトークン取得
-    let access_token = get_adc_access_token()?;
-
-    // URL構築
-    let base_url = build_google_stt_base_url(location)?;
-    let url = build_google_stt_recognize_url(&base_url, project_id, location, recognizer_id);
-
-    // リクエスト構築
+    let base_url = match base_url_override {
+        Some(u) => u.to_string(),
+        None => build_google_stt_base_url(location).map_err(|e| {
+            google_oauth::GoogleApiError::new(
+                google_oauth::GoogleApiErrorKind::InvalidConfig,
+                e.message,
+            )
+        })?,
+    };
     let body = build_google_stt_request_body(&audio_base64, model, language_code);
 
-    // HTTPリクエスト
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .bearer_auth(&access_token)
-        .header("x-goog-user-project", project_id)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| FetchModelsError {
-            kind: FetchErrorKind::ConnectionError,
-            message: format!("リクエスト送信に失敗しました: {}", e),
-        })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        let kind = if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
-            if body_text.contains("PERMISSION_DENIED") || body_text.contains("speech.recognizers") {
-                FetchErrorKind::AuthError
-            } else if body_text.contains("billing") || body_text.contains("SERVICE_DISABLED") {
-                FetchErrorKind::ConnectionError
-            } else {
-                FetchErrorKind::AuthError
-            }
-        } else if status == reqwest::StatusCode::NOT_FOUND {
-            FetchErrorKind::NotConfigured
-        } else {
-            FetchErrorKind::ConnectionError
-        };
-        return Err(FetchModelsError {
-            kind,
-            message: format!("Speech-to-Text APIエラー ({}): {}", status, body_text),
-        });
-    }
-
-    let json: serde_json::Value = resp.json().await.map_err(|e| FetchModelsError {
-        kind: FetchErrorKind::ConnectionError,
-        message: format!("レスポンス解析に失敗しました: {}", e),
-    })?;
-
-    parse_google_stt_response(&json)
+    google_cloud::execute_speech_v2_recognize_with_snapshot(
+        auth,
+        transport,
+        expected_project_id,
+        |project_id| build_google_stt_recognize_url(&base_url, project_id, location, recognizer_id),
+        &body,
+        parse_google_stt_response,
+        mark_verified_on_success,
+    )
+    .await
 }
 
 fn resolve_google_stt_builtin_audio(
     app: &tauri::AppHandle,
-) -> Result<std::path::PathBuf, FetchModelsError> {
+) -> Result<std::path::PathBuf, google_oauth::GoogleApiError> {
     use tauri::Manager;
     let resource_path = app
         .path()
@@ -3921,11 +3930,18 @@ fn resolve_google_stt_builtin_audio(
             "resources/google-stt-test-ja.wav",
             tauri::path::BaseDirectory::Resource,
         )
-        .map_err(|_e| FetchModelsError {
-            kind: FetchErrorKind::NotConfigured,
-            message: "同梱テスト音声のパス解決に失敗しました".to_string(),
+        .map_err(|_e| {
+            google_oauth::GoogleApiError::new(
+                google_oauth::GoogleApiErrorKind::InvalidConfig,
+                "同梱テスト音声のパス解決に失敗しました",
+            )
         })?;
-    validate_google_stt_builtin_audio_path(resource_path)
+    validate_google_stt_builtin_audio_path(resource_path).map_err(|e| {
+        google_oauth::GoogleApiError::new(
+            google_oauth::GoogleApiErrorKind::InvalidConfig,
+            e.message,
+        )
+    })
 }
 
 fn validate_google_stt_builtin_audio_path(
@@ -3943,17 +3959,27 @@ fn validate_google_stt_builtin_audio_path(
 #[tauri::command]
 async fn google_stt_run_builtin_test(
     app: tauri::AppHandle,
+    state: tauri::State<'_, GoogleAuthState>,
     input: GoogleSttBuiltinTestInput,
-) -> Result<GoogleSttRecognizeResult, FetchModelsError> {
+) -> Result<google_cloud::GoogleSpeechRecognizeResult, google_oauth::GoogleApiError> {
     let audio_path = resolve_google_stt_builtin_audio(&app)?;
     let config = google_stt_builtin_recognition_config();
-    recognize_google_stt_audio(
-        &input.project_id,
+    let expected_pid = if input.project_id.trim().is_empty() {
+        None
+    } else {
+        Some(input.project_id.trim())
+    };
+    recognize_google_stt_audio_with_auth(
+        &state.manager,
+        state.transport.as_ref(),
+        expected_pid,
         &input.location,
         config.recognizer_id,
         config.language_code,
         config.model,
         &audio_path,
+        None,
+        true,
     )
     .await
 }
@@ -5949,9 +5975,42 @@ async fn local_asr_uninstall(
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("failed to resolve app data dir");
+            let config = google_oauth::GoogleOAuthConfig::from_env();
+            let transport = std::sync::Arc::new(google_oauth::ReqwestGoogleHttpTransport::new());
+            #[cfg(windows)]
+            let cred_store: std::sync::Arc<dyn google_oauth::CredentialStore> =
+                std::sync::Arc::new(google_oauth::WindowsCredentialStore);
+            #[cfg(not(windows))]
+            let cred_store: std::sync::Arc<dyn google_oauth::CredentialStore> =
+                std::sync::Arc::new(google_oauth::InMemoryCredentialStore::new());
+
+            let legacy_candidate = read_legacy_google_stt_project_candidate(app.handle());
+            let manager = std::sync::Arc::new(google_oauth::GoogleAuthManager::new(
+                config,
+                &app_data_dir,
+                cred_store,
+                transport.clone(),
+                legacy_candidate,
+            ));
+
+            // Crash recovery: if auth metadata already has a committed project_id,
+            // clean up any leftover legacy project_id/identity fields from settings.json.
+            let has_committed = tauri::async_runtime::block_on(manager.has_committed_project_id());
+            if has_committed {
+                cleanup_legacy_google_stt_options_in_settings(app.handle());
+            }
+
+            app.manage(GoogleAuthState { manager, transport });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             load_api_settings,
             save_provider_config,
@@ -5965,10 +6024,19 @@ pub fn run() {
             call_ollama_chat,
             test_llm_connection,
             get_env_var,
-            google_stt_check_adc,
+            google_auth_get_status,
+            google_auth_login,
+            google_auth_switch_account,
+            google_auth_cancel_login,
+            google_auth_logout,
+            google_auth_revoke,
+            google_auth_confirm_project,
+            google_auth_complete_onboarding,
             google_stt_list_projects,
             google_stt_recognize,
             google_stt_run_builtin_test,
+            google_stt_check_speech_api_state,
+            google_stt_enable_speech_api,
             xiaomi_mimo_asr_recognize,
             xiaomi_mimo_asr_run_builtin_test,
             docker_check_status,
@@ -5983,7 +6051,10 @@ pub fn run() {
             local_asr_uninstall,
             local_asr_transcribe,
             cancel_transcription,
+            resolve_output_directory,
             save_text_file,
+            remove_output_file,
+            commit_staged_output_files,
             save_transcript_document,
             load_transcript_document,
             get_correction_context_paths,
@@ -5991,8 +6062,19 @@ pub fn run() {
             open_correction_file,
             read_correction_context_files
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(auth_state) = app_handle.try_state::<GoogleAuthState>() {
+                let manager = auth_state.manager.clone();
+                tauri::async_runtime::block_on(async move {
+                    let _ = manager.cancel_in_flight_login().await;
+                });
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -7359,209 +7441,7 @@ mod tests {
 
     // ---- find_gcloud_executable (実環境テスト) ----
 
-    #[test]
-    #[ignore] // CI環境ではgcloudが入っていないため
-    fn test_find_gcloud_executable_on_this_machine() {
-        let result = find_gcloud_executable();
-        assert!(result.is_some(), "gcloud should be found on this machine");
-        let path = result.unwrap();
-        eprintln!("gcloud found at: {}", path.display());
-    }
-
-    #[test]
-    #[ignore]
-    fn test_get_adc_current_project_returns_value() {
-        let gcloud = find_gcloud_executable().expect("gcloud not found");
-        let project = get_adc_current_project(&gcloud);
-        assert!(project.is_some(), "current project should be set");
-        eprintln!("current project: {}", project.unwrap());
-    }
-
-    #[test]
-    #[ignore]
-    fn test_adc_check_components() {
-        // find gcloud
-        let gcloud = find_gcloud_executable();
-        assert!(gcloud.is_some(), "gcloud not found");
-        let gcloud = gcloud.unwrap();
-        eprintln!("gcloud: {}", gcloud.display());
-
-        // quota project from ADC JSON
-        let quota = get_adc_quota_project();
-        eprintln!("quota_project: {:?}", quota);
-
-        // current project from gcloud config
-        let current = get_adc_current_project(&gcloud);
-        eprintln!("current_project: {:?}", current);
-        assert!(current.is_some(), "current project should be set");
-    }
-
-    #[test]
-    #[ignore]
-    fn test_get_adc_access_token_returns_ya29() {
-        let result = get_adc_access_token();
-        assert!(result.is_ok(), "ADC token should be available: {:?}", result.err());
-        let token = result.unwrap();
-        assert!(token.starts_with("ya29."), "token should start with ya29.");
-        eprintln!("token length: {} (not printing value)", token.len());
-    }
-
-    #[test]
-    #[ignore]
-    fn test_google_stt_recognize_with_speech() {
-        let test_wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("test-speech-jp.wav");
-        assert!(test_wav.exists(), "test-speech-jp.wav not found at {}", test_wav.display());
-
-        let input = GoogleSttRecognizeInput {
-            project_id: "asr-composer-sohei".to_string(),
-            location: "us-central1".to_string(),
-            recognizer_id: "_".to_string(),
-            model: "chirp_2".to_string(),
-            language_code: "ja-JP".to_string(),
-            audio_path: test_wav.to_string_lossy().to_string(),
-        };
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async { google_stt_recognize(input).await });
-
-        match &result {
-            Ok(r) => {
-                eprintln!("=== 発話音声テスト ===");
-                eprintln!("transcript: '{}'", r.transcript);
-                eprintln!("segments: {}", r.segments.len());
-                for (i, seg) in r.segments.iter().enumerate() {
-                    eprintln!("  [{}] '{}' confidence={:?} lang={:?}",
-                        i, seg.transcript, seg.confidence, seg.language_code);
-                }
-                assert!(!r.transcript.is_empty(), "transcript should not be empty for speech audio");
-            }
-            Err(e) => {
-                let msg = &e.message;
-                assert!(!msg.contains("ya29."), "error must not contain access token");
-                eprintln!("error_kind: {:?}", e.kind);
-                eprintln!("error_message: {}", msg);
-                panic!("speech recognition should succeed: {}", msg);
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_google_stt_recognize_with_silence() {
-        let test_wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("test-audio.wav");
-        assert!(test_wav.exists(), "test-audio.wav not found at {}", test_wav.display());
-
-        let input = GoogleSttRecognizeInput {
-            project_id: "asr-composer-sohei".to_string(),
-            location: "us-central1".to_string(),
-            recognizer_id: "_".to_string(),
-            model: "chirp_2".to_string(),
-            language_code: "ja-JP".to_string(),
-            audio_path: test_wav.to_string_lossy().to_string(),
-        };
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async { google_stt_recognize(input).await });
-
-        match &result {
-            Ok(r) => {
-                eprintln!("=== 無音テスト ===");
-                eprintln!("transcript: '{}'", r.transcript);
-                eprintln!("segments: {}", r.segments.len());
-                for (i, seg) in r.segments.iter().enumerate() {
-                    eprintln!("  [{}] '{}' confidence={:?} lang={:?}",
-                        i, seg.transcript, seg.confidence, seg.language_code);
-                }
-                // 無音でもAPIエラーにならないことを確認
-            }
-            Err(e) => {
-                let msg = &e.message;
-                assert!(!msg.contains("ya29."), "error must not contain access token");
-                eprintln!("error_kind: {:?}", e.kind);
-                eprintln!("error_message: {}", msg);
-                // 無音でエラーになることもあるが、gcloud/ADCレベルの失敗でないこと
-                assert!(
-                    !msg.contains("gcloud") && !msg.contains("ADC"),
-                    "should not fail at gcloud/ADC level"
-                );
-            }
-        }
-    }
-
-    // ---- parse_google_stt_projects ----
-
-    #[test]
-    fn test_parse_google_stt_projects_normal() {
-        let json = r#"[
-            {"projectId": "beta-project", "name": "Beta"},
-            {"projectId": "alpha-project", "name": "Alpha"}
-        ]"#;
-        let projects = parse_google_stt_projects(json).unwrap();
-        assert_eq!(projects.len(), 2);
-        assert_eq!(projects[0].project_id, "alpha-project");
-        assert_eq!(projects[0].name, "Alpha");
-        assert_eq!(projects[1].project_id, "beta-project");
-        assert_eq!(projects[1].name, "Beta");
-    }
-
-    #[test]
-    fn test_parse_google_stt_projects_empty_array() {
-        let projects = parse_google_stt_projects("[]").unwrap();
-        assert!(projects.is_empty());
-    }
-
-    #[test]
-    fn test_parse_google_stt_projects_invalid_json() {
-        let result = parse_google_stt_projects("not json");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_google_stt_projects_skips_missing_project_id() {
-        let json = r#"[
-            {"projectId": "valid-project", "name": "Valid"},
-            {"name": "No ID"}
-        ]"#;
-        let projects = parse_google_stt_projects(json).unwrap();
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].project_id, "valid-project");
-    }
-
-    #[test]
-    fn test_parse_google_stt_projects_name_fallback_to_project_id() {
-        let json = r#"[{"projectId": "my-proj"}]"#;
-        let projects = parse_google_stt_projects(json).unwrap();
-        assert_eq!(projects[0].name, "my-proj");
-    }
-
-    #[test]
-    fn test_parse_google_stt_projects_dedup_by_project_id() {
-        let json = r#"[
-            {"projectId": "dup-proj", "name": "First"},
-            {"projectId": "dup-proj", "name": "Second"}
-        ]"#;
-        let projects = parse_google_stt_projects(json).unwrap();
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].name, "First");
-    }
-
-    #[test]
-    fn test_parse_google_stt_projects_sorted_by_project_id() {
-        let json = r#"[
-            {"projectId": "z-project", "name": "Z"},
-            {"projectId": "a-project", "name": "A"},
-            {"projectId": "m-project", "name": "M"}
-        ]"#;
-        let projects = parse_google_stt_projects(json).unwrap();
-        let ids: Vec<&str> = projects.iter().map(|p| p.project_id.as_str()).collect();
-        assert_eq!(ids, vec!["a-project", "m-project", "z-project"]);
-    }
+    // (Old gcloud/ADC tests removed in v0.5.0; replaced by OAuth & HTTP mock integration tests.)
 
     // ---- Google STT builtin test ----
 
@@ -7614,23 +7494,36 @@ mod tests {
 
     #[test]
     fn test_google_stt_recognize_still_works_for_existing_path() {
-        // Verify the existing recognize command delegates to the common function
-        // by checking that the common function validates file existence
         let nonexistent = std::path::PathBuf::from("/nonexistent/audio.wav");
         let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = std::env::temp_dir().join(format!("asrc_test_{}", uuid::Uuid::new_v4()));
+        let transport = std::sync::Arc::new(google_oauth::ReqwestGoogleHttpTransport::new());
+        let cred_store = std::sync::Arc::new(google_oauth::InMemoryCredentialStore::new());
+        let manager = google_oauth::GoogleAuthManager::new(
+            google_oauth::GoogleOAuthConfig::from_env(),
+            &temp_dir,
+            cred_store,
+            transport.clone(),
+            None,
+        );
         let result = rt.block_on(async {
-            recognize_google_stt_audio(
-                "test-proj",
+            recognize_google_stt_audio_with_auth(
+                &manager,
+                transport.as_ref(),
+                Some("test-proj"),
                 "us-central1",
                 "_",
                 "ja-JP",
                 "chirp_2",
                 &nonexistent,
+                None,
+                false,
             )
             .await
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("音声ファイルが見つかりません"));
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     // ---- is_anthropic_provider ----
@@ -11627,6 +11520,51 @@ mod tests {
             assert_eq!(res, Err("指定されたジョブが見つかりません".to_string()));
             assert!(get_job_control(&unknown_id).is_none());
         });
+    }
+
+    #[test]
+    fn test_commit_staged_output_files_partial_failure_reports_state_and_cleans_remaining_temps() {
+        let dir = std::env::temp_dir().join(format!("asrc_commit_partial_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let txt_tmp = dir.join("sample.txt.tmp-1");
+        let txt_final = dir.join("sample.txt");
+        let json_tmp = dir.join("sample.json.tmp-1");
+        // Make json_final a non-empty directory so replace_file_atomic fails on the 2nd file
+        let json_final = dir.join("sample.json");
+        let asrc_tmp = dir.join("sample.asrc.json.tmp-1");
+        let asrc_final = dir.join("sample.asrc.json");
+
+        std::fs::write(&txt_tmp, "new txt").unwrap();
+        std::fs::write(&json_tmp, "{}").unwrap();
+        std::fs::create_dir_all(json_final.join("blocker")).unwrap();
+        std::fs::write(&asrc_tmp, "{}").unwrap();
+
+        let err = commit_staged_output_files(vec![
+            StagedOutputFileInput {
+                temp_path: txt_tmp.to_string_lossy().to_string(),
+                final_path: txt_final.to_string_lossy().to_string(),
+            },
+            StagedOutputFileInput {
+                temp_path: json_tmp.to_string_lossy().to_string(),
+                final_path: json_final.to_string_lossy().to_string(),
+            },
+            StagedOutputFileInput {
+                temp_path: asrc_tmp.to_string_lossy().to_string(),
+                final_path: asrc_final.to_string_lossy().to_string(),
+            },
+        ])
+        .unwrap_err();
+
+        assert!(err.contains("確定済み: sample.txt"));
+        assert!(err.contains("失敗: sample.json"));
+        assert!(err.contains("未確定: sample.asrc.json"));
+        assert_eq!(std::fs::read_to_string(&txt_final).unwrap(), "new txt");
+        assert!(!json_tmp.exists());
+        assert!(!asrc_tmp.exists());
+        assert!(!asrc_final.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

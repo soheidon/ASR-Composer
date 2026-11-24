@@ -303,7 +303,6 @@ describe("readProviderConfigFromSection", () => {
     });
     const result = readProviderConfigFromSection(section);
     expect(result!.options).toEqual({
-      project_id: "my-project-123",
       location: "us-central1",
       recognizer_id: "_",
       language_code: "ja-JP",
@@ -324,7 +323,6 @@ describe("readProviderConfigFromSection", () => {
     });
     const result = readProviderConfigFromSection(section);
     expect(result!.options).toEqual({
-      project_id: "test-proj",
       location: "europe-west4",
     });
   });
@@ -734,20 +732,20 @@ describe("readProviderConfigFromSection: Google STT options", () => {
       </div>`;
   }
 
-  it("reads project_id from visible select", () => {
+  it("does not include project_id from visible select in provider settings", () => {
     const section = makeSection(googleSttSectionHtml({ projectId: "my-project" }));
     const result = readProviderConfigFromSection(section);
-    expect(result?.options?.project_id).toBe("my-project");
+    expect(result?.options?.project_id).toBeUndefined();
   });
 
-  it("reads project_id from input when select is hidden", () => {
+  it("does not include project_id from input when select is hidden", () => {
     const section = makeSection(googleSttSectionHtml({
       projectId: "old-project",
       projectIdHidden: true,
       projectInput: "manual-project",
     }));
     const result = readProviderConfigFromSection(section);
-    expect(result?.options?.project_id).toBe("manual-project");
+    expect(result?.options?.project_id).toBeUndefined();
   });
 
   it("reads location from select", () => {
@@ -786,7 +784,7 @@ describe("readProviderConfigFromSection: Google STT options", () => {
       projectInput: "manual-project",
     }));
     const result = readProviderConfigFromSection(section);
-    expect(result?.options?.project_id).toBe("manual-project");
+    expect(result?.options?.project_id).toBeUndefined();
   });
 });
 
